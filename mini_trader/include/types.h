@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 
-struct __align__(16) Event {
+struct alignas(16) Event {
   uint64_t t_ns;
   float price;
   uint32_t _pad;
@@ -9,7 +9,7 @@ struct __align__(16) Event {
 
 enum Side : int8_t { NONE = 0, BUY = 1, SELL = -1 };
 
-struct __align__(16) Order {
+struct alignas(16) Order {
   uint64_t t_ns;
   float price;
   float qty;
