@@ -128,7 +128,7 @@ def sample_latency(mean: float, std: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EMAProcessor:
-    def __init__(self, alpha: float = 0.01, threshold: float = 0.001):
+    def __init__(self, alpha: float = 0.05, threshold: float = 0.0002):
         self.alpha     = alpha
         self.threshold = threshold
         self._ema      = [0.0] * 256
@@ -220,14 +220,15 @@ class TierReceiver(threading.Thread):
     def __init__(self, tier: int,
                  result_queue: queue.Queue,
                  signal_queue: Optional[queue.Queue],
-                 stop_event: threading.Event):
+                 stop_event: threading.Event,
+                 alpha: float = 0.05, threshold: float = 0.0002):
         super().__init__(daemon=True, name=f"T{tier}-receiver")
         self.tier         = tier
         self.profile      = TIER_PROFILES[tier]
         self.result_q     = result_queue
         self.signal_q     = signal_queue   # only T1 sends to fill sim
         self.stop         = stop_event
-        self.processor    = EMAProcessor()
+        self.processor    = EMAProcessor(alpha=alpha, threshold=threshold)
         self.n_rx         = 0
         self.n_signals    = 0
 
@@ -628,7 +629,11 @@ def main():
                         help="Warmup period in seconds (default: 3)")
     parser.add_argument("--tiers",    default="1,2,3,4,5",
                         help="Comma-separated tiers to run (default: 1,2,3,4,5)")
-    parser.add_argument("--output",   default="results/laptop_test.csv")
+    parser.add_argument("--output",    default="results/laptop_test.csv")
+    parser.add_argument("--alpha",     type=float, default=0.05,
+                        help="EMA alpha, higher = faster tracking (default: 0.05)")
+    parser.add_argument("--threshold", type=float, default=0.0002,
+                        help="Signal threshold fraction (default: 0.0002 = 2 bps)")
     args = parser.parse_args()
 
     tiers   = [int(t) for t in args.tiers.split(",") if t.strip()]
@@ -676,7 +681,8 @@ def main():
     receivers = []
     for tier in tiers:
         sig_q = signal_q if tier == 1 else None
-        rx = TierReceiver(tier, result_q, sig_q, stop)
+        rx = TierReceiver(tier, result_q, sig_q, stop,
+                          alpha=args.alpha, threshold=args.threshold)
         receivers.append(rx)
 
     # ── Fill simulator ────────────────────────────────────────────────────
