@@ -19,10 +19,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # ── Find CUDA ─────────────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
-# GPU architecture: BlueField-3 host GPU — adjust for your actual GPU
-# e.g. 80 = A100, 86 = RTX 3xxx, 89 = RTX 4xxx, 90 = H100
+# GPU architecture: NVIDIA A2 (sm_86)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80)
+    set(CMAKE_CUDA_ARCHITECTURES 86)
 endif()
 
 # ── Threads ───────────────────────────────────────────────────────────────────
