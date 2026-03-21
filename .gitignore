@@ -1,0 +1,40 @@
+# Build outputs
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.d
+
+# Compiled binaries
+src/data_source/data_source
+src/receivers/cpu/cpu_receiver
+src/receivers/dpdk/dpdk_receiver
+src/receivers/rdma/rdma_receiver
+src/receivers/gpu/gpu_receiver
+src/fill_simulator/fill_simulator
+src/benchmark_harness/benchmark_harness
+
+# Benchmark results
+results/
+*.csv
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+backtest_results/
+backtest.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# CUDA
+*.ptx
+*.cubin
