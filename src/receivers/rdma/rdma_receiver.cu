@@ -60,7 +60,11 @@ struct GpuRdmaResources {
     uint8_t          *d_pkt_bufs   = nullptr;    /* [MAX_RECV_WR * PKT_BUF_SIZE] */
     TickMessage      *d_ticks      = nullptr;    /* extracted tick data */
     SignalResult     *d_signals    = nullptr;
-    double           *d_ema        = nullptr;
+    double           *d_fast_ema   = nullptr;
+    double           *d_slow_ema   = nullptr;
+    double           *d_avg_gain   = nullptr;
+    double           *d_avg_loss   = nullptr;
+    double           *d_last_mid   = nullptr;
 
     /* Host pinned for results readback */
     SignalResult     *h_signals    = nullptr;
@@ -202,8 +206,12 @@ static void gpu_init(GpuRdmaResources &r, int batch_size)
     /* Processing buffers */
     CUDA_CHECK(cudaMalloc(&r.d_ticks,   batch_size * sizeof(TickMessage)));
     CUDA_CHECK(cudaMalloc(&r.d_signals, batch_size * sizeof(SignalResult)));
-    CUDA_CHECK(cudaMalloc(&r.d_ema,     MAX_INSTRUMENTS * sizeof(double)));
-    CUDA_CHECK(cudaMemset(r.d_ema, 0,   MAX_INSTRUMENTS * sizeof(double)));
+    size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&r.d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_fast_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_slow_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_gain, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_gain, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_loss, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
 
     CUDA_CHECK(cudaMallocHost(&r.h_signals,    batch_size * sizeof(SignalResult)));
     CUDA_CHECK(cudaMallocHost(&r.h_ticks_copy, batch_size * sizeof(TickMessage)));
@@ -252,8 +260,6 @@ int main(int argc, char **argv)
     uint8_t     tier         = 3;
     const char *harness_ip   = "127.0.0.1";
     const char *fillsim_ip   = "127.0.0.1";
-    double      alpha        = 0.01;
-    double      threshold    = 0.001;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--dev")       && i+1<argc) ib_dev_name = argv[++i];
@@ -262,8 +268,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier        = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip  = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip  = argv[++i];
-        else if (!strcmp(argv[i],"--alpha")     && i+1<argc) alpha       = atof(argv[++i]);
-        else if (!strcmp(argv[i],"--threshold") && i+1<argc) threshold   = atof(argv[++i]);
     }
 
     fprintf(stderr, "[T3 rdma_receiver] ib_dev=%s gid=%d batch=%d tier=%d\n",
@@ -315,8 +319,10 @@ int main(int argc, char **argv)
 
                 /* Process */
                 launch_process_ticks(gpu.d_ticks, batch_n,
-                                      gpu.d_signals, gpu.d_ema,
-                                      t2, alpha, threshold, gpu.stream);
+                                      gpu.d_signals,
+                                      gpu.d_fast_ema, gpu.d_slow_ema,
+                                      gpu.d_avg_gain, gpu.d_avg_loss, gpu.d_last_mid,
+                                      t2, gpu.stream);
                 CUDA_CHECK(cudaStreamSynchronize(gpu.stream));
 
                 /* Readback signals + ticks for BenchmarkResult */

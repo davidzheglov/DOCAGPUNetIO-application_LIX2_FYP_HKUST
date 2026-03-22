@@ -110,13 +110,17 @@ static int make_udp_send(const char *addr, int port, sockaddr_in &dest)
 
 /* ── GPU resource bundle (same as T1) ───────────────────────────────────── */
 struct GpuResources {
-    TickMessage  *d_ticks   = nullptr;
-    SignalResult *d_signals = nullptr;
-    TickMessage  *h_ticks   = nullptr;
-    SignalResult *h_signals = nullptr;
-    double       *d_ema     = nullptr;
-    cudaStream_t  stream    = nullptr;
-    int           cap       = DEFAULT_BATCH;
+    TickMessage  *d_ticks     = nullptr;
+    SignalResult *d_signals   = nullptr;
+    TickMessage  *h_ticks     = nullptr;
+    SignalResult *h_signals   = nullptr;
+    double       *d_fast_ema  = nullptr;
+    double       *d_slow_ema  = nullptr;
+    double       *d_avg_gain  = nullptr;
+    double       *d_avg_loss  = nullptr;
+    double       *d_last_mid  = nullptr;
+    cudaStream_t  stream      = nullptr;
+    int           cap         = DEFAULT_BATCH;
 };
 
 static double gpu_clock_khz = 0;
@@ -128,8 +132,12 @@ static void gpu_init(GpuResources &r, int cap)
     CUDA_CHECK(cudaMallocHost(&r.h_signals, cap * sizeof(SignalResult)));
     CUDA_CHECK(cudaMalloc(&r.d_ticks,   cap * sizeof(TickMessage)));
     CUDA_CHECK(cudaMalloc(&r.d_signals, cap * sizeof(SignalResult)));
-    CUDA_CHECK(cudaMalloc(&r.d_ema, MAX_INSTRUMENTS * sizeof(double)));
-    CUDA_CHECK(cudaMemset(r.d_ema, 0, MAX_INSTRUMENTS * sizeof(double)));
+    size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&r.d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_fast_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_slow_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_gain, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_gain, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_loss, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
     CUDA_CHECK(cudaStreamCreate(&r.stream));
     int dev; CUDA_CHECK(cudaGetDevice(&dev));
     cudaDeviceProp p; CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
@@ -138,7 +146,6 @@ static void gpu_init(GpuResources &r, int cap)
 
 /* ── Process batch ──────────────────────────────────────────────────────── */
 static void process_batch(GpuResources &r, int n, uint8_t tier,
-                           double alpha, double threshold,
                            int harness_fd, sockaddr_in harness_dest,
                            int signal_fd,  sockaddr_in signal_dest)
 {
@@ -148,8 +155,10 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
     uint64_t t2 = now_ns();
 
-    launch_process_ticks(r.d_ticks, n, r.d_signals, r.d_ema,
-                          t2, alpha, threshold, r.stream);
+    launch_process_ticks(r.d_ticks, n, r.d_signals,
+                          r.d_fast_ema, r.d_slow_ema,
+                          r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
+                          t2, r.stream);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
 
     CUDA_CHECK(cudaMemcpyAsync(r.h_signals, r.d_signals,
@@ -197,8 +206,6 @@ int main(int argc, char **argv)
     uint8_t     tier        = 2;
     const char *harness_ip  = "127.0.0.1";
     const char *fillsim_ip  = "127.0.0.1";
-    double      alpha       = 0.01;
-    double      threshold   = 0.001;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--port")      && i+1<argc) dpdk_port  = (uint16_t)atoi(argv[++i]);
@@ -206,8 +213,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier       = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip = argv[++i];
-        else if (!strcmp(argv[i],"--alpha")     && i+1<argc) alpha      = atof(argv[++i]);
-        else if (!strcmp(argv[i],"--threshold") && i+1<argc) threshold  = atof(argv[++i]);
     }
 
     fprintf(stderr, "[T2 dpdk_receiver] dpdk_port=%u batch=%d\n", dpdk_port, batch_size);
@@ -261,7 +266,7 @@ int main(int argc, char **argv)
             rte_pktmbuf_free(m);
 
             if (batch_n >= batch_size) {
-                process_batch(gpu, batch_n, tier, alpha, threshold,
+                process_batch(gpu, batch_n, tier,
                                harness_fd, harness_dest, signal_fd, signal_dest);
                 batch_n = 0;
             }

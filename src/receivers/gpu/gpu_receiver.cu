@@ -23,8 +23,8 @@
  *   /opt/mellanox/doca/include/doca_gpunetio.h
  *
  * Usage:
- *   gpu_receiver --iface <interface> [--batch 256] [--tier 4]
- *                [--harness <ip>] [--alpha 0.01] [--threshold 0.001]
+ *   gpu_receiver --iface <interface> [--tier 4]
+ *                [--harness <ip>] [--fillsim <ip>]
  */
 
 #include <doca_gpunetio.h>
@@ -68,17 +68,34 @@
         fprintf(stderr,"DOCA %s:%d: %s\n",__FILE__,__LINE__,doca_error_get_descr(_e)); exit(1); \
     }} while(0)
 
-/* ── Atomic EMA (device) ─────────────────────────────────────────────────── */
-__device__ static void ema_update(double *slot, double price, double alpha)
+/* ── Atomic EMA CAS update (device) ─────────────────────────────────────── */
+__device__ static double ema_cas(double *slot, double sample, double alpha)
 {
     unsigned long long *addr = reinterpret_cast<unsigned long long *>(slot);
     unsigned long long expected, desired;
+    double old_val, new_val;
     do {
-        expected = *addr;
-        double old_v = __longlong_as_double((long long)expected);
-        double new_v = alpha * price + (1.0 - alpha) * old_v;
-        desired  = (unsigned long long)__double_as_longlong(new_v);
+        expected = atomicAdd(addr, 0ULL);
+        old_val  = __longlong_as_double((long long)expected);
+        if (old_val == 0.0) old_val = sample;
+        new_val  = alpha * sample + (1.0 - alpha) * old_val;
+        desired  = (unsigned long long)__double_as_longlong(new_val);
     } while (atomicCAS(addr, expected, desired) != expected);
+    return new_val;
+}
+
+__device__ static double rsi_cas(double *slot, double sample, double alpha)
+{
+    unsigned long long *addr = reinterpret_cast<unsigned long long *>(slot);
+    unsigned long long expected, desired;
+    double old_val, new_val;
+    do {
+        expected = atomicAdd(addr, 0ULL);
+        old_val  = __longlong_as_double((long long)expected);
+        new_val  = alpha * sample + (1.0 - alpha) * old_val;
+        desired  = (unsigned long long)__double_as_longlong(new_val);
+    } while (atomicCAS(addr, expected, desired) != expected);
+    return new_val;
 }
 
 /* ── Shared GPU result ring (GPU → CPU readback) ─────────────────────────── */
@@ -115,13 +132,15 @@ struct ResultRing {
 __global__ void gpu_recv_process_kernel(
     doca_gpu_eth_rxq_t  *rxq,
     volatile uint32_t   *quit_flag,
-    double              *ema_table,          /* [MAX_INSTRUMENTS] */
+    double              *d_fast_ema,         /* [MAX_INSTRUMENTS] */
+    double              *d_slow_ema,         /* [MAX_INSTRUMENTS] */
+    double              *d_avg_gain,         /* [MAX_INSTRUMENTS] */
+    double              *d_avg_loss,         /* [MAX_INSTRUMENTS] */
+    double              *d_last_mid,         /* [MAX_INSTRUMENTS] */
     ResultSlot          *result_ring,
     volatile uint64_t   *ring_head,
     uint32_t             ring_depth,
-    uint8_t              tier,
-    double               alpha,
-    double               threshold)
+    uint8_t              tier)
 {
     /* Shared memory: packet metadata for the current burst */
     __shared__ uint32_t  s_n_rx;
@@ -193,16 +212,43 @@ __global__ void gpu_recv_process_kernel(
             /* ── Compute mid and spread ── */
             double mid    = (tick->bid + tick->ask) * 0.5;
             double spread =  tick->ask - tick->bid;
+            int    inst   =  tick->instrument_id % MAX_INSTRUMENTS;
 
-            /* ── Update per-instrument EMA ── */
-            int slot_idx = tick->instrument_id % MAX_INSTRUMENTS;
-            ema_update(&ema_table[slot_idx], mid, alpha);
-            double ema = ema_table[slot_idx];
+            /* ── Dual EMA update ── */
+            double fast_ema = ema_cas(&d_fast_ema[inst], mid, EMA_ALPHA_FAST);
+            double slow_ema = ema_cas(&d_slow_ema[inst], mid, EMA_ALPHA_SLOW);
 
-            /* ── Mean-reversion signal ── */
-            int8_t sig = 0;
-            if (mid < ema - threshold * ema) sig = +1;
-            if (mid > ema + threshold * ema) sig = -1;
+            /* ── RSI update ── */
+            double last_mid = d_last_mid[inst];
+            if (last_mid == 0.0) last_mid = mid;
+            double delta   = mid - last_mid;
+            double gain    = (delta > 0.0) ? delta : 0.0;
+            double loss    = (delta < 0.0) ? -delta : 0.0;
+            double avg_gain = rsi_cas(&d_avg_gain[inst], gain, RSI_ALPHA);
+            double avg_loss = rsi_cas(&d_avg_loss[inst], loss, RSI_ALPHA);
+            *(unsigned long long *)&d_last_mid[inst] =
+                (unsigned long long)__double_as_longlong(mid);
+
+            double rs_val = (avg_loss > 1e-12) ? avg_gain / avg_loss : 100.0;
+            float  rsi    = (float)(100.0 - 100.0 / (1.0 + rs_val));
+            rsi = fmaxf(0.0f, fminf(100.0f, rsi));
+
+            /* ── EMA crossover signal ── */
+            int8_t ema_sig = 0;
+            if (slow_ema > 0.0) {
+                double cross = (fast_ema - slow_ema) / slow_ema;
+                if (cross >  EMA_CROSS_THRESH) ema_sig = +1;
+                if (cross < -EMA_CROSS_THRESH) ema_sig = -1;
+            }
+
+            /* ── RSI signal ── */
+            int8_t rsi_sig = 0;
+            if (rsi < RSI_OVERSOLD)   rsi_sig = +1;
+            if (rsi > RSI_OVERBOUGHT) rsi_sig = -1;
+
+            /* ── Combined signal ── */
+            int8_t combined = 0;
+            if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
             /* T3: kernel done */
             uint64_t t3 = clock64();
@@ -211,31 +257,34 @@ __global__ void gpu_recv_process_kernel(
             uint64_t ring_idx = atomicAdd(
                 reinterpret_cast<unsigned long long *>(
                     const_cast<uint64_t *>(ring_head)), 1ULL);
-            ResultSlot *rs = &result_ring[ring_idx % ring_depth];
+            ResultSlot *rslot = &result_ring[ring_idx % ring_depth];
 
             /* BenchmarkResult */
-            rs->bench.tick_id = tick->tick_id;
-            rs->bench.t1_ns   = tick->timestamp_ns;
-            rs->bench.t2_ns   = t2;    /* GPU clock cycles (converted by CPU) */
-            rs->bench.t3_ns   = t3;
-            rs->bench.t4_ns   = 0;
-            rs->bench.tier    = tier;
-            rs->bench.dropped = 0;
+            rslot->bench.tick_id = tick->tick_id;
+            rslot->bench.t1_ns   = tick->timestamp_ns;
+            rslot->bench.t2_ns   = t2;
+            rslot->bench.t3_ns   = t3;
+            rslot->bench.t4_ns   = 0;
+            rslot->bench.tier    = tier;
+            rslot->bench.dropped = 0;
 
             /* SignalResult */
-            rs->signal.tick_id       = tick->tick_id;
-            rs->signal.t3_ns         = t3;
-            rs->signal.instrument_id = tick->instrument_id;
-            rs->signal.signal        = sig;
-            rs->signal.mid_price     = mid;
-            rs->signal.spread        = spread;
-            rs->signal.ema           = ema;
+            rslot->signal.tick_id       = tick->tick_id;
+            rslot->signal.t3_ns         = t3;
+            rslot->signal.instrument_id = tick->instrument_id;
+            rslot->signal.signal        = combined;
+            rslot->signal.rsi_signal    = rsi_sig;
+            rslot->signal.rsi           = rsi;
+            rslot->signal.mid_price     = mid;
+            rslot->signal.spread        = spread;
+            rslot->signal.fast_ema      = fast_ema;
+            rslot->signal.slow_ema      = slow_ema;
 
             /* T4: write complete */
             __threadfence();
             uint64_t t4 = clock64();
-            rs->bench.t4_ns  = t4;
-            rs->signal.t4_ns = t4;
+            rslot->bench.t4_ns  = t4;
+            rslot->signal.t4_ns = t4;
         }
         done:
         __syncthreads();
@@ -373,8 +422,6 @@ int main(int argc, char **argv)
     uint8_t     tier          = 4;
     const char *harness_ip    = "127.0.0.1";
     const char *fillsim_ip    = "127.0.0.1";
-    double      alpha         = 0.01;
-    double      threshold     = 0.001;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--iface")     && i+1<argc) iface       = argv[++i];
@@ -382,8 +429,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier        = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip  = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip  = argv[++i];
-        else if (!strcmp(argv[i],"--alpha")     && i+1<argc) alpha       = atof(argv[++i]);
-        else if (!strcmp(argv[i],"--threshold") && i+1<argc) threshold   = atof(argv[++i]);
     }
 
     fprintf(stderr, "[T%d gpu_receiver] iface=%s cuda=%d\n", tier, iface, cuda_device);
@@ -402,10 +447,15 @@ int main(int argc, char **argv)
     DocaContext doca{};
     if (doca_init(doca, iface, cuda_device) < 0) return 1;
 
-    /* EMA table in device memory */
-    double *d_ema = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_ema, MAX_INSTRUMENTS * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_ema, 0, MAX_INSTRUMENTS * sizeof(double)));
+    /* Per-instrument state arrays */
+    double *d_fast_ema = nullptr, *d_slow_ema = nullptr;
+    double *d_avg_gain = nullptr, *d_avg_loss = nullptr, *d_last_mid = nullptr;
+    size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(d_fast_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(d_slow_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_avg_gain, state_sz)); CUDA_CHECK(cudaMemset(d_avg_gain, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(d_avg_loss, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(d_last_mid, 0, state_sz));
 
     /* Result ring: host-mapped device memory for GPU→CPU transfer */
     ResultRing ring{};
@@ -442,13 +492,11 @@ int main(int argc, char **argv)
     gpu_recv_process_kernel<<<1, MAX_PKT_PER_BURST>>>(
         doca.rxq_gpu,
         d_quit,
-        d_ema,
+        d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
         ring.slots,
         ring.head,
         ring.depth,
-        tier,
-        alpha,
-        threshold);
+        tier);
 
     /* Wait for SIGINT / SIGTERM */
     while (!g_quit) {
@@ -472,7 +520,11 @@ int main(int argc, char **argv)
     DOCA_CHECK(doca_gpu_destroy(doca.gpu));
     DOCA_CHECK(doca_dev_close(doca.dev));
 
-    cudaFree(d_ema);
+    cudaFree(d_fast_ema);
+    cudaFree(d_slow_ema);
+    cudaFree(d_avg_gain);
+    cudaFree(d_avg_loss);
+    cudaFree(d_last_mid);
     cudaFree(d_quit);
     cudaFreeHost(ring.slots);
     cudaFreeHost(ring.head);

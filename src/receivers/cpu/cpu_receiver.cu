@@ -12,7 +12,7 @@
  *
  * Usage:
  *   cpu_receiver [--mcast 239.0.0.1] [--port 5005] [--batch 256]
- *                [--tier 1] [--harness <ip>] [--alpha 0.01] [--threshold 0.001]
+ *                [--tier 1] [--harness <ip>] [--fillsim <ip>]
  */
 
 #include <arpa/inet.h>
@@ -36,8 +36,6 @@
 /* ── Configuration defaults ─────────────────────────────────────────────────── */
 #define DEFAULT_BATCH       256
 #define DEFAULT_TIER        1
-#define DEFAULT_ALPHA       0.01
-#define DEFAULT_THRESHOLD   0.001
 
 /* ── CUDA error check ───────────────────────────────────────────────────────── */
 #define CUDA_CHECK(call)                                                    \
@@ -101,13 +99,18 @@ static uint64_t gpu_cycles_to_ns(uint64_t cycles)
 
 /* ── GPU resource bundle ─────────────────────────────────────────────────────── */
 struct GpuResources {
-    TickMessage  *d_ticks    = nullptr;
-    SignalResult *d_signals  = nullptr;
-    TickMessage  *h_ticks    = nullptr;   /* pinned host buffer */
-    SignalResult *h_signals  = nullptr;   /* pinned host buffer */
-    double       *d_ema      = nullptr;
-    cudaStream_t  stream     = nullptr;
-    int           batch_size = DEFAULT_BATCH;
+    TickMessage  *d_ticks     = nullptr;
+    SignalResult *d_signals   = nullptr;
+    TickMessage  *h_ticks     = nullptr;   /* pinned host buffer */
+    SignalResult *h_signals   = nullptr;   /* pinned host buffer */
+    /* Per-instrument EMA/RSI state — zero-initialised, persist across batches */
+    double       *d_fast_ema  = nullptr;   /* fast EMA (alpha = EMA_ALPHA_FAST) */
+    double       *d_slow_ema  = nullptr;   /* slow EMA (alpha = EMA_ALPHA_SLOW) */
+    double       *d_avg_gain  = nullptr;   /* RSI running avg gain              */
+    double       *d_avg_loss  = nullptr;   /* RSI running avg loss              */
+    double       *d_last_mid  = nullptr;   /* previous tick mid-price           */
+    cudaStream_t  stream      = nullptr;
+    int           batch_size  = DEFAULT_BATCH;
 };
 
 static void gpu_init(GpuResources &r, int batch_size)
@@ -118,22 +121,26 @@ static void gpu_init(GpuResources &r, int batch_size)
     CUDA_CHECK(cudaMallocHost(&r.h_ticks,   batch_size * sizeof(TickMessage)));
     CUDA_CHECK(cudaMallocHost(&r.h_signals, batch_size * sizeof(SignalResult)));
 
-    /* Device buffers */
+    /* Device tick/signal buffers */
     CUDA_CHECK(cudaMalloc(&r.d_ticks,   batch_size * sizeof(TickMessage)));
     CUDA_CHECK(cudaMalloc(&r.d_signals, batch_size * sizeof(SignalResult)));
 
-    /* EMA table — zero-initialised */
-    CUDA_CHECK(cudaMalloc(&r.d_ema, MAX_INSTRUMENTS * sizeof(double)));
-    CUDA_CHECK(cudaMemset(r.d_ema, 0, MAX_INSTRUMENTS * sizeof(double)));
+    /* Per-instrument state — zero-initialised (kernel seeds on first tick) */
+    size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&r.d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_fast_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_slow_ema, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_gain, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_gain, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_loss, 0, state_sz));
+    CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
 
     CUDA_CHECK(cudaStreamCreate(&r.stream));
 
-    /* Query clock rate */
+    /* Query GPU clock rate (for clock64() → ns conversion) */
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    gpu_clock_rate_khz = prop.clockRate;   /* kHz */
+    gpu_clock_rate_khz = prop.clockRate;
 }
 
 static void gpu_free(GpuResources &r)
@@ -142,7 +149,11 @@ static void gpu_free(GpuResources &r)
     cudaFreeHost(r.h_signals);
     cudaFree(r.d_ticks);
     cudaFree(r.d_signals);
-    cudaFree(r.d_ema);
+    cudaFree(r.d_fast_ema);
+    cudaFree(r.d_slow_ema);
+    cudaFree(r.d_avg_gain);
+    cudaFree(r.d_avg_loss);
+    cudaFree(r.d_last_mid);
     cudaStreamDestroy(r.stream);
 }
 
@@ -150,7 +161,7 @@ static void gpu_free(GpuResources &r)
 static void process_batch(GpuResources &r, int n,
                            int harness_fd, sockaddr_in harness_dest,
                            int signal_fd,  sockaddr_in signal_dest,
-                           uint8_t tier, double alpha, double threshold)
+                           uint8_t tier)
 {
     /* H → D */
     CUDA_CHECK(cudaMemcpyAsync(r.d_ticks, r.h_ticks,
@@ -161,9 +172,11 @@ static void process_batch(GpuResources &r, int n,
     /* T2: ticks are now in GPU memory */
     uint64_t t2 = now_ns();
 
-    /* Launch processing kernel */
-    launch_process_ticks(r.d_ticks, n, r.d_signals, r.d_ema,
-                          t2, alpha, threshold, r.stream);
+    /* Launch dual-EMA + RSI processing kernel */
+    launch_process_ticks(r.d_ticks, n, r.d_signals,
+                          r.d_fast_ema, r.d_slow_ema,
+                          r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
+                          t2, r.stream);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
 
     /* D → H results */
@@ -213,18 +226,14 @@ int main(int argc, char **argv)
     uint8_t     tier          = DEFAULT_TIER;
     const char *harness_addr  = "127.0.0.1";
     const char *fillsim_addr  = "127.0.0.1";
-    double      alpha         = DEFAULT_ALPHA;
-    double      threshold     = DEFAULT_THRESHOLD;
 
     for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i], "--mcast")     && i+1<argc) mcast_addr   = argv[++i];
-        else if (!strcmp(argv[i], "--port")      && i+1<argc) mcast_port   = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--batch")     && i+1<argc) batch_size   = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--tier")      && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--harness")   && i+1<argc) harness_addr = argv[++i];
-        else if (!strcmp(argv[i], "--fillsim")   && i+1<argc) fillsim_addr = argv[++i];
-        else if (!strcmp(argv[i], "--alpha")     && i+1<argc) alpha        = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--threshold") && i+1<argc) threshold    = atof(argv[++i]);
+        if      (!strcmp(argv[i], "--mcast")   && i+1<argc) mcast_addr   = argv[++i];
+        else if (!strcmp(argv[i], "--port")    && i+1<argc) mcast_port   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--batch")   && i+1<argc) batch_size   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--tier")    && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--harness") && i+1<argc) harness_addr = argv[++i];
+        else if (!strcmp(argv[i], "--fillsim") && i+1<argc) fillsim_addr = argv[++i];
     }
 
     fprintf(stderr, "[T1 cpu_receiver] mcast=%s:%d batch=%d tier=%d\n",
@@ -258,7 +267,7 @@ int main(int argc, char **argv)
             process_batch(gpu, batch_n,
                           harness_fd, harness_dest,
                           signal_fd,  signal_dest,
-                          tier, alpha, threshold);
+                          tier);
             batch_n = 0;
         }
     }

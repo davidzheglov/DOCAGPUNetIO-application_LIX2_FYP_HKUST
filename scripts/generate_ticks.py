@@ -24,7 +24,7 @@ def generate(rows: int, n_instruments: int, output: str) -> None:
     instruments = INSTRUMENTS[:n_instruments]
     mids = {iid: mid for iid, mid in instruments}
 
-    print(f"Generating {rows:,} ticks for {n_instruments} instrument(s) → {output}")
+    print(f"Generating {rows:,} ticks for {n_instruments} instrument(s) -> {output}")
 
     t_ns = int(time.time_ns())
     interval_ns = 1_000_000  # 1 ms between ticks (doesn't matter — replay re-stamps)
