@@ -88,14 +88,6 @@ static int make_udp_send_socket(const char *dst_addr, int port,
     return fd;
 }
 
-/* ── GPU clock → ns conversion ──────────────────────────────────────────────── */
-static double gpu_clock_rate_khz = 0.0;  /* populated at init */
-
-static uint64_t gpu_cycles_to_ns(uint64_t cycles)
-{
-    if (gpu_clock_rate_khz <= 0.0) return cycles;
-    return (uint64_t)((double)cycles / (gpu_clock_rate_khz * 1e3) * 1e9);
-}
 
 /* ── GPU resource bundle ─────────────────────────────────────────────────────── */
 struct GpuResources {
@@ -135,12 +127,7 @@ static void gpu_init(GpuResources &r, int batch_size)
 
     CUDA_CHECK(cudaStreamCreate(&r.stream));
 
-    /* Query GPU clock rate (for clock64() → ns conversion) */
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
-    int clock_khz = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device));
-    gpu_clock_rate_khz = clock_khz;
+    (void)r;  /* clock query not needed — t3/t4 use host wall-clock */
 }
 
 static void gpu_free(GpuResources &r)
@@ -179,27 +166,29 @@ static void process_batch(GpuResources &r, int n,
                           t2, r.stream);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
 
+    /* T3: kernel complete — host wall-clock after kernel sync */
+    uint64_t t3 = now_ns();
+
     /* D → H results */
     CUDA_CHECK(cudaMemcpyAsync(r.h_signals, r.d_signals,
                                 n * sizeof(SignalResult),
                                 cudaMemcpyDeviceToHost, r.stream));
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
 
+    /* T4: results readable on host */
+    uint64_t t4 = now_ns();
+
     /* Send BenchmarkResult + SignalResult for each tick */
     for (int i = 0; i < n; ++i) {
         const TickMessage  &tick = r.h_ticks[i];
         const SignalResult &sig  = r.h_signals[i];
 
-        /* Convert GPU clock cycles → ns */
-        uint64_t t3 = t2 + gpu_cycles_to_ns(sig.t3_ns);
-        uint64_t t4 = t2 + gpu_cycles_to_ns(sig.t4_ns);
-
         BenchmarkResult br{};
         br.tick_id = tick.tick_id;
         br.t1_ns   = tick.timestamp_ns;
         br.t2_ns   = t2;
-        br.t3_ns   = t3;
-        br.t4_ns   = t4;
+        br.t3_ns   = t3;   /* host time after kernel sync — same for all ticks in batch */
+        br.t4_ns   = t4;   /* host time after D→H copy   — same for all ticks in batch */
         br.tier    = tier;
         br.dropped = 0;
 
