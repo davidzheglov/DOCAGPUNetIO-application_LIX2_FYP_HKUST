@@ -201,6 +201,14 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "--rate", std::to_string(rate_hz)
     };
 
+    /* Kill any leftover receivers/sources from a previous run */
+    system("pkill -f bin/cpu_receiver  2>/dev/null; "
+           "pkill -f bin/dpdk_receiver 2>/dev/null; "
+           "pkill -f bin/rdma_receiver 2>/dev/null; "
+           "pkill -f bin/gpu_receiver  2>/dev/null; "
+           "pkill -f bin/data_source   2>/dev/null; true");
+    usleep(300000);   /* wait for ports to be released */
+
     /* Launch data_source */
     pid_t ds_pid = launch("./bin/data_source", ds_args);
     if (ds_pid < 0) { fprintf(stderr, "Failed to launch data_source\n"); }
@@ -243,7 +251,8 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         if (n != sizeof(BenchmarkResult)) continue;
 
         if (br.dropped) { ++n_dropped; continue; }
-        if (br.t4_ns <= br.t1_ns) continue;   /* clock glitch / warmup */
+        if (br.t4_ns <= br.t1_ns) continue;            /* clock glitch */
+        if (br.t4_ns - br.t1_ns > 10000000000ULL) continue;  /* > 10 s: stale */
 
         e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
         ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
