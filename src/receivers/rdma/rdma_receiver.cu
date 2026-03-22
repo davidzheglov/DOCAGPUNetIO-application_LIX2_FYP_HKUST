@@ -219,8 +219,9 @@ static void gpu_init(GpuRdmaResources &r, int batch_size)
     CUDA_CHECK(cudaStreamCreate(&r.stream));
 
     int dev; CUDA_CHECK(cudaGetDevice(&dev));
-    cudaDeviceProp p; CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
-    r.gpu_ns_per_cycle = 1e6 / (double)p.clockRate;
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev));
+    r.gpu_ns_per_cycle = 1e6 / (double)clock_khz;
 }
 
 /* ── extract_ticks_kernel: parse raw Ethernet frames into TickMessage ────── */

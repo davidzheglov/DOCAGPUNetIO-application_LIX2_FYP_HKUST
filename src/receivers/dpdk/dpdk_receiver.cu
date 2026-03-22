@@ -140,8 +140,9 @@ static void gpu_init(GpuResources &r, int cap)
     CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
     CUDA_CHECK(cudaStreamCreate(&r.stream));
     int dev; CUDA_CHECK(cudaGetDevice(&dev));
-    cudaDeviceProp p; CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
-    gpu_clock_khz = p.clockRate;
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev));
+    gpu_clock_khz = clock_khz;
 }
 
 /* ── Process batch ──────────────────────────────────────────────────────── */

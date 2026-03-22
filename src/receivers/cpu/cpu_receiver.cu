@@ -138,9 +138,9 @@ static void gpu_init(GpuResources &r, int batch_size)
     /* Query GPU clock rate (for clock64() → ns conversion) */
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    gpu_clock_rate_khz = prop.clockRate;
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device));
+    gpu_clock_rate_khz = clock_khz;
 }
 
 static void gpu_free(GpuResources &r)

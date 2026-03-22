@@ -439,9 +439,9 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaSetDevice(cuda_device));
 
     /* Get GPU clock rate for ns conversion */
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, cuda_device));
-    double ns_per_cyc = 1e6 / (double)prop.clockRate;  /* clockRate in kHz */
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, cuda_device));
+    double ns_per_cyc = 1e6 / (double)clock_khz;  /* clockRate in kHz → ns/cycle */
 
     /* DOCA init */
     DocaContext doca{};

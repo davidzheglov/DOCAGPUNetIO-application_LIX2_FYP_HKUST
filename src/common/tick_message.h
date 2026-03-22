@@ -59,8 +59,10 @@ static inline uint16_t symbol_to_id(const char *sym)
     return (uint16_t)(h % MAX_INSTRUMENTS);
 }
 
-/* Convenience: current wall-clock time in nanoseconds (POSIX CLOCK_REALTIME). */
-#if !defined(__CUDACC__)
+/* Convenience: current wall-clock time in nanoseconds (POSIX CLOCK_REALTIME).
+ * Guard: compile for host code only — excluded from GPU device compilation
+ * (__CUDA_ARCH__ is defined only during device-code compilation passes). */
+#ifndef __CUDA_ARCH__
 #include <time.h>
 static inline uint64_t now_ns(void)
 {
