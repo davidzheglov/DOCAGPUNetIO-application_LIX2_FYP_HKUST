@@ -10,6 +10,7 @@ Usage:
 """
 import argparse
 import csv
+import os
 import random
 import time
 
@@ -25,6 +26,7 @@ def generate(rows: int, n_instruments: int, output: str) -> None:
     mids = {iid: mid for iid, mid in instruments}
 
     print(f"Generating {rows:,} ticks for {n_instruments} instrument(s) -> {output}")
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
 
     t_ns = int(time.time_ns())
     interval_ns = 1_000_000  # 1 ms between ticks (doesn't matter — replay re-stamps)
