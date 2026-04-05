@@ -355,67 +355,99 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     }
 
     /* Create DOCA GPU context */
-    DOCA_CHECK(doca_gpu_create(gpu_pcie, &doca.gpu_dev));
+    doca_error_t err;
 
-    /* Create ETH RX queue */
-    DOCA_CHECK(doca_eth_rxq_create(doca.dev, MAX_PKT_NUM, MAX_PKT_SIZE,
-                                    &doca.rxq_cpu));
+    fprintf(stderr, "[DBG] step 1: doca_gpu_create(%s)\n", gpu_pcie);
+    err = doca_gpu_create(gpu_pcie, &doca.gpu_dev);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Set RXQ type to CYCLIC for GPU-side receive */
-    DOCA_CHECK(doca_eth_rxq_set_type(doca.rxq_cpu, DOCA_ETH_RXQ_TYPE_CYCLIC));
+    fprintf(stderr, "[DBG] step 2: doca_eth_rxq_create(MAX_PKT_NUM=%d, MAX_PKT_SIZE=%d)\n",
+            MAX_PKT_NUM, MAX_PKT_SIZE);
+    err = doca_eth_rxq_create(doca.dev, MAX_PKT_NUM, MAX_PKT_SIZE, &doca.rxq_cpu);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Estimate and allocate GPU packet buffer */
+    fprintf(stderr, "[DBG] step 3: doca_eth_rxq_set_type(CYCLIC)\n");
+    err = doca_eth_rxq_set_type(doca.rxq_cpu, DOCA_ETH_RXQ_TYPE_CYCLIC);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
+
     uint32_t cyclic_buf_size = 0;
-    DOCA_CHECK(doca_eth_rxq_estimate_packet_buf_size(
+    fprintf(stderr, "[DBG] step 4: doca_eth_rxq_estimate_packet_buf_size\n");
+    err = doca_eth_rxq_estimate_packet_buf_size(
         DOCA_ETH_RXQ_TYPE_CYCLIC, 0, 0, MAX_PKT_SIZE, MAX_PKT_NUM,
-        0, 0, 0, &cyclic_buf_size));
+        0, 0, 0, &cyclic_buf_size);
+    fprintf(stderr, "[DBG]   -> %s (%d), buf_size=%u\n", doca_error_get_descr(err), (int)err, cyclic_buf_size);
+    if (err != DOCA_SUCCESS) return -1;
 
     size_t page_sz = get_page_size();
     cyclic_buf_size = ((cyclic_buf_size + page_sz - 1) / page_sz) * page_sz;
+    fprintf(stderr, "[DBG]   aligned buf_size=%u, page_sz=%zu\n", cyclic_buf_size, page_sz);
 
-    DOCA_CHECK(doca_gpu_mem_alloc(doca.gpu_dev, cyclic_buf_size, page_sz,
-                                   DOCA_GPU_MEM_TYPE_GPU,
-                                   &doca.gpu_pkt_buf, NULL));
+    fprintf(stderr, "[DBG] step 5: doca_gpu_mem_alloc(%u bytes)\n", cyclic_buf_size);
+    err = doca_gpu_mem_alloc(doca.gpu_dev, cyclic_buf_size, page_sz,
+                              DOCA_GPU_MEM_TYPE_GPU, &doca.gpu_pkt_buf, NULL);
+    fprintf(stderr, "[DBG]   -> %s (%d), ptr=%p\n", doca_error_get_descr(err), (int)err, doca.gpu_pkt_buf);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Create mmap for packet buffer */
-    DOCA_CHECK(doca_mmap_create(&doca.pkt_mmap));
-    DOCA_CHECK(doca_mmap_add_dev(doca.pkt_mmap, doca.dev));
+    fprintf(stderr, "[DBG] step 6: doca_mmap_create + add_dev\n");
+    err = doca_mmap_create(&doca.pkt_mmap);
+    fprintf(stderr, "[DBG]   create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
+    err = doca_mmap_add_dev(doca.pkt_mmap, doca.dev);
+    fprintf(stderr, "[DBG]   add_dev -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Try dmabuf first, fall back to nvidia-peermem */
+    fprintf(stderr, "[DBG] step 7: dmabuf or peermem\n");
     int dmabuf_fd = -1;
     doca_error_t dm_ret = doca_gpu_dmabuf_fd(doca.gpu_dev, doca.gpu_pkt_buf,
                                               cyclic_buf_size, &dmabuf_fd);
     if (dm_ret == DOCA_SUCCESS) {
-        fprintf(stderr, "[gpu_receiver] Using dmabuf mode (fd=%d)\n", dmabuf_fd);
-        DOCA_CHECK(doca_mmap_set_dmabuf_memrange(doca.pkt_mmap, dmabuf_fd,
-                                                   doca.gpu_pkt_buf, 0,
-                                                   cyclic_buf_size));
+        fprintf(stderr, "[DBG]   dmabuf fd=%d\n", dmabuf_fd);
+        err = doca_mmap_set_dmabuf_memrange(doca.pkt_mmap, dmabuf_fd,
+                                             doca.gpu_pkt_buf, 0, cyclic_buf_size);
+        fprintf(stderr, "[DBG]   set_dmabuf_memrange -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     } else {
-        fprintf(stderr, "[gpu_receiver] dmabuf unavailable, using nvidia-peermem\n");
-        DOCA_CHECK(doca_mmap_set_memrange(doca.pkt_mmap, doca.gpu_pkt_buf,
-                                           cyclic_buf_size));
+        fprintf(stderr, "[DBG]   dmabuf failed (%s), using peermem\n", doca_error_get_descr(dm_ret));
+        err = doca_mmap_set_memrange(doca.pkt_mmap, doca.gpu_pkt_buf, cyclic_buf_size);
+        fprintf(stderr, "[DBG]   set_memrange -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     }
+    if (err != DOCA_SUCCESS) return -1;
 
-    DOCA_CHECK(doca_mmap_set_permissions(doca.pkt_mmap,
-        DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING));
-    DOCA_CHECK(doca_mmap_start(doca.pkt_mmap));
+    fprintf(stderr, "[DBG] step 8: mmap permissions + start\n");
+    err = doca_mmap_set_permissions(doca.pkt_mmap,
+        DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING);
+    fprintf(stderr, "[DBG]   set_permissions -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
+    err = doca_mmap_start(doca.pkt_mmap);
+    fprintf(stderr, "[DBG]   mmap_start -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Attach packet buffer to RXQ */
-    DOCA_CHECK(doca_eth_rxq_set_pkt_buf(doca.rxq_cpu, doca.pkt_mmap,
-                                         0, cyclic_buf_size));
+    fprintf(stderr, "[DBG] step 9: doca_eth_rxq_set_pkt_buf\n");
+    err = doca_eth_rxq_set_pkt_buf(doca.rxq_cpu, doca.pkt_mmap, 0, cyclic_buf_size);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* Convert RXQ to context, set GPU datapath, start */
+    fprintf(stderr, "[DBG] step 10: doca_eth_rxq_as_doca_ctx\n");
     doca.rxq_ctx = doca_eth_rxq_as_doca_ctx(doca.rxq_cpu);
-    if (!doca.rxq_ctx) {
-        fprintf(stderr, "Failed doca_eth_rxq_as_doca_ctx\n");
-        return -1;
-    }
+    fprintf(stderr, "[DBG]   -> ctx=%p\n", (void*)doca.rxq_ctx);
+    if (!doca.rxq_ctx) return -1;
 
-    DOCA_CHECK(doca_ctx_set_datapath_on_gpu(doca.rxq_ctx, doca.gpu_dev));
-    DOCA_CHECK(doca_ctx_start(doca.rxq_ctx));
+    fprintf(stderr, "[DBG] step 11: doca_ctx_set_datapath_on_gpu\n");
+    err = doca_ctx_set_datapath_on_gpu(doca.rxq_ctx, doca.gpu_dev);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-    /* NOW get the GPU handle */
-    DOCA_CHECK(doca_eth_rxq_get_gpu_handle(doca.rxq_cpu, &doca.rxq_gpu));
+    fprintf(stderr, "[DBG] step 12: doca_ctx_start\n");
+    err = doca_ctx_start(doca.rxq_ctx);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
+
+    fprintf(stderr, "[DBG] step 13: doca_eth_rxq_get_gpu_handle\n");
+    err = doca_eth_rxq_get_gpu_handle(doca.rxq_cpu, &doca.rxq_gpu);
+    fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
     fprintf(stderr, "[gpu_receiver] DOCA init OK — GPU PCIe: %s\n", gpu_pcie);
     return 0;
