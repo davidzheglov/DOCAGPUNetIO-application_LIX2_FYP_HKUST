@@ -82,17 +82,40 @@ static const char *receiver_binary(int tier)
     }
 }
 
+/* ── Hardware config for tier-specific args ──────────────────────────────── */
+static std::string g_dpdk_pci  = "0000:bd:00.0";   /* T2: ConnectX-7 NIC PCIe */
+static std::string g_gpu_pcie  = "00000000:AC:00.0"; /* T4: GPU 1 PCIe */
+static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
+static int         g_gpu_id    = 1;                   /* T4: CUDA device */
+
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
 {
     std::vector<std::string> args;
+
+    if (tier == 2) {
+        /* DPDK EAL args come first, then "--" separator, then app args */
+        args.push_back("-a");
+        args.push_back(g_dpdk_pci);
+        args.push_back("-l");
+        args.push_back("0-1");
+        args.push_back("-n");
+        args.push_back("4");
+        args.push_back("--");
+    }
+
     args.push_back("--tier");
     args.push_back(std::to_string(tier));
-    if (tier == 5) {
-        /* T5: adapter is on DPU, GPU binary is the same */
-        args.push_back("--tier");
-        args.push_back("5");
+
+    if (tier == 4 || tier == 5) {
+        args.push_back("--gpu");
+        args.push_back(std::to_string(g_gpu_id));
+        args.push_back("--gpu-pcie");
+        args.push_back(g_gpu_pcie);
+        args.push_back("--nic-pcie");
+        args.push_back(g_nic_pcie);
     }
+
     return args;
 }
 
@@ -317,6 +340,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--reps")     && i+1<argc) reps         = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--tiers")    && i+1<argc) tiers_str    = argv[++i];
         else if (!strcmp(argv[i],"--rates")    && i+1<argc) rates_str    = argv[++i];
+        else if (!strcmp(argv[i],"--dpdk-pci") && i+1<argc) g_dpdk_pci   = argv[++i];
+        else if (!strcmp(argv[i],"--gpu-pcie") && i+1<argc) g_gpu_pcie   = argv[++i];
+        else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
+        else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
     }
 
     /* Parse tier list */
