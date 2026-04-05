@@ -113,8 +113,9 @@ $(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
 		    -Xcompiler "$(DPDK_CFLAGS)" \
-		    $< -o $@ -Xlinker "$(DPDK_LIBS)"; \
-		echo "  [OK] $@"; \
+		    $< -o $@ -Xcompiler "$(DPDK_LIBS)" \
+		&& echo "  [OK] $@" \
+		|| echo "  [FAIL] T2: link failed"; \
 	fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
