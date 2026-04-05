@@ -48,9 +48,9 @@ DOCA_LIBS := -L$(DOCA_ROOT)/lib/x86_64-linux-gnu \
              -ldoca_gpunetio -ldoca_eth -ldoca_flow \
              -ldoca_common -ldoca_argp -lcuda -lcudart
 
-# DPDK (via pkg-config)
+# DPDK (via pkg-config) — strip -Wl,... flags that nvcc can't handle
 DPDK_CFLAGS  := $(shell pkg-config --cflags libdpdk 2>/dev/null)
-DPDK_LIBS    := $(shell pkg-config --libs   libdpdk 2>/dev/null)
+DPDK_LIBS    := $(filter-out -Wl%,$(shell pkg-config --libs libdpdk 2>/dev/null))
 
 # ibverbs for T3 GPU RDMA
 RDMA_LIBS := -libverbs
@@ -113,7 +113,7 @@ $(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
 		    -Xcompiler "$(DPDK_CFLAGS)" \
-		    $< -o $@ -Xcompiler "$(DPDK_LIBS)" \
+		    $< -o $@ $(DPDK_LIBS) \
 		&& echo "  [OK] $@" \
 		|| echo "  [FAIL] T2: link failed"; \
 	fi
