@@ -323,27 +323,34 @@ static size_t get_page_size(void)
     return (ret > 0) ? (size_t)ret : 4096;
 }
 
-static int doca_init(DocaContext &doca, const char *gpu_pcie, int cuda_device)
+static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pcie,
+                     int cuda_device)
 {
     CUDA_CHECK(cudaSetDevice(cuda_device));
 
-    /* Open DOCA device — use first available */
+    /* Open DOCA device by NIC PCIe address */
     struct doca_devinfo **dev_list;
     uint32_t nb_devs;
     DOCA_CHECK(doca_devinfo_create_list(&dev_list, &nb_devs));
 
     bool found = false;
     for (uint32_t i = 0; i < nb_devs; ++i) {
-        doca_error_t r = doca_dev_open(dev_list[i], &doca.dev);
-        if (r == DOCA_SUCCESS) {
-            fprintf(stderr, "[gpu_receiver] DOCA device opened: index %u\n", i);
-            found = true;
-            break;
+        uint8_t is_equal = 0;
+        doca_error_t r = doca_devinfo_is_equal_pci_addr(dev_list[i], nic_pcie,
+                                                         &is_equal);
+        if (r == DOCA_SUCCESS && is_equal) {
+            r = doca_dev_open(dev_list[i], &doca.dev);
+            if (r == DOCA_SUCCESS) {
+                fprintf(stderr, "[gpu_receiver] DOCA NIC device opened: %s\n",
+                        nic_pcie);
+                found = true;
+                break;
+            }
         }
     }
     doca_devinfo_destroy_list(dev_list);
     if (!found) {
-        fprintf(stderr, "No DOCA device found\n");
+        fprintf(stderr, "DOCA device for NIC PCIe '%s' not found\n", nic_pcie);
         return -1;
     }
 
@@ -432,6 +439,7 @@ static void sig_handler(int) { g_quit = 1; }
 int main(int argc, char **argv)
 {
     const char *gpu_pcie      = "";
+    const char *nic_pcie      = "";
     int         cuda_device   = 1;   /* GPU 1 (GPU 0 has VLLM) */
     uint8_t     tier          = 4;
     const char *harness_ip    = "127.0.0.1";
@@ -439,13 +447,15 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--gpu-pcie")  && i+1<argc) gpu_pcie     = argv[++i];
+        else if (!strcmp(argv[i],"--nic-pcie")  && i+1<argc) nic_pcie     = argv[++i];
         else if (!strcmp(argv[i],"--gpu")       && i+1<argc) cuda_device  = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip   = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
     }
 
-    fprintf(stderr, "[T%d gpu_receiver] gpu=%d pcie=%s\n", tier, cuda_device, gpu_pcie);
+    fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
+            tier, cuda_device, gpu_pcie, nic_pcie);
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -459,7 +469,7 @@ int main(int argc, char **argv)
 
     /* DOCA init */
     DocaContext doca{};
-    if (doca_init(doca, gpu_pcie, cuda_device) < 0) return 1;
+    if (doca_init(doca, nic_pcie, gpu_pcie, cuda_device) < 0) return 1;
 
     /* Per-instrument state arrays */
     double *d_fast_ema = nullptr, *d_slow_ema = nullptr;
