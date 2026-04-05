@@ -28,6 +28,7 @@
 #include <doca_error.h>
 #include <doca_mmap.h>
 #include <doca_ctx.h>
+#include <doca_flow.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -310,6 +311,7 @@ static void cpu_forward_thread(ForwardCtx *ctx)
 struct DocaContext {
     struct doca_dev         *dev       = nullptr;
     struct doca_gpu         *gpu_dev   = nullptr;
+    struct doca_flow_port   *flow_port = nullptr;
     struct doca_eth_rxq     *rxq_cpu   = nullptr;
     struct doca_gpu_eth_rxq *rxq_gpu   = nullptr;
     struct doca_mmap        *pkt_mmap  = nullptr;
@@ -361,6 +363,50 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     err = doca_gpu_create(gpu_pcie, &doca.gpu_dev);
     fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     if (err != DOCA_SUCCESS) return -1;
+
+    /* DOCA Flow init — required before RXQ ctx_start */
+    fprintf(stderr, "[DBG] step 1b: doca_flow_init + port_start\n");
+    {
+        struct doca_flow_cfg *flow_cfg = nullptr;
+        err = doca_flow_cfg_create(&flow_cfg);
+        fprintf(stderr, "[DBG]   flow_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        err = doca_flow_cfg_set_pipe_queues(flow_cfg, 1);
+        fprintf(stderr, "[DBG]   set_pipe_queues(1) -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_cfg_destroy(flow_cfg); return -1; }
+
+        err = doca_flow_cfg_set_mode_args(flow_cfg, "vnf,hws,isolated");
+        fprintf(stderr, "[DBG]   set_mode_args -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_cfg_destroy(flow_cfg); return -1; }
+
+        err = doca_flow_cfg_set_nr_counters(flow_cfg, 1024);
+        fprintf(stderr, "[DBG]   set_nr_counters -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_cfg_destroy(flow_cfg); return -1; }
+
+        err = doca_flow_init(flow_cfg);
+        fprintf(stderr, "[DBG]   doca_flow_init -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        doca_flow_cfg_destroy(flow_cfg);
+        if (err != DOCA_SUCCESS) return -1;
+
+        struct doca_flow_port_cfg *port_cfg = nullptr;
+        err = doca_flow_port_cfg_create(&port_cfg);
+        fprintf(stderr, "[DBG]   port_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        err = doca_flow_port_cfg_set_port_id(port_cfg, 0);
+        fprintf(stderr, "[DBG]   set_port_id(0) -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_port_cfg_destroy(port_cfg); return -1; }
+
+        err = doca_flow_port_cfg_set_dev(port_cfg, doca.dev);
+        fprintf(stderr, "[DBG]   set_dev -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_port_cfg_destroy(port_cfg); return -1; }
+
+        err = doca_flow_port_start(port_cfg, &doca.flow_port);
+        fprintf(stderr, "[DBG]   doca_flow_port_start -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        doca_flow_port_cfg_destroy(port_cfg);
+        if (err != DOCA_SUCCESS) return -1;
+    }
 
     fprintf(stderr, "[DBG] step 2: doca_eth_rxq_create(MAX_PKT_NUM=%d, MAX_PKT_SIZE=%d)\n",
             MAX_PKT_NUM, MAX_PKT_SIZE);
@@ -571,6 +617,8 @@ int main(int argc, char **argv)
     /* Cleanup */
     doca_ctx_stop(doca.rxq_ctx);
     doca_eth_rxq_destroy(doca.rxq_cpu);
+    if (doca.flow_port) doca_flow_port_stop(doca.flow_port);
+    doca_flow_destroy();
     doca_mmap_destroy(doca.pkt_mmap);
     if (doca.gpu_pkt_buf) doca_gpu_mem_free(doca.gpu_dev, doca.gpu_pkt_buf);
     doca_gpu_destroy(doca.gpu_dev);
