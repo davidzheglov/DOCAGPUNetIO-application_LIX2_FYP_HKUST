@@ -19,7 +19,6 @@
  */
 
 #include <infiniband/verbs.h>
-#include <rdma/rdma_cma.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

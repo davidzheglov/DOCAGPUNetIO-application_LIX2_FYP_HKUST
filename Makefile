@@ -39,7 +39,7 @@ BINDIR    := bin
 
 # WebSocket support for --mode live (requires libwebsockets)
 WS_LIBS   := -lwebsockets -lssl -lcrypto -lpthread
-WS_FLAGS  := -DHAS_WEBSOCKETS
+WS_FLAGS  := -DENABLE_LIVE_FEED
 
 # DOCA SDK
 DOCA_ROOT ?= /opt/mellanox/doca
@@ -113,7 +113,7 @@ $(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
 		    -Xcompiler "$(DPDK_CFLAGS)" \
-		    $< -o $@ $(DPDK_LIBS); \
+		    $< -o $@ -Xlinker "$(DPDK_LIBS)"; \
 		echo "  [OK] $@"; \
 	fi
 
@@ -151,6 +151,7 @@ $(T4_BIN): $(T4_SRC) $(COMMON_HDRS) | $(BINDIR)
 		echo "         Install DOCA SDK or set DOCA_ROOT=/path/to/doca"; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $(DOCA_INC) \
+		    -DALLOW_EXPERIMENTAL_API \
 		    $< -o $@ $(DOCA_LIBS); \
 		echo "  [OK] $@  (T4 + T5 share this binary)"; \
 	fi

@@ -327,7 +327,7 @@ static void run_live(const std::vector<std::string> &symbols,
         struct lws_client_connect_info ccinfo{};
         ccinfo.context       = lws_ctx;
         ccinfo.address       = "stream.binance.com";
-        ccinfo.port          = 9443;
+        ccinfo.port          = 443;
         ccinfo.path          = path.c_str();
         ccinfo.host          = ccinfo.address;
         ccinfo.origin        = ccinfo.address;
