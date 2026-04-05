@@ -152,8 +152,9 @@ $(T4_BIN): $(T4_SRC) $(COMMON_HDRS) | $(BINDIR)
 		echo "         Install DOCA SDK or set DOCA_ROOT=/path/to/doca"; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $(DOCA_INC) \
+		    -Xcompiler "$(DPDK_CFLAGS)" \
 		    -DALLOW_EXPERIMENTAL_API \
-		    $< -o $@ $(DOCA_LIBS); \
+		    $< -o $@ $(DOCA_LIBS) -ldoca_dpdk $(DPDK_LIBS); \
 		echo "  [OK] $@  (T4 + T5 share this binary)"; \
 	fi
 

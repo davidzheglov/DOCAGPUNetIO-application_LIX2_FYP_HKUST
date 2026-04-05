@@ -29,6 +29,8 @@
 #include <doca_mmap.h>
 #include <doca_ctx.h>
 #include <doca_flow.h>
+#include <doca_dpdk.h>
+#include <rte_eal.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -363,6 +365,30 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     err = doca_gpu_create(gpu_pcie, &doca.gpu_dev);
     fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     if (err != DOCA_SUCCESS) return -1;
+
+    /* Initialize DPDK EAL — required for DOCA Flow */
+    fprintf(stderr, "[DBG] step 1a: DPDK EAL init + port probe\n");
+    {
+        char *eal_args[] = {
+            (char*)"gpu_receiver",
+            (char*)"-a", (char*)"00:00.0",  /* dummy — we use doca_dpdk_port_probe */
+            (char*)"--no-pci",
+            NULL
+        };
+        int eal_argc = 4;
+        int eal_ret = rte_eal_init(eal_argc, eal_args);
+        fprintf(stderr, "[DBG]   rte_eal_init -> %d\n", eal_ret);
+        if (eal_ret < 0) {
+            fprintf(stderr, "[DBG]   EAL init failed: %s\n", rte_strerror(rte_errno));
+            return -1;
+        }
+
+        /* Probe the NIC as a DPDK port via DOCA */
+        err = doca_dpdk_port_probe(doca.dev, "dv_flow_en=2");
+        fprintf(stderr, "[DBG]   doca_dpdk_port_probe -> %s (%d)\n",
+                doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+    }
 
     /* DOCA Flow init — required before RXQ ctx_start */
     fprintf(stderr, "[DBG] step 1b: doca_flow_init + port_start\n");
