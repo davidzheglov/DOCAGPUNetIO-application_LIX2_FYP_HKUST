@@ -26,6 +26,8 @@
 #include <doca_eth_rxq.h>
 #include <doca_dev.h>
 #include <doca_error.h>
+#include <doca_mmap.h>
+#include <doca_ctx.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -310,7 +312,16 @@ struct DocaContext {
     struct doca_gpu         *gpu_dev   = nullptr;
     struct doca_eth_rxq     *rxq_cpu   = nullptr;
     struct doca_gpu_eth_rxq *rxq_gpu   = nullptr;
+    struct doca_mmap        *pkt_mmap  = nullptr;
+    struct doca_ctx         *rxq_ctx   = nullptr;
+    void                    *gpu_pkt_buf = nullptr;
 };
+
+static size_t get_page_size(void)
+{
+    long ret = sysconf(_SC_PAGESIZE);
+    return (ret > 0) ? (size_t)ret : 4096;
+}
 
 static int doca_init(DocaContext &doca, const char *gpu_pcie, int cuda_device)
 {
@@ -346,7 +357,57 @@ static int doca_init(DocaContext &doca, const char *gpu_pcie, int cuda_device)
     /* Set RXQ type to CYCLIC for GPU-side receive */
     DOCA_CHECK(doca_eth_rxq_set_type(doca.rxq_cpu, DOCA_ETH_RXQ_TYPE_CYCLIC));
 
-    /* Get GPU handle */
+    /* Estimate and allocate GPU packet buffer */
+    uint32_t cyclic_buf_size = 0;
+    DOCA_CHECK(doca_eth_rxq_estimate_packet_buf_size(
+        DOCA_ETH_RXQ_TYPE_CYCLIC, 0, 0, MAX_PKT_SIZE, MAX_PKT_NUM,
+        0, 0, 0, &cyclic_buf_size));
+
+    size_t page_sz = get_page_size();
+    cyclic_buf_size = ((cyclic_buf_size + page_sz - 1) / page_sz) * page_sz;
+
+    DOCA_CHECK(doca_gpu_mem_alloc(doca.gpu_dev, cyclic_buf_size, page_sz,
+                                   DOCA_GPU_MEM_TYPE_GPU,
+                                   &doca.gpu_pkt_buf, NULL));
+
+    /* Create mmap for packet buffer */
+    DOCA_CHECK(doca_mmap_create(&doca.pkt_mmap));
+    DOCA_CHECK(doca_mmap_add_dev(doca.pkt_mmap, doca.dev));
+
+    /* Try dmabuf first, fall back to nvidia-peermem */
+    int dmabuf_fd = -1;
+    doca_error_t dm_ret = doca_gpu_dmabuf_fd(doca.gpu_dev, doca.gpu_pkt_buf,
+                                              cyclic_buf_size, &dmabuf_fd);
+    if (dm_ret == DOCA_SUCCESS) {
+        fprintf(stderr, "[gpu_receiver] Using dmabuf mode (fd=%d)\n", dmabuf_fd);
+        DOCA_CHECK(doca_mmap_set_dmabuf_memrange(doca.pkt_mmap, dmabuf_fd,
+                                                   doca.gpu_pkt_buf, 0,
+                                                   cyclic_buf_size));
+    } else {
+        fprintf(stderr, "[gpu_receiver] dmabuf unavailable, using nvidia-peermem\n");
+        DOCA_CHECK(doca_mmap_set_memrange(doca.pkt_mmap, doca.gpu_pkt_buf,
+                                           cyclic_buf_size));
+    }
+
+    DOCA_CHECK(doca_mmap_set_permissions(doca.pkt_mmap,
+        DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_PCI_RELAXED_ORDERING));
+    DOCA_CHECK(doca_mmap_start(doca.pkt_mmap));
+
+    /* Attach packet buffer to RXQ */
+    DOCA_CHECK(doca_eth_rxq_set_pkt_buf(doca.rxq_cpu, doca.pkt_mmap,
+                                         0, cyclic_buf_size));
+
+    /* Convert RXQ to context, set GPU datapath, start */
+    doca.rxq_ctx = doca_eth_rxq_as_doca_ctx(doca.rxq_cpu);
+    if (!doca.rxq_ctx) {
+        fprintf(stderr, "Failed doca_eth_rxq_as_doca_ctx\n");
+        return -1;
+    }
+
+    DOCA_CHECK(doca_ctx_set_datapath_on_gpu(doca.rxq_ctx, doca.gpu_dev));
+    DOCA_CHECK(doca_ctx_start(doca.rxq_ctx));
+
+    /* NOW get the GPU handle */
     DOCA_CHECK(doca_eth_rxq_get_gpu_handle(doca.rxq_cpu, &doca.rxq_gpu));
 
     fprintf(stderr, "[gpu_receiver] DOCA init OK — GPU PCIe: %s\n", gpu_pcie);
@@ -466,7 +527,10 @@ int main(int argc, char **argv)
     fwd_thread.join();
 
     /* Cleanup */
+    doca_ctx_stop(doca.rxq_ctx);
     doca_eth_rxq_destroy(doca.rxq_cpu);
+    doca_mmap_destroy(doca.pkt_mmap);
+    if (doca.gpu_pkt_buf) doca_gpu_mem_free(doca.gpu_dev, doca.gpu_pkt_buf);
     doca_gpu_destroy(doca.gpu_dev);
     doca_dev_close(doca.dev);
 
