@@ -29,8 +29,6 @@
 #include <doca_mmap.h>
 #include <doca_ctx.h>
 #include <doca_flow.h>
-#include <doca_dpdk.h>
-#include <rte_eal.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -366,31 +364,7 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     if (err != DOCA_SUCCESS) return -1;
 
-    /* Initialize DPDK EAL — required for DOCA Flow */
-    fprintf(stderr, "[DBG] step 1a: DPDK EAL init + port probe\n");
-    {
-        char *eal_args[] = {
-            (char*)"gpu_receiver",
-            (char*)"-a", (char*)"00:00.0",  /* dummy — we use doca_dpdk_port_probe */
-            (char*)"--no-pci",
-            NULL
-        };
-        int eal_argc = 4;
-        int eal_ret = rte_eal_init(eal_argc, eal_args);
-        fprintf(stderr, "[DBG]   rte_eal_init -> %d\n", eal_ret);
-        if (eal_ret < 0) {
-            fprintf(stderr, "[DBG]   EAL init failed: %s\n", rte_strerror(rte_errno));
-            return -1;
-        }
-
-        /* Probe the NIC as a DPDK port via DOCA */
-        err = doca_dpdk_port_probe(doca.dev, "dv_flow_en=2");
-        fprintf(stderr, "[DBG]   doca_dpdk_port_probe -> %s (%d)\n",
-                doca_error_get_descr(err), (int)err);
-        if (err != DOCA_SUCCESS) return -1;
-    }
-
-    /* DOCA Flow init — required before RXQ ctx_start */
+    /* DOCA Flow init — required before RXQ ctx_start (must run as root) */
     fprintf(stderr, "[DBG] step 1b: doca_flow_init + port_start\n");
     {
         struct doca_flow_cfg *flow_cfg = nullptr;
@@ -593,10 +567,12 @@ int main(int argc, char **argv)
     *ring.head = 0;
     ring.tail  = 0;
 
-    /* Quit flag (device-accessible) */
+    /* Quit flag — host-pinned mapped memory so CPU writes are
+     * immediately visible to the GPU without cudaMemcpy */
     uint32_t *d_quit = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_quit, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_quit, 0, sizeof(uint32_t)));
+    CUDA_CHECK(cudaHostAlloc(&d_quit, sizeof(uint32_t),
+                              cudaHostAllocMapped | cudaHostAllocWriteCombined));
+    *d_quit = 0;
 
     /* Output sockets */
     sockaddr_in harness_dest{}, signal_dest{};
@@ -631,10 +607,15 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[gpu_receiver] stopping...\n");
 
-    /* Signal kernel to stop */
-    uint32_t one = 1;
-    CUDA_CHECK(cudaMemcpy(d_quit, &one, sizeof(one), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    /* Signal kernel to stop — d_quit is host-mapped, GPU sees it immediately */
+    *d_quit = 1;
+    __sync_synchronize();  /* memory fence */
+
+    /* Wait for kernel with timeout */
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess)
+        fprintf(stderr, "[gpu_receiver] cudaDeviceSynchronize: %s\n",
+                cudaGetErrorString(sync_err));
 
     /* Stop forwarding thread */
     fwd_ctx.stop = true;
@@ -655,7 +636,7 @@ int main(int argc, char **argv)
     cudaFree(d_avg_gain);
     cudaFree(d_avg_loss);
     cudaFree(d_last_mid);
-    cudaFree(d_quit);
+    cudaFreeHost(d_quit);
     cudaFreeHost(ring.slots);
     cudaFreeHost(ring.head);
     close(harness_fd);
