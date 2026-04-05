@@ -59,6 +59,9 @@ using NS    = std::chrono::nanoseconds;
  *  Multicast socket helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
+/* Global: if set via --iface, forces multicast out a specific NIC */
+static const char *g_mcast_iface = nullptr;
+
 static int make_mcast_send_socket(const char *mcast_addr, int port,
                                    sockaddr_in &dest)
 {
@@ -69,8 +72,18 @@ static int make_mcast_send_socket(const char *mcast_addr, int port,
     int ttl = 1;
     setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    /* Disable loopback if we're not testing locally */
-    /* int loop = 0; setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)); */
+    /* Bind multicast output to a specific NIC interface (bypasses loopback) */
+    if (g_mcast_iface) {
+        struct in_addr iface_addr{};
+        iface_addr.s_addr = inet_addr(g_mcast_iface);
+        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
+                        &iface_addr, sizeof(iface_addr)) < 0) {
+            perror("IP_MULTICAST_IF");
+        } else {
+            fprintf(stderr, "[data_source] multicast bound to interface %s\n",
+                    g_mcast_iface);
+        }
+    }
 
     memset(&dest, 0, sizeof(dest));
     dest.sin_family      = AF_INET;
@@ -382,7 +395,11 @@ static void usage(const char *prog)
         "Live options:\n"
         "  --symbols <SYM,...>   comma-separated symbols (default: BTCUSDT,ETHUSDT)\n"
         "\n"
-        "Both mode runs replay + live simultaneously at --rate/2 each.\n",
+        "Both mode runs replay + live simultaneously at --rate/2 each.\n"
+        "\n"
+        "Network options:\n"
+        "  --iface <IP>          bind multicast to NIC with this IP\n"
+        "                        (required for T2/T4 — sends via physical NIC)\n",
         prog);
 }
 
@@ -398,6 +415,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--csv")     && i + 1 < argc) csv_path    = argv[++i];
         else if (!strcmp(argv[i], "--rate")    && i + 1 < argc) rate_hz     = atol(argv[++i]);
         else if (!strcmp(argv[i], "--symbols") && i + 1 < argc) symbols_str = argv[++i];
+        else if (!strcmp(argv[i], "--iface")   && i + 1 < argc) g_mcast_iface = argv[++i];
         else if (!strcmp(argv[i], "--help"))  { usage(argv[0]); return 0; }
     }
 

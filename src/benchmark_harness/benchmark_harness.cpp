@@ -87,6 +87,7 @@ static std::string g_dpdk_pci  = "0000:bd:00.0";   /* T2: ConnectX-7 NIC PCIe */
 static std::string g_gpu_pcie  = "00000000:AC:00.0"; /* T4: GPU 1 PCIe */
 static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
 static int         g_gpu_id    = 1;                   /* T4: CUDA device */
+static std::string g_mcast_iface;                     /* NIC IP for multicast output */
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
@@ -223,6 +224,11 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "--csv",  csv_path,
         "--rate", std::to_string(rate_hz)
     };
+    /* For T2/T4: route multicast through the physical NIC */
+    if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
+        ds_args.push_back("--iface");
+        ds_args.push_back(g_mcast_iface);
+    }
 
     /* Kill any leftover receivers/sources from a previous run */
     system("pkill -f bin/cpu_receiver  2>/dev/null; "
@@ -344,6 +350,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--gpu-pcie") && i+1<argc) g_gpu_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--iface")   && i+1<argc) g_mcast_iface = argv[++i];
     }
 
     /* Parse tier list */
