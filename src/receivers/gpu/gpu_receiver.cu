@@ -495,6 +495,59 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     if (err != DOCA_SUCCESS) return -1;
 
+    /* step 14: create DOCA Flow root pipe that steers UDP -> GPU rxq.
+     * Without this, isolated-mode port delivers zero packets. */
+    fprintf(stderr, "[DBG] step 14: create UDP->GPU_RXQ flow pipe\n");
+    {
+        struct doca_flow_match match = {};
+        match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+        match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+
+        err = doca_eth_rxq_apply_queue_id(doca.rxq_cpu, 0);
+        fprintf(stderr, "[DBG]   apply_queue_id(0) -> %s (%d)\n",
+                doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        uint16_t rss_queues[1] = { 0 };
+        struct doca_flow_fwd fwd = {};
+        fwd.type             = DOCA_FLOW_FWD_RSS;
+        fwd.rss_type         = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+        fwd.rss.queues_array = rss_queues;
+        fwd.rss.outer_flags  = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP;
+        fwd.rss.nr_queues    = 1;
+
+        struct doca_flow_fwd miss_fwd = {};
+        miss_fwd.type = DOCA_FLOW_FWD_DROP;
+
+        struct doca_flow_pipe_cfg *pipe_cfg = nullptr;
+        err = doca_flow_pipe_cfg_create(&pipe_cfg, doca.flow_port);
+        fprintf(stderr, "[DBG]   pipe_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        doca_flow_pipe_cfg_set_name(pipe_cfg, "GPU_RXQ_UDP_PIPE");
+        doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
+        doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
+        err = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
+        fprintf(stderr, "[DBG]   set_match -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) { doca_flow_pipe_cfg_destroy(pipe_cfg); return -1; }
+
+        struct doca_flow_pipe *rxq_pipe = nullptr;
+        err = doca_flow_pipe_create(pipe_cfg, &fwd, &miss_fwd, &rxq_pipe);
+        fprintf(stderr, "[DBG]   pipe_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        doca_flow_pipe_cfg_destroy(pipe_cfg);
+        if (err != DOCA_SUCCESS) return -1;
+
+        struct doca_flow_pipe_entry *entry = nullptr;
+        err = doca_flow_pipe_add_entry(0, rxq_pipe, &match, 0, NULL, NULL, NULL,
+                                        DOCA_FLOW_NO_WAIT, NULL, &entry);
+        fprintf(stderr, "[DBG]   pipe_add_entry -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        err = doca_flow_entries_process(doca.flow_port, 0, 10000, 4);
+        fprintf(stderr, "[DBG]   entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+    }
+
     fprintf(stderr, "[gpu_receiver] DOCA init OK — GPU PCIe: %s\n", gpu_pcie);
     return 0;
 }
