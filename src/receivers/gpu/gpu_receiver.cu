@@ -499,9 +499,9 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
      * Without this, isolated-mode port delivers zero packets. */
     fprintf(stderr, "[DBG] step 14: create UDP->GPU_RXQ flow pipe\n");
     {
+        /* Root matcher cannot use parser_meta fields — use empty match
+         * (match-all) so the root pipe steers everything to GPU rxq. */
         struct doca_flow_match match = {};
-        match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
-        match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
 
         err = doca_eth_rxq_apply_queue_id(doca.rxq_cpu, 0);
         fprintf(stderr, "[DBG]   apply_queue_id(0) -> %s (%d)\n",
