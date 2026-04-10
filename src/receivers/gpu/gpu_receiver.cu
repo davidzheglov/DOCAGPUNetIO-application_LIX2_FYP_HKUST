@@ -134,6 +134,23 @@ __global__ void gpu_recv_process_kernel(
 {
     const int tid = threadIdx.x;
 
+    /* ── Diagnostic counters (thread 0 only) ── */
+    __shared__ uint64_t s_poll_count;
+    __shared__ uint64_t s_recv_count;
+    __shared__ uint64_t s_pkt_total;
+    __shared__ uint64_t s_addr_zero;
+    __shared__ uint64_t s_port_miss;
+    __shared__ uint64_t s_ring_writes;
+    if (tid == 0) {
+        s_poll_count  = 0;
+        s_recv_count  = 0;
+        s_pkt_total   = 0;
+        s_addr_zero   = 0;
+        s_port_miss   = 0;
+        s_ring_writes = 0;
+    }
+    __syncthreads();
+
     while (!*quit_flag) {
         /* ── Receive a burst of packets (block-scope) ── */
         uint64_t first_pkt_idx = 0;
@@ -152,6 +169,35 @@ __global__ void gpu_recv_process_kernel(
 
         __syncthreads();
 
+        /* ── Diagnostic: periodic poll stats from thread 0 ── */
+        if (tid == 0) {
+            s_poll_count++;
+            if (ret != DOCA_SUCCESS && ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
+                if (s_poll_count <= 5 || s_poll_count % 10000 == 0)
+                    printf("[GPU] poll #%llu: recv returned error %d (n_pkts=%u)\n",
+                           (unsigned long long)s_poll_count, (int)ret, n_pkts);
+            }
+            if (n_pkts > 0) {
+                s_recv_count++;
+                s_pkt_total += n_pkts;
+                if (s_recv_count <= 10 || s_recv_count % 100 == 0)
+                    printf("[GPU] poll #%llu: GOT %u pkts (total bursts=%llu, total pkts=%llu)\n",
+                           (unsigned long long)s_poll_count, n_pkts,
+                           (unsigned long long)s_recv_count,
+                           (unsigned long long)s_pkt_total);
+            }
+            /* Print periodic heartbeat every 50000 polls */
+            if (s_poll_count % 50000 == 0)
+                printf("[GPU] heartbeat: %llu polls, %llu bursts, %llu pkts, "
+                       "%llu addr_zero, %llu port_miss, %llu ring_writes\n",
+                       (unsigned long long)s_poll_count,
+                       (unsigned long long)s_recv_count,
+                       (unsigned long long)s_pkt_total,
+                       (unsigned long long)s_addr_zero,
+                       (unsigned long long)s_port_miss,
+                       (unsigned long long)s_ring_writes);
+        }
+
         if (ret != DOCA_SUCCESS || n_pkts == 0) continue;
 
         /* ── Each thread processes one packet ── */
@@ -163,10 +209,34 @@ __global__ void gpu_recv_process_kernel(
             const uint8_t *pkt = reinterpret_cast<const uint8_t *>(buf_addr);
 
             /* Verify minimum length */
+            if (buf_addr == 0) {
+                atomicAdd((unsigned long long *)&s_addr_zero, 1ULL);
+                if (tid == 0) printf("[GPU] pkt %d: buf_addr is NULL!\n", tid);
+            }
             if (buf_addr != 0) {
                 /* Skip Ethernet + IP + UDP headers */
                 const uint8_t *udp_hdr = pkt + 14 + 20;
                 uint16_t dst_port = (uint16_t)((udp_hdr[2] << 8) | udp_hdr[3]);
+
+                /* Diagnostic: print first few packet headers */
+                if (s_pkt_total <= 5 && tid == 0) {
+                    printf("[GPU] pkt header dump (first 48 bytes):\n");
+                    printf("[GPU]   ETH dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                           "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
+                           pkt[0],pkt[1],pkt[2],pkt[3],pkt[4],pkt[5],
+                           pkt[6],pkt[7],pkt[8],pkt[9],pkt[10],pkt[11],
+                           pkt[12],pkt[13]);
+                    printf("[GPU]   IP: proto=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u\n",
+                           pkt[23], pkt[26],pkt[27],pkt[28],pkt[29],
+                           pkt[30],pkt[31],pkt[32],pkt[33]);
+                    printf("[GPU]   UDP: src_port=%u dst_port=%u (expected %u)\n",
+                           (unsigned)((udp_hdr[0]<<8)|udp_hdr[1]),
+                           (unsigned)dst_port, (unsigned)TICK_MCAST_PORT);
+                }
+
+                if (dst_port != TICK_MCAST_PORT) {
+                    atomicAdd((unsigned long long *)&s_port_miss, 1ULL);
+                }
 
                 if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
@@ -250,6 +320,7 @@ __global__ void gpu_recv_process_kernel(
                     rslot->bench.t4_ns  = t4;
                     rslot->signal.t4_ns = t4;
 
+                    atomicAdd((unsigned long long *)&s_ring_writes, 1ULL);
                     processed = true;
                 }
             }
@@ -279,8 +350,28 @@ static uint64_t cyc_to_ns(uint64_t cyc, double ns_per_cyc)
 
 static void cpu_forward_thread(ForwardCtx *ctx)
 {
+    uint64_t fwd_count = 0;
+    uint64_t last_report = 0;
+    auto start_time = std::chrono::steady_clock::now();
+
+    fprintf(stderr, "[CPU-FWD] forwarding thread started, ring depth=%u\n",
+            ctx->ring->depth);
+
     while (!ctx->stop.load()) {
         uint64_t head = *ctx->ring->head;
+
+        /* Periodic report even when idle */
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed > 0 && elapsed % 5 == 0 && (uint64_t)elapsed != last_report) {
+            last_report = elapsed;
+            fprintf(stderr, "[CPU-FWD] %llds: ring head=%llu tail=%llu forwarded=%llu\n",
+                    (long long)elapsed,
+                    (unsigned long long)head,
+                    (unsigned long long)ctx->ring->tail,
+                    (unsigned long long)fwd_count);
+        }
+
         while (ctx->ring->tail < head) {
             uint64_t idx = ctx->ring->tail % ctx->ring->depth;
             ResultSlot *rs = &ctx->ring->slots[idx];
@@ -294,17 +385,26 @@ static void cpu_forward_thread(ForwardCtx *ctx)
             sig.t3_ns = br.t3_ns;
             sig.t4_ns = br.t4_ns;
 
-            sendto(ctx->harness_fd, &br, sizeof(br), 0,
+            ssize_t s1 = sendto(ctx->harness_fd, &br, sizeof(br), 0,
                    reinterpret_cast<const sockaddr *>(&ctx->harness_dest),
                    sizeof(ctx->harness_dest));
-            sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
+            ssize_t s2 = sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
                    reinterpret_cast<const sockaddr *>(&ctx->signal_dest),
                    sizeof(ctx->signal_dest));
+
+            fwd_count++;
+            if (fwd_count <= 5 || fwd_count % 500 == 0) {
+                fprintf(stderr, "[CPU-FWD] #%llu: tick=%u sendto=%zd/%zd\n",
+                        (unsigned long long)fwd_count, br.tick_id, s1, s2);
+            }
 
             ++ctx->ring->tail;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
+
+    fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu\n",
+            (unsigned long long)fwd_count);
 }
 
 /* ── DOCA host-side initialisation (DOCA 3.x API) ─────────────────────── */
