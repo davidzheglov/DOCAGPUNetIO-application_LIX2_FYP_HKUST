@@ -409,14 +409,15 @@ static void cpu_forward_thread(ForwardCtx *ctx)
 
 /* ── DOCA host-side initialisation (DOCA 3.x API) ─────────────────────── */
 struct DocaContext {
-    struct doca_dev         *dev       = nullptr;
-    struct doca_gpu         *gpu_dev   = nullptr;
-    struct doca_flow_port   *flow_port = nullptr;
-    struct doca_eth_rxq     *rxq_cpu   = nullptr;
-    struct doca_gpu_eth_rxq *rxq_gpu   = nullptr;
-    struct doca_mmap        *pkt_mmap  = nullptr;
-    struct doca_ctx         *rxq_ctx   = nullptr;
-    void                    *gpu_pkt_buf = nullptr;
+    struct doca_dev              *dev        = nullptr;
+    struct doca_gpu              *gpu_dev    = nullptr;
+    struct doca_flow_port        *flow_port  = nullptr;
+    struct doca_eth_rxq          *rxq_cpu    = nullptr;
+    struct doca_gpu_eth_rxq      *rxq_gpu    = nullptr;
+    struct doca_mmap             *pkt_mmap   = nullptr;
+    struct doca_ctx              *rxq_ctx    = nullptr;
+    void                         *gpu_pkt_buf = nullptr;
+    struct doca_flow_pipe_entry  *flow_entry = nullptr;  /* for counter query */
 };
 
 static size_t get_page_size(void)
@@ -476,7 +477,11 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         fprintf(stderr, "[DBG]   set_pipe_queues(1) -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) { doca_flow_cfg_destroy(flow_cfg); return -1; }
 
-        err = doca_flow_cfg_set_mode_args(flow_cfg, "vnf,hws,isolated");
+        /* NOTE: "isolated" removed — it was preventing eswitch-redirected
+         * (tc flower) packets from reaching the DOCA Flow pipe. Without
+         * isolated, the kernel netdev path is still active (tcpdump works
+         * alongside DOCA Flow), and eswitch-forwarded packets reach us. */
+        err = doca_flow_cfg_set_mode_args(flow_cfg, "vnf,hws");
         fprintf(stderr, "[DBG]   set_mode_args -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) { doca_flow_cfg_destroy(flow_cfg); return -1; }
 
@@ -646,6 +651,8 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         err = doca_flow_entries_process(doca.flow_port, 0, 10000, 4);
         fprintf(stderr, "[DBG]   entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
+
+        doca.flow_entry = entry;  /* save for counter query */
     }
 
     fprintf(stderr, "[gpu_receiver] DOCA init OK — GPU PCIe: %s\n", gpu_pcie);
@@ -753,9 +760,26 @@ int main(int argc, char **argv)
         ring.depth,
         tier);
 
-    /* Wait for SIGINT / SIGTERM */
+    /* Wait for SIGINT / SIGTERM — periodically query flow counters */
+    int poll_sec = 0;
     while (!g_quit) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        poll_sec++;
+
+        /* Query DOCA Flow entry counter every 5 seconds */
+        if (poll_sec % 5 == 0 && doca.flow_entry) {
+            struct doca_flow_resource_query stats = {};
+            doca_error_t qerr = doca_flow_resource_query_entry(
+                doca.flow_entry, &stats);
+            fprintf(stderr, "[FLOW-COUNTER] %ds: query=%s total_bytes=%llu total_pkts=%llu\n",
+                    poll_sec,
+                    (qerr == DOCA_SUCCESS) ? "ok" : doca_error_get_descr(qerr),
+                    (unsigned long long)stats.counter.total_bytes,
+                    (unsigned long long)stats.counter.total_pkts);
+        }
+
+        /* Also process flow entries to ensure NIC updates */
+        doca_flow_entries_process(doca.flow_port, 0, 100, 0);
     }
 
     fprintf(stderr, "[gpu_receiver] stopping...\n");
