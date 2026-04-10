@@ -538,8 +538,8 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         if (err != DOCA_SUCCESS) return -1;
 
         struct doca_flow_pipe_entry *entry = nullptr;
-        err = doca_flow_pipe_add_entry(0, rxq_pipe, &match, 0, NULL, NULL, NULL,
-                                        DOCA_FLOW_NO_WAIT, NULL, &entry);
+        err = doca_flow_pipe_basic_add_entry(0, rxq_pipe, &match, 0, NULL, NULL, NULL,
+                                        DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, NULL, &entry);
         fprintf(stderr, "[DBG]   pipe_add_entry -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
 
