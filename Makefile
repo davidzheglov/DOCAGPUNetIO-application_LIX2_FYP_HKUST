@@ -222,6 +222,25 @@ data_source_dpu: $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
 	$(DPU_CXX) $(DPU_FLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $(DPU_BIN) $(WS_LIBS)
 	@echo "  [OK] $(DPU_BIN)  (aarch64 — deploy to DPU with scp)"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test: DOCA Flow + GPUNetIO minimal receiver test
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_FLOW_SRC := tests/doca_flow_test.cu
+TEST_FLOW_BIN := $(BINDIR)/doca_flow_test
+
+test_flow: $(TEST_FLOW_BIN)
+
+$(TEST_FLOW_BIN): $(TEST_FLOW_SRC) | $(BINDIR)
+	@if [ ! -d "$(DOCA_ROOT)/include" ]; then \
+		echo "  [SKIP] test_flow: DOCA SDK not found at $(DOCA_ROOT)"; \
+	else \
+		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) $(DOCA_INC) \
+		    -DALLOW_EXPERIMENTAL_API \
+		    $< -o $@ $(DOCA_LIBS); \
+		echo "  [OK] $@"; \
+	fi
+
 # ── Clean ──────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BINDIR)/
