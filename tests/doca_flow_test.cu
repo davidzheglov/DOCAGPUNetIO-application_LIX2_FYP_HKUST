@@ -177,14 +177,16 @@ int main(int argc, char **argv)
     struct doca_gpu *gpu_dev = nullptr;
     CHECK_DOCA(doca_gpu_create(gpu_pcie, &gpu_dev), "doca_gpu_create");
 
-    /* ── Step 3: DOCA Flow init (isolated + hws) ────────────────────────── */
+    /* ── Step 3: DOCA Flow init (skip with SKIP_FLOW=1 to isolate ctx_start) */
     fprintf(stderr, "\nSTEP 3: DOCA Flow init\n");
     struct doca_flow_port *flow_port = nullptr;
-    {
+    bool skip_flow = (getenv("SKIP_FLOW") != nullptr);
+    if (skip_flow) {
+        fprintf(stderr, "  SKIP_FLOW=1 — skipping flow init to test ctx_start alone\n");
+    } else {
         struct doca_flow_cfg *flow_cfg = nullptr;
         CHECK_DOCA(doca_flow_cfg_create(&flow_cfg), "flow_cfg_create");
         CHECK_DOCA(doca_flow_cfg_set_pipe_queues(flow_cfg, 1), "set_pipe_queues(1)");
-        /* Try both modes — set ISOLATED env var to use isolated mode */
         const char *mode = getenv("DOCA_ISOLATED") ? "vnf,hws,isolated" : "vnf,hws";
         fprintf(stderr, "  Using mode: %s\n", mode);
         CHECK_DOCA(doca_flow_cfg_set_mode_args(flow_cfg, mode), "set_mode_args");
