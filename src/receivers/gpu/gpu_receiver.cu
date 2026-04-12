@@ -600,18 +600,24 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
     fprintf(stderr, "[DBG]   -> %s (%d)\n", doca_error_get_descr(err), (int)err);
     if (err != DOCA_SUCCESS) return -1;
 
-    /* step 14: create DOCA Flow root pipe that steers UDP -> GPU rxq.
-     * Without this, isolated-mode port delivers zero packets. */
-    fprintf(stderr, "[DBG] step 14: create UDP->GPU_RXQ flow pipe\n");
-    {
-        /* Root matcher cannot use parser_meta fields — use empty match
-         * (match-all) so the root pipe steers everything to GPU rxq. */
-        struct doca_flow_match match = {};
+    /* step 14: assign queue ID for flow steering */
+    err = doca_eth_rxq_apply_queue_id(doca.rxq_cpu, 0);
+    fprintf(stderr, "[DBG] step 14: apply_queue_id(0) -> %s (%d)\n",
+            doca_error_get_descr(err), (int)err);
+    if (err != DOCA_SUCCESS) return -1;
 
-        err = doca_eth_rxq_apply_queue_id(doca.rxq_cpu, 0);
-        fprintf(stderr, "[DBG]   apply_queue_id(0) -> %s (%d)\n",
-                doca_error_get_descr(err), (int)err);
-        if (err != DOCA_SUCCESS) return -1;
+    /* step 15: create DOCA Flow pipes (NVIDIA reference pattern).
+     * Root CONTROL pipe matches IPv4/UDP and forwards to non-root BASIC pipe
+     * which does RSS steering into the GPU RX queue. */
+    fprintf(stderr, "[DBG] step 15: create flow pipes (CONTROL root + BASIC UDP)\n");
+    {
+        /* 15a: Non-root BASIC pipe — matches IPv4+UDP via parser_meta, RSS to queue 0 */
+        struct doca_flow_match udp_match = {};
+        udp_match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+        udp_match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+
+        struct doca_flow_monitor udp_monitor = {};
+        udp_monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
         uint16_t rss_queues[1] = { 0 };
         struct doca_flow_fwd fwd = {};
@@ -626,33 +632,76 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
 
         struct doca_flow_pipe_cfg *pipe_cfg = nullptr;
         err = doca_flow_pipe_cfg_create(&pipe_cfg, doca.flow_port);
-        fprintf(stderr, "[DBG]   pipe_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        fprintf(stderr, "[DBG]   15a: udp_pipe_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
 
         doca_flow_pipe_cfg_set_name(pipe_cfg, "GPU_RXQ_UDP_PIPE");
         doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
-        doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
-        err = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
-        fprintf(stderr, "[DBG]   set_match -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
+        err = doca_flow_pipe_cfg_set_match(pipe_cfg, &udp_match, NULL);
+        fprintf(stderr, "[DBG]   udp_set_match -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) { doca_flow_pipe_cfg_destroy(pipe_cfg); return -1; }
+        doca_flow_pipe_cfg_set_monitor(pipe_cfg, &udp_monitor);
 
-        struct doca_flow_pipe *rxq_pipe = nullptr;
-        err = doca_flow_pipe_create(pipe_cfg, &fwd, &miss_fwd, &rxq_pipe);
-        fprintf(stderr, "[DBG]   pipe_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        struct doca_flow_pipe *udp_pipe = nullptr;
+        err = doca_flow_pipe_create(pipe_cfg, &fwd, &miss_fwd, &udp_pipe);
+        fprintf(stderr, "[DBG]   udp_pipe_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         doca_flow_pipe_cfg_destroy(pipe_cfg);
         if (err != DOCA_SUCCESS) return -1;
 
-        struct doca_flow_pipe_entry *entry = nullptr;
-        err = doca_flow_pipe_basic_add_entry(0, rxq_pipe, &match, 0, NULL, NULL, NULL,
-                                        DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, NULL, &entry);
-        fprintf(stderr, "[DBG]   pipe_add_entry -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        struct doca_flow_pipe_entry *udp_entry = nullptr;
+        err = doca_flow_pipe_basic_add_entry(0, udp_pipe, &udp_match, 0, NULL, NULL, NULL,
+                                              DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, NULL, &udp_entry);
+        fprintf(stderr, "[DBG]   udp_pipe_add_entry -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
 
-        err = doca_flow_entries_process(doca.flow_port, 0, 10000, 4);
-        fprintf(stderr, "[DBG]   entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        err = doca_flow_entries_process(doca.flow_port, 0, 10000, 0);
+        fprintf(stderr, "[DBG]   udp_entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return -1;
 
-        doca.flow_entry = entry;  /* save for counter query */
+        doca.flow_entry = udp_entry;  /* save for counter query */
+
+        /* 15b: Root CONTROL pipe — matches outer IPv4/UDP headers, forwards to UDP pipe */
+        struct doca_flow_monitor root_monitor = {};
+        root_monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+
+        struct doca_flow_pipe_cfg *root_cfg = nullptr;
+        err = doca_flow_pipe_cfg_create(&root_cfg, doca.flow_port);
+        fprintf(stderr, "[DBG]   15b: root_pipe_cfg_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        doca_flow_pipe_cfg_set_name(root_cfg, "ROOT_CONTROL_PIPE");
+        doca_flow_pipe_cfg_set_type(root_cfg, DOCA_FLOW_PIPE_CONTROL);
+        doca_flow_pipe_cfg_set_is_root(root_cfg, true);
+        doca_flow_pipe_cfg_set_monitor(root_cfg, &root_monitor);
+
+        struct doca_flow_pipe *root_pipe = nullptr;
+        err = doca_flow_pipe_create(root_cfg, NULL, NULL, &root_pipe);
+        fprintf(stderr, "[DBG]   root_pipe_create -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        doca_flow_pipe_cfg_destroy(root_cfg);
+        if (err != DOCA_SUCCESS) return -1;
+
+        /* Add IPv4/UDP match entry to root pipe -> forward to UDP pipe */
+        struct doca_flow_match root_match = {};
+        root_match.outer.eth.type = htons(DOCA_FLOW_ETHER_TYPE_IPV4);
+        root_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+        root_match.outer.ip4.next_proto = IPPROTO_UDP;
+
+        struct doca_flow_fwd root_fwd = {};
+        root_fwd.type = DOCA_FLOW_FWD_PIPE;
+        root_fwd.next_pipe = udp_pipe;
+
+        struct doca_flow_pipe_entry *root_entry = nullptr;
+        err = doca_flow_pipe_control_add_entry(0, root_pipe,
+                                                &root_match, NULL, NULL, NULL, NULL,
+                                                NULL, NULL, 1, &root_fwd, NULL, &root_entry);
+        fprintf(stderr, "[DBG]   root_control_add_entry(UDP) -> %s (%d)\n",
+                doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
+
+        err = doca_flow_entries_process(doca.flow_port, 0, 10000, 0);
+        fprintf(stderr, "[DBG]   root_entries_process -> %s (%d)\n", doca_error_get_descr(err), (int)err);
+        if (err != DOCA_SUCCESS) return -1;
     }
 
     fprintf(stderr, "[gpu_receiver] DOCA init OK — GPU PCIe: %s\n", gpu_pcie);
