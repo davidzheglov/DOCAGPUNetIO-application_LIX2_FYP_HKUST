@@ -7,8 +7,6 @@
  *   - Non-root BASIC pipe (RSS to GPU RX queue)
  *   - "vnf,hws,isolated" mode
  *
- * Prints detailed status at every step for easy debugging.
- *
  * Usage:
  *   sudo ./doca_flow_test --nic-pcie 0000:bd:00.1 --gpu-pcie 0000:ac:00.0 --gpu 1
  */
@@ -65,55 +63,39 @@ __global__ void poll_rx_kernel(struct doca_gpu_eth_rxq *rxq_gpu,
                                uint32_t *pkt_count,
                                uint32_t *quit_flag)
 {
-    __shared__ uint64_t polls;
-    if (threadIdx.x == 0) polls = 0;
-    __syncthreads();
+    uint64_t polls = 0;
 
     while (*quit_flag == 0) {
-        struct doca_gpu_buf *buf_ptr = nullptr;
+        uint64_t first_pkt_idx = 0;
         uint32_t rx_pkt_num = 0;
 
-        doca_gpu_dev_eth_rxq_recv(rxq_gpu, 0, &buf_ptr, &rx_pkt_num);
+        /* Use the _thread variant directly for single-thread kernel */
+        doca_gpu_dev_eth_rxq_recv_thread(rxq_gpu,
+                                         MAX_PKT_NUM,  /* max_rx_pkts */
+                                         0,            /* timeout_ns (0 = no wait) */
+                                         &first_pkt_idx,
+                                         &rx_pkt_num,
+                                         nullptr);     /* out_attr */
 
-        if (threadIdx.x == 0) {
-            polls++;
+        polls++;
 
-            if (rx_pkt_num > 0) {
-                uint32_t old = atomicAdd(pkt_count, rx_pkt_num);
-                if (old == 0) {
-                    /* First packet ever received — dump info */
-                    printf("[GPU] *** FIRST PACKETS! rx_pkt_num=%u ***\n", rx_pkt_num);
-
-                    /* Try to read first packet bytes */
-                    if (buf_ptr != nullptr) {
-                        uintptr_t addr = 0;
-                        doca_gpu_dev_buf_get_addr(buf_ptr, &addr);
-                        if (addr != 0) {
-                            uint8_t *pkt = (uint8_t *)addr;
-                            printf("[GPU] pkt[0..15]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
-                                   "%02x %02x %02x %02x  %02x %02x %02x %02x\n",
-                                   pkt[0], pkt[1], pkt[2], pkt[3],
-                                   pkt[4], pkt[5], pkt[6], pkt[7],
-                                   pkt[8], pkt[9], pkt[10], pkt[11],
-                                   pkt[12], pkt[13], pkt[14], pkt[15]);
-                        }
-                    }
-                }
-            }
-
-            /* Periodic heartbeat every ~100k polls */
-            if (polls % 100000 == 0) {
-                printf("[GPU] heartbeat: %llu polls, %u total pkts received\n",
-                       (unsigned long long)polls, *pkt_count);
+        if (rx_pkt_num > 0) {
+            uint32_t old = atomicAdd(pkt_count, rx_pkt_num);
+            if (old == 0) {
+                printf("[GPU] *** FIRST PACKETS! rx_pkt_num=%u, first_idx=%llu ***\n",
+                       rx_pkt_num, (unsigned long long)first_pkt_idx);
             }
         }
-        __syncthreads();
+
+        /* Periodic heartbeat every ~100k polls */
+        if (polls % 100000 == 0) {
+            printf("[GPU] heartbeat: %llu polls, %u total pkts received\n",
+                   (unsigned long long)polls, *pkt_count);
+        }
     }
 
-    if (threadIdx.x == 0) {
-        printf("[GPU] kernel exiting: %llu polls, %u total pkts\n",
-               (unsigned long long)polls, *pkt_count);
-    }
+    printf("[GPU] kernel exiting: %llu polls, %u total pkts\n",
+           (unsigned long long)polls, *pkt_count);
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -147,10 +129,10 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    fprintf(stderr, "╔══════════════════════════════════════════════════════════════╗\n");
-    fprintf(stderr, "║  DOCA Flow + GPUNetIO RX Test                               ║\n");
-    fprintf(stderr, "║  NIC: %-20s  GPU: %-20s   ║\n", nic_pcie, gpu_pcie);
-    fprintf(stderr, "╚══════════════════════════════════════════════════════════════╝\n\n");
+    fprintf(stderr, "=============================================================\n");
+    fprintf(stderr, "  DOCA Flow + GPUNetIO RX Test\n");
+    fprintf(stderr, "  NIC: %-20s  GPU: %-20s\n", nic_pcie, gpu_pcie);
+    fprintf(stderr, "=============================================================\n\n");
 
     doca_error_t err;
 
@@ -319,9 +301,10 @@ int main(int argc, char **argv)
         if (err != DOCA_SUCCESS) return 1;
 
         /* Add entry to the non-root pipe */
-        err = doca_flow_pipe_add_entry(0, udp_pipe, &match, 0, NULL, NULL, NULL,
-                                       DOCA_FLOW_NO_WAIT, NULL, &udp_counter_entry);
-        fprintf(stderr, "  [%s] udp_pipe_add_entry -> %s (%d)\n",
+        err = doca_flow_pipe_basic_add_entry(0, udp_pipe, &match, 0, NULL, NULL, NULL,
+                                              DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, NULL,
+                                              &udp_counter_entry);
+        fprintf(stderr, "  [%s] udp_pipe_basic_add_entry -> %s (%d)\n",
                 err == DOCA_SUCCESS ? "OK" : "FAIL", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return 1;
 
@@ -332,6 +315,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "  10b: Root CONTROL pipe\n");
     struct doca_flow_pipe *root_pipe = nullptr;
     struct doca_flow_pipe_entry *root_udp_entry = nullptr;
+    struct doca_flow_pipe_entry *root_all_entry = nullptr;
     {
         struct doca_flow_monitor monitor = {};
         monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
@@ -349,7 +333,7 @@ int main(int argc, char **argv)
         doca_flow_pipe_cfg_destroy(pipe_cfg);
         if (err != DOCA_SUCCESS) return 1;
 
-        /* Add UDP match entry to root pipe -> forward to udp_pipe */
+        /* Add UDP match entry: IPv4 + UDP -> forward to udp_pipe */
         struct doca_flow_match udp_match = {};
         udp_match.outer.eth.type = htons(DOCA_FLOW_ETHER_TYPE_IPV4);
         udp_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -359,26 +343,37 @@ int main(int argc, char **argv)
         udp_fwd.type = DOCA_FLOW_FWD_PIPE;
         udp_fwd.next_pipe = udp_pipe;
 
-        err = doca_flow_pipe_control_add_entry(0, 0, root_pipe,
-                                                &udp_match, NULL, NULL, NULL,
-                                                NULL, NULL, NULL,
-                                                &udp_fwd, NULL,
+        /* doca_flow_pipe_control_add_entry signature:
+         * (pipe_queue, pipe, match, match_mask, condition, actions, actions_mask,
+         *  action_descs, monitor, priority, fwd, usr_ctx, entry) */
+        err = doca_flow_pipe_control_add_entry(0, root_pipe,
+                                                &udp_match,     /* match */
+                                                NULL,           /* match_mask */
+                                                NULL,           /* condition */
+                                                NULL,           /* actions */
+                                                NULL,           /* actions_mask */
+                                                NULL,           /* action_descs */
+                                                NULL,           /* monitor */
+                                                1,              /* priority (high) */
+                                                &udp_fwd,       /* fwd */
+                                                NULL,           /* usr_ctx */
                                                 &root_udp_entry);
-        fprintf(stderr, "  [%s] root_control_add_entry(UDP) -> %s (%d)\n",
+        fprintf(stderr, "  [%s] root_control_add_entry(UDP, prio=1) -> %s (%d)\n",
                 err == DOCA_SUCCESS ? "OK" : "FAIL", doca_error_get_descr(err), (int)err);
         if (err != DOCA_SUCCESS) return 1;
 
-        /* Also add a catch-all entry to see ALL packets (for debugging) */
+        /* Also add a catch-all entry at lower priority to debug */
         struct doca_flow_match all_match = {};
         struct doca_flow_fwd all_fwd = {};
         all_fwd.type = DOCA_FLOW_FWD_PIPE;
         all_fwd.next_pipe = udp_pipe;
 
-        struct doca_flow_pipe_entry *root_all_entry = nullptr;
-        err = doca_flow_pipe_control_add_entry(0, 10, root_pipe,
-                                                &all_match, NULL, NULL, NULL,
-                                                NULL, NULL, NULL,
-                                                &all_fwd, NULL,
+        err = doca_flow_pipe_control_add_entry(0, root_pipe,
+                                                &all_match,
+                                                NULL, NULL, NULL, NULL, NULL, NULL,
+                                                10,             /* priority (low) */
+                                                &all_fwd,
+                                                NULL,
                                                 &root_all_entry);
         fprintf(stderr, "  [%s] root_control_add_entry(CATCH-ALL, prio=10) -> %s (%d)\n",
                 err == DOCA_SUCCESS ? "OK" : "FAIL", doca_error_get_descr(err), (int)err);
@@ -387,11 +382,11 @@ int main(int argc, char **argv)
         CHECK_DOCA(doca_flow_entries_process(flow_port, 0, 10000, 0), "root_entries_process");
     }
 
-    fprintf(stderr, "\n══════════════════════════════════════════════════════════════\n");
+    fprintf(stderr, "\n=============================================================\n");
     fprintf(stderr, "  All DOCA init complete! Launching GPU poll kernel...\n");
     fprintf(stderr, "  Send UDP packets to this NIC to test.\n");
     fprintf(stderr, "  Press Ctrl+C to stop.\n");
-    fprintf(stderr, "══════════════════════════════════════════════════════════════\n\n");
+    fprintf(stderr, "=============================================================\n\n");
 
     /* ── Launch GPU kernel ──────────────────────────────────────────────── */
     uint32_t *d_pkt_count = nullptr;
@@ -418,21 +413,26 @@ int main(int argc, char **argv)
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start).count();
 
-        /* Query root pipe counter */
+        /* Query root pipe UDP entry counter */
         struct doca_flow_resource_query root_stats = {};
-        doca_error_t rq = doca_flow_resource_query_entry(root_udp_entry,
-                              DOCA_FLOW_RESOURCE_TYPE_NON_SHARED, &root_stats);
+        doca_error_t rq = doca_flow_resource_query_entry(root_udp_entry, &root_stats);
 
-        /* Query UDP pipe counter */
+        /* Query UDP pipe entry counter */
         struct doca_flow_resource_query udp_stats = {};
-        doca_error_t uq = doca_flow_resource_query_entry(udp_counter_entry,
-                              DOCA_FLOW_RESOURCE_TYPE_NON_SHARED, &udp_stats);
+        doca_error_t uq = doca_flow_resource_query_entry(udp_counter_entry, &udp_stats);
+
+        /* Query catch-all entry counter */
+        struct doca_flow_resource_query all_stats = {};
+        doca_error_t aq = DOCA_ERROR_UNKNOWN;
+        if (root_all_entry)
+            aq = doca_flow_resource_query_entry(root_all_entry, &all_stats);
 
         /* Process pending entries */
         doca_flow_entries_process(flow_port, 0, 0, 0);
 
-        fprintf(stderr, "[%llds] ROOT: %s pkts=%lu bytes=%lu | "
+        fprintf(stderr, "[%llds] ROOT_UDP: %s pkts=%lu bytes=%lu | "
                         "UDP_PIPE: %s pkts=%lu bytes=%lu | "
+                        "CATCH_ALL: %s pkts=%lu | "
                         "GPU: %u pkts\n",
                 (long long)elapsed,
                 rq == DOCA_SUCCESS ? "ok" : "err",
@@ -441,12 +441,14 @@ int main(int argc, char **argv)
                 uq == DOCA_SUCCESS ? "ok" : "err",
                 (unsigned long)udp_stats.counter.total_pkts,
                 (unsigned long)udp_stats.counter.total_bytes,
+                aq == DOCA_SUCCESS ? "ok" : "err",
+                (unsigned long)all_stats.counter.total_pkts,
                 *d_pkt_count);
 
         /* Highlight if counters changed */
         if (root_stats.counter.total_pkts != last_root_pkts ||
             udp_stats.counter.total_pkts != last_udp_pkts) {
-            fprintf(stderr, "  ^^^ COUNTER CHANGE! root +%lu, udp +%lu\n",
+            fprintf(stderr, "  ^^^ COUNTER CHANGE! root_udp +%lu, udp_pipe +%lu\n",
                     (unsigned long)(root_stats.counter.total_pkts - last_root_pkts),
                     (unsigned long)(udp_stats.counter.total_pkts - last_udp_pkts));
             last_root_pkts = root_stats.counter.total_pkts;
