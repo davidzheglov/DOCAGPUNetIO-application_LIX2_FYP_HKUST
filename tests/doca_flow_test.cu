@@ -184,7 +184,10 @@ int main(int argc, char **argv)
         struct doca_flow_cfg *flow_cfg = nullptr;
         CHECK_DOCA(doca_flow_cfg_create(&flow_cfg), "flow_cfg_create");
         CHECK_DOCA(doca_flow_cfg_set_pipe_queues(flow_cfg, 1), "set_pipe_queues(1)");
-        CHECK_DOCA(doca_flow_cfg_set_mode_args(flow_cfg, "vnf,hws,isolated"), "set_mode_args(vnf,hws,isolated)");
+        /* Try both modes — set ISOLATED env var to use isolated mode */
+        const char *mode = getenv("DOCA_ISOLATED") ? "vnf,hws,isolated" : "vnf,hws";
+        fprintf(stderr, "  Using mode: %s\n", mode);
+        CHECK_DOCA(doca_flow_cfg_set_mode_args(flow_cfg, mode), "set_mode_args");
         CHECK_DOCA(doca_flow_cfg_set_nr_counters(flow_cfg, FLOW_NB_COUNTERS), "set_nr_counters");
         CHECK_DOCA(doca_flow_init(flow_cfg), "doca_flow_init");
         doca_flow_cfg_destroy(flow_cfg);
