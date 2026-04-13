@@ -238,7 +238,9 @@ __global__ void gpu_recv_process_kernel(
                     atomicAdd((unsigned long long *)&s_port_miss, 1ULL);
                 }
 
-                if (dst_port == TICK_MCAST_PORT) {
+                // Temporarily skip port check for testing (cross-reference with doca_flow_test.cu)
+                // if (dst_port == TICK_MCAST_PORT) {
+                if (true) {  // Process all UDP packets for now
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
 
