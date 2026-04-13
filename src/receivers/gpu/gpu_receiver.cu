@@ -316,7 +316,7 @@ __global__ void gpu_recv_process_kernel(
                     rslot->signal.fast_ema      = fast_ema;
                     rslot->signal.slow_ema      = slow_ema;
 
-                    __threadfence();
+                    __threadfence_system();
                     uint64_t t4 = clock64();
                     rslot->bench.t4_ns  = t4;
                     rslot->signal.t4_ns = t4;
