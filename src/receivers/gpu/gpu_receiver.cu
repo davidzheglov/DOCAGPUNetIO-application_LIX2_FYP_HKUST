@@ -152,13 +152,14 @@ __global__ void gpu_recv_process_kernel(
     __syncthreads();
 
     while (!*quit_flag) {
-        /* ── Thread 0 receives a burst (single-thread variant) ── */
+        /* ── Thread 0 receives a burst (block-scope template variant) ── */
         uint64_t first_pkt_idx = 0;
         uint32_t n_pkts = 0;
         doca_error_t ret = DOCA_SUCCESS;
 
         if (tid == 0) {
-            ret = doca_gpu_dev_eth_rxq_recv_thread<
+            ret = doca_gpu_dev_eth_rxq_recv<
+                DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
                 DOCA_GPUNETIO_ETH_MCST_AUTO,
                 DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
                 rxq,
