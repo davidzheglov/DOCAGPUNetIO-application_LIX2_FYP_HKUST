@@ -163,7 +163,7 @@ __global__ void gpu_recv_process_kernel(
                 DOCA_GPUNETIO_ETH_MCST_AUTO,
                 DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
                 rxq,
-                MAX_PKT_PER_BURST,
+                0,  /* max_rx_pkts: 0 = unlimited for block-scope */
                 MAX_RX_TIMEOUT_NS,
                 &first_pkt_idx,
                 &n_pkts,
