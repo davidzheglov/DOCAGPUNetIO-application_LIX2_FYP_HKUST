@@ -18,10 +18,13 @@ This document records the complete process of getting NVIDIA DOCA GPUNetIO worki
 8. [Phase 4: Flow Steering — Why Packets Were Invisible](#8-phase-4-flow-steering--why-packets-were-invisible)
 9. [Phase 5: Building a Standalone Test](#9-phase-5-building-a-standalone-test)
 10. [Phase 6: Updating gpu_receiver.cu](#10-phase-6-updating-gpu_receivercu)
-11. [The Final Working Output](#11-the-final-working-output)
-12. [Remaining Work](#12-remaining-work)
-13. [Quick Reference: Setup Checklist](#13-quick-reference-setup-checklist)
-14. [Lessons Learned](#14-lessons-learned)
+11. [Phase 7: GPU Kernel Debugging — Block-Scope Crash and Shared Memory Bug](#11-phase-7-gpu-kernel-debugging--block-scope-crash-and-shared-memory-bug)
+12. [Phase 8: Session-to-Session Networking Issues](#12-phase-8-session-to-session-networking-issues)
+13. [The Final Working Output (T4 End-to-End)](#13-the-final-working-output-t4-end-to-end)
+14. [Remaining Work](#14-remaining-work)
+15. [Quick Reference: Session Setup Commands](#15-quick-reference-session-setup-commands)
+16. [Quick Reference: Running T1 and T4](#16-quick-reference-running-t1-and-t4)
+17. [Lessons Learned](#17-lessons-learned)
 
 ---
 
@@ -1017,123 +1020,402 @@ Changing to `--nic-pcie 0000:bd:00.1` immediately fixed the issue.
 
 ---
 
-## 11. The Final Working Output
+## 11. Phase 7: GPU Kernel Debugging — Block-Scope Crash and Shared Memory Bug
 
+With DOCA Flow steering working (10,000 packets in flow counters), the next problem was that the GPU kernel wasn't actually receiving or processing packets. This phase had two distinct bugs.
+
+### Bug 1: Block-Scope `recv` Template Crashes After ~4000 Polls
+
+**Symptom**: The GPU kernel used the block-scope template variant:
+```cuda
+doca_gpu_dev_eth_rxq_recv<
+    DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
+    DOCA_GPUNETIO_ETH_MCST_AUTO,
+    DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(rxq, ...);
 ```
-lix2@lxcpu1:~/DOCAGPUNetIO-application_LIX2_FYP_HKUST$ sudo bin/gpu_receiver --tier 4 --gpu 1 \
-    --gpu-pcie 0000:ac:00.0 \
-    --nic-pcie 0000:bd:00.1 \
-    --harness 127.0.0.1 --fillsim 127.0.0.1
+This froze after ~4000-9000 polls with `recv_bursts=0`, then on shutdown produced `cudaDeviceSynchronize: unspecified launch failure`. Once the kernel crashed, ALL subsequent CUDA calls failed — this is why the CPU-FWD thread reported `cudaMemcpy(head) failed: unspecified launch failure`.
+
+**Root cause**: Unknown internal issue in the block-scope template variant. The block-scope variant requires all threads in the block to participate in the recv call, and appears to have a bug or undocumented constraint that causes it to deadlock/crash.
+
+**Proof**: The standalone `doca_flow_test.cu` used the `_thread` variant (`doca_gpu_dev_eth_rxq_recv_thread()`) with a single thread and successfully received 2,047 packets. Same DOCA init, same flow pipes, same NIC — only the recv function differed.
+
+**Fix**: Switched to the `_thread` variant in `gpu_receiver.cu`. Thread 0 calls `doca_gpu_dev_eth_rxq_recv_thread()` and stores results in `__shared__` memory, then all 64 threads process their assigned packet in parallel:
+
+```cuda
+__shared__ uint64_t s_first_pkt_idx;
+__shared__ uint32_t s_n_pkts;
+__shared__ doca_error_t s_ret;
+
+while (!*quit_flag) {
+    if (tid == 0) {
+        s_n_pkts = 0;
+        s_ret = doca_gpu_dev_eth_rxq_recv_thread(rxq, MAX_PKT_PER_BURST,
+                    MAX_RX_TIMEOUT_NS, &s_first_pkt_idx, &s_n_pkts, NULL);
+    }
+    __syncthreads();  // All threads see s_n_pkts, s_first_pkt_idx, s_ret
+
+    if (s_ret == DOCA_SUCCESS && s_n_pkts > 0 && tid < (int)s_n_pkts) {
+        // Each thread processes one packet...
+    }
+    __syncthreads();  // All threads complete before next recv
+}
 ```
 
-All DOCA initialization steps succeed:
+### Bug 2: Local Variables Instead of `__shared__` — Only Thread 0 Processed Packets
 
+**Symptom**: After switching to `_thread` variant, the GPU received 63 packets but CPU-FWD only forwarded 1. The GPU was receiving but only 1 packet was being processed per burst.
+
+**Root cause**: A Copilot-assisted edit declared `first_pkt_idx`, `n_pkts`, and `ret` as **local variables** instead of `__shared__`:
+
+```cuda
+// BUG — local variables, only thread 0 sets them
+uint64_t first_pkt_idx = 0;
+uint32_t n_pkts = 0;
+doca_error_t ret = DOCA_SUCCESS;
+
+if (tid == 0) {
+    ret = doca_gpu_dev_eth_rxq_recv_thread(rxq, ..., &first_pkt_idx, &n_pkts, ...);
+}
+__syncthreads();
+
+if (ret != DOCA_SUCCESS || n_pkts == 0) continue;  // BUG: also skips __syncthreads()!
+
+if (tid < (int)n_pkts) { ... }  // Only thread 0 enters (other threads have n_pkts=0)
 ```
-[DBG] step 1: doca_gpu_create(0000:ac:00.0)         -> Success
-[DBG] step 1b: doca_flow_init + port_start           -> Success (all sub-steps)
-[DBG] step 2-9: RX queue + GPU memory + MMAP         -> Success (all sub-steps)
-[DBG] step 10-13: Context setup + start              -> Success
-[DBG] step 14: apply_queue_id(0)                     -> Success
-[DBG] step 15a: Non-root BASIC pipe (UDP RSS)        -> Success
-[DBG] step 15b: Root CONTROL pipe                    -> Success
+
+Two problems:
+1. Threads 1-63 had `n_pkts=0` (their local copy was never written), so they never entered the processing block — only thread 0 processed one packet per burst.
+2. The `continue` statement skipped the `__syncthreads()` at the bottom of the loop, which causes undefined behavior (some threads sync, others don't).
+
+**Fix**: Made all three variables `__shared__` and removed the `continue`:
+
+```cuda
+__shared__ uint64_t s_first_pkt_idx;
+__shared__ uint32_t s_n_pkts;
+__shared__ doca_error_t s_ret;
 ```
 
-Then 10,000 ticks sent from DPU ARM:
+### Bug 3: `cudaHostAllocWriteCombined` on GPU-Written Buffers
 
+**Symptom**: CPU reads from `ring_head` (written by GPU atomicAdd) sometimes returned stale values.
+
+**Root cause**: `ring_head` was allocated with `cudaHostAllocMapped | cudaHostAllocWriteCombined`. WriteCombined is an optimization for **CPU→GPU writes** — it batches writes for throughput. But it makes **CPU reads return stale data** because the CPU cache bypass mechanism doesn't guarantee read coherence.
+
+**Fix**: Removed `WriteCombined` from `ring_head` (GPU writes, CPU reads). Kept it only on `d_quit` (CPU writes, GPU reads — correct direction):
+
+```c
+// ring_head: GPU writes, CPU reads — no WriteCombined
+cudaHostAlloc(&ring.head, sizeof(uint64_t), cudaHostAllocMapped);
+
+// d_quit: CPU writes, GPU reads — WriteCombined is correct
+cudaHostAlloc(&d_quit, sizeof(uint32_t), cudaHostAllocMapped | cudaHostAllocWriteCombined);
 ```
-[FLOW-COUNTER] 10s: query=ok total_bytes=382140 total_pkts=4246
-[FLOW-COUNTER] 15s: query=ok total_bytes=831780 total_pkts=9242
-[FLOW-COUNTER] 20s: query=ok total_bytes=900000 total_pkts=10000
-```
 
-All 10,000 packets arrived through the flow steering hardware and were deposited into GPU memory. The flow counters show:
-- **900,000 bytes total**: 10,000 packets * 90 bytes/packet
-- **90 bytes per packet**: 14 (Ethernet) + 20 (IPv4) + 8 (UDP) + 48 (TickMessage)
+### GPU printf Doesn't Flush From Persistent Kernels
 
-### Current Status of the GPU Kernel
+During debugging, we added `printf` calls inside the persistent GPU kernel for diagnostics. **GPU printf buffers are only flushed on kernel exit or `cudaDeviceSynchronize()`**. Since our kernel runs indefinitely (persistent), printf output was never visible.
 
-The flow counters confirm packets are being steered correctly into the GPU RX queue. The `CPU-FWD forwarded=0` means the GPU kernel's result ring isn't being populated yet — this is a separate issue related to how the block-scope receive kernel interacts with the cyclic buffer consumption, and is the next item to debug.
+**Fix**: Used `KernelDiag` struct in pinned host memory. Thread 0 writes volatile counters to the struct; the CPU main loop reads them every 5 seconds and prints `[GPU-DIAG]` lines.
 
 ---
 
-## 12. Remaining Work
+## 12. Phase 8: Session-to-Session Networking Issues
 
-1. **GPU kernel packet consumption**: The persistent kernel uses `doca_gpu_dev_eth_rxq_recv<BLOCK_SCOPE>` which should advance the consumer pointer automatically. The fact that flow counters show packets arriving but the GPU kernel isn't producing results suggests a mismatch between the polling/processing logic and the cyclic buffer consumption. The standalone test (which uses `_thread` variant with a single thread) confirmed GPU reception works, so this is a matter of getting the block-scope template version working correctly.
+Between debugging sessions, the DPU's network state resets. IP addresses, bridge config, and multicast snooping are all ephemeral. This caused hours of debugging where the GPU code was fine but packets simply weren't reaching the NIC.
 
-2. **End-to-end pipeline**: Once the GPU kernel receives and processes packets, the CPU forwarding thread should pick up results from the ResultRing and send BenchmarkResult/SignalResult UDP packets to the harness and fill simulator.
+### Problem 1: IGMP Snooping Re-Enabled After Reboot
 
-3. **`cudaDeviceSynchronize: unspecified launch failure`**: On shutdown (Ctrl+C), the persistent GPU kernel sometimes hits this error. This is likely because `doca_ctx_stop()` or `doca_flow_port_stop()` invalidates the RX queue handle while the GPU kernel is still polling it. The cleanup sequence needs to be: set quit flag -> wait for kernel to exit -> then stop DOCA contexts.
+**Symptom**: After DPU reboot, packets reached `br-pf1` (tcpdump confirmed) but did NOT reach `pf1hpf` (tcpdump on `pf1hpf` showed nothing).
 
----
+**Root cause**: Linux bridges have IGMP snooping enabled by default. After a reboot, the bridge is recreated fresh and snooping is back on. Multicast packets (destination `239.0.0.1`) are silently dropped because no IGMP join was sent.
 
-## 13. Quick Reference: Setup Checklist
-
-### After DPU Reboot (ON DPU ARM, 192.168.100.2)
-
+**Fix (ON DPU ARM, every session)**:
 ```bash
-# Remove ports from OVS bridges (if they got re-added)
-sudo ovs-vsctl del-port ovsbr1 p0
-sudo ovs-vsctl del-port ovsbr2 p1
-
-# Create bridge for PF1 traffic
-sudo ip link add br-pf1 type bridge
-sudo ip link set p1 master br-pf1
-sudo ip link set pf1hpf master br-pf1
-sudo ip link set br-pf1 up
-sudo ip link set p1 up
-sudo ip link set pf1hpf up
-
-# Disable IGMP snooping (required for multicast)
 sudo ip link set br-pf1 type bridge mcast_snooping 0
-
-# Set IP on p0 for sending
-sudo ip addr add 10.10.10.1/24 dev p0
-sudo ip link set p0 up
 ```
 
-### After Host Reboot (ON HOST, lxcpu1)
+### Problem 2: IP Address on Wrong Interface
 
+**Symptom**: `send_ticks.py --iface 10.10.10.1` sent packets, but they went out the wrong port.
+
+**Root cause**: The IP `10.10.10.1` was assigned to both `p0` and `br-pf1`. The kernel routing table chose `p0` (which has no loopback cable to p1), so packets vanished.
+
+**Fix**: The IP must be ONLY on `br-pf1`:
 ```bash
-# Verify correct kernel (MUST be 6.11, not 6.17)
-uname -r
-# Expected: 6.11.0-17-generic
-
-# Load nvidia-peermem
-sudo modprobe nvidia-peermem
-
-# Verify NVIDIA driver
-nvidia-smi
-
-# Set IP on PF1
-sudo ip addr add 10.10.10.2/24 dev ens21f1np1
-sudo ip link set ens21f1np1 up
-
-# Set CUDA and DOCA paths
-export PATH=/usr/local/cuda-12.8/bin:$PATH
-export LD_LIBRARY_PATH=/opt/mellanox/doca/lib/x86_64-linux-gnu:/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH
+sudo ip addr del 10.10.10.1/24 dev p0 2>/dev/null
+sudo ip addr add 10.10.10.1/24 dev br-pf1
 ```
 
-### Build and Run
+### Problem 3: PHY Local Loopback on Port 0
+
+**Symptom**: `p1` showed `NO-CARRIER` / `Link detected: no`. The QSFP112 cable connecting p0→p1 seemed to not be working.
+
+**Discovery**: `sudo mlxlink -d mlx5_0 -p 1` on DPU ARM revealed:
+```
+Loopback Mode: PHY Local Loopback
+```
+
+**Root cause**: Port 0 was in PHY Local Loopback — all TX from p0 was looping back into p0's own RX. Signals never left the port, so p1 (connected by cable) saw no link partner.
+
+**Impact on our setup**: The data path `p0 → cable → p1 → bridge → pf1hpf → host` was physically broken. However, the alternate path `br-pf1 → pf1hpf → eswitch → host` works because the bridge TX goes directly to the representor — it doesn't need physical port connectivity.
+
+**Current working path**: With `10.10.10.1` on `br-pf1`, packets flow:
+```
+DPU ARM app → br-pf1 (10.10.10.1) → pf1hpf → eswitch internal pairing → host PF1
+```
+This bypasses the physical ports entirely. The p0→cable→p1 path is NOT used.
+
+### Problem 4: `rx_packets_phy` vs DOCA Flow Counters
+
+**Symptom**: `ethtool -S ens21f1np1` showed `rx_packets_phy` not incrementing, leading us to believe packets weren't arriving.
+
+**Key insight**: `rx_packets_phy` counts packets arriving from the physical cable. Our packets arrive via the eswitch representor pairing (pf1hpf → PF1), which is an internal ASIC path, NOT the physical RX pipeline. These packets show up in DOCA Flow counters but NOT in `rx_packets_phy`.
+
+**Rule**: Use DOCA Flow counters (FLOW-COUNTER output) as the source of truth for whether packets reach DOCA, not `ethtool -S` physical counters. Physical counters only count wire traffic.
+
+### Debugging Methodology: Step-by-Step Packet Tracing
+
+When packets don't arrive, trace them step by step using tcpdump at each interface ON DPU ARM:
 
 ```bash
-# ON HOST: Build
-cd ~/DOCAGPUNetIO-application_LIX2_FYP_HKUST
-make t4
+# Step 1: Do packets leave the sender? (should always work)
+sudo tcpdump -i br-pf1 -c 5 udp port 5005
 
-# ON HOST: Run gpu_receiver
+# Step 2: Do packets reach the representor? (needs snooping off)
+sudo tcpdump -i pf1hpf -c 5 udp port 5005
+
+# Step 3: Do packets reach the host NIC hardware?
+# ON HOST: check DOCA Flow counters in gpu_receiver output
+# (NOT ethtool -S, which only counts physical cable RX)
+```
+
+If step 1 fails: IP address issue (wrong interface binding).
+If step 2 fails: IGMP snooping or bridge misconfiguration.
+If step 3 fails: DOCA Flow init issue or wrong NIC PCIe address.
+
+---
+
+## 13. The Final Working Output (T4 End-to-End)
+
+### T1 (CPU Naive) — Working
+
+ON HOST:
+```bash
+bin/cpu_receiver --batch 256
+```
+
+ON DPU ARM:
+```bash
+python3 ~/send_ticks.py --mode generate --rate 1000 --count 1000 --iface 10.10.10.1
+```
+
+Result: 1000/1000 ticks received and processed. Uses `recvfrom()` + `cudaMemcpy()`. Added 100ms `SO_RCVTIMEO` timeout for partial batch flushing (without it, the last partial batch never gets processed).
+
+### T4 (GPUNetIO) — Working
+
+ON HOST:
+```bash
 sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
     bin/gpu_receiver --tier 4 --gpu 1 \
     --gpu-pcie 0000:ac:00.0 \
     --nic-pcie 0000:bd:00.1 \
     --harness 127.0.0.1 --fillsim 127.0.0.1
+```
 
-# ON DPU ARM: Send test ticks
-python3 ~/send_ticks.py --mode generate --rate 1000 --count 10000 --iface 10.10.10.1
+ON DPU ARM (after "kernel is alive"):
+```bash
+python3 ~/send_ticks.py --mode generate --rate 1000 --count 1000 --iface 10.10.10.1
+```
+
+Result:
+```
+[GPU] poll #75: GOT 29 pkts (total bursts=1, total pkts=29)
+[GPU] poll #76: GOT 30 pkts (total bursts=2, total pkts=59)
+[GPU] poll #77: GOT 31 pkts (total bursts=3, total pkts=90)
+...
+[GPU] poll #84: GOT 31 pkts (total bursts=10, total pkts=303)
+[CPU-FWD] 5s: ring head=1000 tail=1000 forwarded=1000
+[FLOW-COUNTER] 5s: query=ok total_bytes=90000 total_pkts=1000
+```
+
+**1000 sent, 1000 received by flow hardware, 1000 processed by GPU, 1000 forwarded by CPU. Zero packet loss.** The GPU receives packets in bursts of ~30 (limited by `MAX_PKT_PER_BURST=64` and arrival timing), processes EMA/RSI signals in-kernel, writes results to a pinned-memory ring, and the CPU forwarding thread sends BenchmarkResult and SignalResult via UDP.
+
+---
+
+## 14. Remaining Work
+
+1. **T2 (DPDK) and T3 (GPU RDMA)**: Not yet tested on lxcpu1. Need to check availability of DPDK and libibverbs.
+
+2. **Benchmark matrix**: Run all working tiers (T1, T4, T5) at multiple rates (100, 1000, 5000, 10000, 50000 ticks/sec) with multiple repetitions. Collect latency distributions (t1→t2→t3→t4 timestamps).
+
+3. **T5**: Same binary as T4 — just run `data_source` on DPU ARM instead of `send_ticks.py`. Need to deploy the C++ data_source to the DPU ARM.
+
+4. **Cleanup**: Remove debug `[DBG]` output from gpu_receiver for benchmarking runs (or gate behind `--verbose`).
+
+---
+
+## 15. Quick Reference: Session Setup Commands
+
+**These commands must be run at the start of EVERY session.** IP addresses, bridge config, and multicast snooping are all ephemeral and reset on reboot or session change.
+
+### Connecting to DPU ARM (ON HOST)
+
+```bash
+sudo ip addr add 192.168.100.1/24 dev tmfifo_net0 2>/dev/null
+ssh ubuntu@192.168.100.2
+# Password: [your DPU password]
+```
+
+### After DPU Reboot (ON DPU ARM, 192.168.100.2)
+
+```bash
+# 1. Remove ports from OVS bridges (OVS re-adds them on boot)
+sudo ovs-vsctl del-port ovsbr1 p0 2>/dev/null
+sudo ovs-vsctl del-port ovsbr2 p1 2>/dev/null
+
+# 2. Create bridge for PF1 traffic (if it doesn't exist)
+sudo ip link add br-pf1 type bridge 2>/dev/null
+sudo ip link set p1 master br-pf1 2>/dev/null
+sudo ip link set pf1hpf master br-pf1 2>/dev/null
+sudo ip link set br-pf1 up
+sudo ip link set p1 up
+sudo ip link set pf1hpf up
+
+# 3. Disable IGMP snooping (CRITICAL — multicast is silently dropped without this)
+sudo ip link set br-pf1 type bridge mcast_snooping 0
+
+# 4. Set IP on bridge (NOT on p0 — p0 has PHY loopback, packets won't reach p1)
+sudo ip addr add 10.10.10.1/24 dev br-pf1 2>/dev/null
+```
+
+### Every New Session (ON DPU ARM)
+
+Even without a reboot, IGMP snooping may need to be re-disabled:
+
+```bash
+# Verify snooping is off
+cat /sys/devices/virtual/net/br-pf1/bridge/multicast_snooping
+# Must show: 0
+# If it shows 1:
+sudo ip link set br-pf1 type bridge mcast_snooping 0
+```
+
+### After Host Reboot (ON HOST, lxcpu1)
+
+```bash
+# 1. Verify correct kernel (MUST be 6.11, not 6.17)
+uname -r
+# Expected: 6.11.0-17-generic
+
+# 2. Load nvidia-peermem (required for NIC→GPU DMA)
+sudo modprobe nvidia-peermem
+
+# 3. Verify NVIDIA driver
+nvidia-smi
+
+# 4. Set DPU management IP
+sudo ip addr add 192.168.100.1/24 dev tmfifo_net0 2>/dev/null
+
+# 5. Set CUDA and DOCA paths (or use: source scripts/env.sh)
+source scripts/env.sh
+```
+
+### Every New Session (ON HOST)
+
+```bash
+# Set CUDA and DOCA paths
+source scripts/env.sh
+
+# Verify nvcc works
+nvcc --version
+# Expected: Cuda compilation tools, release 12.8
+```
+
+### Quick Verification (After Setup)
+
+ON DPU ARM:
+```bash
+# Verify bridge state
+bridge link show
+# Should show p1 and pf1hpf as members of br-pf1
+
+# Verify multicast snooping is off
+cat /sys/devices/virtual/net/br-pf1/bridge/multicast_snooping
+# Must be 0
+
+# Verify IP
+ip addr show dev br-pf1 | grep inet
+# Should show 10.10.10.1/24
+```
+
+ON HOST:
+```bash
+# Verify peermem
+lsmod | grep nvidia_peermem
+# Should show nvidia_peermem module
+
+# Verify CUDA
+nvcc --version
+# Should show 12.8
 ```
 
 ---
 
-## 14. Lessons Learned
+## 16. Quick Reference: Running T1 and T4
+
+### T1 (CPU Naive)
+
+ON HOST (terminal 1):
+```bash
+source scripts/env.sh
+make t1
+bin/cpu_receiver --batch 256
+```
+
+ON DPU ARM (terminal 2):
+```bash
+python3 ~/send_ticks.py --mode generate --rate 1000 --count 1000 --iface 10.10.10.1
+```
+
+### T4 (GPUNetIO)
+
+ON HOST (terminal 1):
+```bash
+source scripts/env.sh
+cd ~/DOCAGPUNetIO-application_LIX2_FYP_HKUST
+git pull && make t4
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/gpu_receiver --tier 4 --gpu 1 \
+    --gpu-pcie 0000:ac:00.0 \
+    --nic-pcie 0000:bd:00.1 \
+    --harness 127.0.0.1 --fillsim 127.0.0.1
+```
+
+Wait for `[gpu_receiver] GPU kernel is alive` then ON DPU ARM (terminal 2):
+```bash
+python3 ~/send_ticks.py --mode generate --rate 1000 --count 1000 --iface 10.10.10.1
+```
+
+Watch for:
+- `[GPU] poll #XX: GOT N pkts` — GPU is receiving
+- `[CPU-FWD] forwarded=1000` — Full pipeline working
+- `[FLOW-COUNTER] total_pkts=1000` — Hardware counters match
+
+### Common Failures and Quick Fixes
+
+| Symptom | Cause | Fix (and where) |
+|---------|-------|-----------------|
+| `FLOW-COUNTER total_pkts=0` | Multicast snooping re-enabled | ON DPU ARM: `sudo ip link set br-pf1 type bridge mcast_snooping 0` |
+| `FLOW-COUNTER total_pkts=0` | IP on wrong interface | ON DPU ARM: ensure `10.10.10.1` is ONLY on `br-pf1`, not on `p0` |
+| `nvcc: No such file` | CUDA not in PATH | ON HOST: `source scripts/env.sh` |
+| `DOCA Driver call failure (21)` at ctx_start | Wrong kernel version | ON HOST: `uname -r` must show `6.11.0-17-generic` |
+| `cudaMemcpy(head) failed: unspecified launch failure` | GPU kernel crashed | Restart gpu_receiver. If persistent, check kernel code for `__syncthreads()` issues |
+| `send_ticks.py` succeeds but nothing arrives | tmfifo_net0 not configured | ON HOST: `sudo ip addr add 192.168.100.1/24 dev tmfifo_net0` |
+| Cannot SSH to DPU ARM | tmfifo_net0 not configured | ON HOST: `sudo ip addr add 192.168.100.1/24 dev tmfifo_net0` |
+
+---
+
+## 17. Lessons Learned
 
 ### 1. Always Check the Kernel Version First
 
@@ -1192,6 +1474,38 @@ IGMP snooping on bridges silently drops multicast traffic unless group membershi
 
 If you're following tutorials or examples written for DOCA 2.x, many function signatures have changed. The only reliable reference is the actual header files in `/opt/mellanox/doca/include/`. Read them before assuming an API call's signature.
 
+### 11. Use `_thread` Recv, Not Block-Scope Template
+
+The block-scope template `doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK>` crashed after ~4000 polls in our setup. The single-thread variant `doca_gpu_dev_eth_rxq_recv_thread()` works reliably. Have thread 0 call the `_thread` variant and share results via `__shared__` memory, then let all threads process in parallel. This gives the same parallelism without the crash.
+
+### 12. `__shared__` Memory Is Required for Cross-Thread Communication in CUDA
+
+Local variables in a CUDA kernel are per-thread. If thread 0 writes to a local variable, threads 1-63 see their own uninitialized copy. Any data that thread 0 produces and other threads consume MUST be in `__shared__` memory (with a `__syncthreads()` barrier between write and read). This is a fundamental CUDA rule but easy to forget when refactoring.
+
+### 13. Never `continue` Past `__syncthreads()`
+
+A `continue` or `break` inside a loop that contains `__syncthreads()` causes undefined behavior — some threads hit the barrier while others skip it. Either restructure the code so all threads reach the barrier, or gate the processing with an `if` block that doesn't skip the barrier.
+
+### 14. `cudaHostAllocWriteCombined` Has a Direction
+
+WriteCombined is an optimization for one-directional writes:
+- **CPU→GPU**: Use `WriteCombined` — batches writes for better throughput
+- **GPU→CPU**: Do NOT use `WriteCombined` — CPU reads will return stale data
+
+For memory written by the GPU kernel and read by CPU threads (like result rings or diagnostic counters), use `cudaHostAllocMapped` only.
+
+### 15. Session State Is Ephemeral — Script Everything
+
+IP addresses, bridge configuration, IGMP snooping, and module loading do not persist across reboots or session changes. The most frustrating debugging sessions were caused by missing network setup, not code bugs. Always run the full session setup commands (Section 15) before testing. Consider scripting them.
+
+### 16. `ethtool -S` Physical Counters Don't Count Representor Traffic
+
+`rx_packets_phy` only counts packets arriving from the physical cable. Packets arriving via the eswitch representor pairing (our production path) are invisible to physical counters. Use DOCA Flow counters (the `[FLOW-COUNTER]` output in gpu_receiver) as the source of truth.
+
+### 17. PHY Loopback Can Silently Break Your Setup
+
+`mlxlink` can show `Loopback Mode: PHY Local Loopback` — meaning TX from a port loops back into its own RX and never leaves. This makes the port appear "active" and "link up" while no data actually reaches the cable. Check with `mlxlink -d mlx5_X -p 1 | grep Loopback` if packets aren't reaching their destination.
+
 ---
 
-*This document was written based on debugging sessions conducted in April 2026 on a host running Ubuntu 24 with BlueField-3 DPU, NVIDIA A2 GPU, DOCA SDK 3.3, CUDA 12.8, and NVIDIA driver 570.*
+*This document was written based on debugging sessions conducted in April 2026 on a host running Ubuntu 24 with BlueField-3 DPU, NVIDIA A2 GPU, DOCA SDK 3.3, CUDA 12.8, and NVIDIA driver 570. Last updated: April 14, 2026 — T4 end-to-end working.*
