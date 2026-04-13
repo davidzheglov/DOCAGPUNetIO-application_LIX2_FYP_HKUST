@@ -237,9 +237,7 @@ __global__ void gpu_recv_process_kernel(
                     atomicAdd((unsigned long long *)&s_port_miss, 1ULL);
                 }
 
-                // Temporarily skip port check for testing (cross-reference with doca_flow_test.cu)
-                // if (dst_port == TICK_MCAST_PORT) {
-                if (true) {  // Process all UDP packets for now
+                if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
 
@@ -616,6 +614,10 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         struct doca_flow_match udp_match = {};
         udp_match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
         udp_match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+        udp_match.outer.eth.type = htons(DOCA_FLOW_ETHER_TYPE_IPV4);
+        udp_match.outer.ip4.dst_ip = htonl(inet_addr(TICK_MCAST_ADDR));
+        udp_match.outer.ip4.next_proto = IPPROTO_UDP;
+        udp_match.outer.ip4.version_ihl = 0;  /* unset, not required */
 
         struct doca_flow_monitor udp_monitor = {};
         udp_monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
@@ -625,8 +627,7 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
         fwd.type = DOCA_FLOW_FWD_RSS;
         fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
         fwd.rss.queues_array = rss_queues;
-        fwd.rss.outer_flags = 0;  /* No RSS hashing to force all packets to queue 0 */
-        fwd.rss.inner_flags = 0;
+        fwd.rss.outer_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP;
         fwd.rss.nr_queues = 1;
 
         struct doca_flow_fwd miss_fwd = {};
