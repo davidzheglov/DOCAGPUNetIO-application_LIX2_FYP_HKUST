@@ -135,7 +135,7 @@ GPU kernel (persistent)      <-- Processes tick data, writes results
 
 Every component in this chain had to be individually debugged. A failure at any point means zero packets reach the GPU.
 
-**Important architectural note**: The host CPU is **not in the data path**. Packets never touch host CPU memory. The ConnectX-7 NIC ASIC sits on the host's PCIe bus alongside the GPU, so its DMA engines can write directly to GPU VRAM via PCIe peer-to-peer transfer. The host CPU only performs setup (creating flow rules, allocating GPU memory, launching the kernel) and reads results afterward.
+**Important architectural note**: The host CPU is **not in the data path**. Packets never touch host CPU memory. The entire packet processing pipeline — parser, flow table lookup, DMA engine — runs inside the ConnectX-7 ASIC on the DPU card. When host code calls functions like `doca_flow_pipe_create()`, these are control plane API calls that send configuration commands to the ASIC over PCIe. The ASIC programs its internal flow tables and then evaluates every arriving packet against those tables autonomously, without the host CPU executing a single instruction per packet. The ASIC's DMA engine initiates PCIe write transactions to the GPU's VRAM address directly. The host CPU only performs setup (programming flow rules, allocating GPU memory, launching the GPU kernel) and reads results afterward.
 
 ### Why Can't the DPU ARM Cores DMA Directly to the GPU?
 
@@ -182,7 +182,25 @@ The Linux bridge (`br-pf1`) on the DPU ARM exists solely to route packets from t
 
 ### What Is an Eswitch?
 
-The **eswitch** (embedded switch) is a packet switch implemented inside the DPU's NIC ASIC. It operates at line rate (no software overhead) and decides where incoming packets go. It has two modes:
+The **eswitch** (embedded switch) is a packet switch implemented inside the DPU's NIC ASIC. It operates at line rate (no software overhead) and routes packets between the ASIC's internal ports (physical ports, representors, VFs/PFs). Its job is purely **port-level routing**: "this packet arrived on port X, send it to port Y." It does not deeply inspect packet contents.
+
+The eswitch is one of several hardware blocks inside the ConnectX-7 ASIC. After the eswitch routes a packet to a destination port, separate hardware blocks handle further processing:
+
+```
+Inside the ConnectX-7 ASIC, in sequence:
+
+1. eswitch          — Routes packet to the correct internal port
+2. Packet parser    — Extracts header fields (ETH type, IP proto, L4 ports, etc.)
+                      Produces parser_meta metadata (outer_l3_type, outer_l4_type)
+3. Flow table       — Matches parsed fields against programmed DOCA Flow rules
+   lookup engine      Decides action (e.g., RSS to RX queue 0)
+4. DMA engine       — Writes packet bytes to the target memory address
+                      (GPU VRAM in our case, via PCIe peer-to-peer)
+```
+
+These are different stages in the same ASIC, not the same thing. The eswitch handles **routing between ports**; the parser + flow table handle **classification and steering within a port**.
+
+The eswitch has two modes:
 
 - **Legacy mode**: Simple, one-to-one mapping. Each physical port maps to one host function. Limited flexibility.
 - **Switchdev mode**: The eswitch becomes fully programmable. You can create virtual ports, add forwarding rules, and use representors to bridge traffic between the DPU ARM and the host.
@@ -261,6 +279,8 @@ When we call `doca_flow_port_start()` on the host with the PF1 device (`0000:bd:
 The host interface `ens21f1np1` is not connected to a physical cable, but it is backed by a real hardware object inside the ASIC: PF1 has its own eswitch port, its own set of RX/TX queues, and its own DMA engines. The flow steering and DMA engines work identically whether the packet arrived via cable or via an internal eswitch path.
 
 DOCA Flow would **not** work on purely software interfaces that have no corresponding hardware in the ASIC — for example, `veth` pairs, `tun/tap` devices, or the loopback interface `lo`. These exist entirely in the Linux kernel with no ASIC hardware to program.
+
+The correct distinction is: **ASIC packet pipeline** vs. **kernel network stack** — not "physical cable" vs. "no cable." Any packet that enters the ASIC's pipeline (from a cable, from a representor, from a VF) can be steered by DOCA Flow. Any packet that has already been delivered to the kernel's network stack (visible in `tcpdump`, readable via `recvfrom()`) has taken the software path and cannot be retroactively redirected by DOCA Flow — at that point you would need `cudaMemcpy()`, which is what the slow T1 baseline does.
 
 ---
 
