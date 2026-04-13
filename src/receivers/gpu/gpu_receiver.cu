@@ -773,10 +773,18 @@ int main(int argc, char **argv)
     /* Result ring: host-mapped pinned memory for GPU->CPU transfer */
     ResultRing ring{};
     ring.depth = RESULT_QUEUE_DEPTH;
-    CUDA_CHECK(cudaMallocHost(&ring.slots, ring.depth * sizeof(ResultSlot)));
-    CUDA_CHECK(cudaMallocHost(&ring.head,  sizeof(uint64_t)));
+    CUDA_CHECK(cudaHostAlloc(&ring.slots, ring.depth * sizeof(ResultSlot),
+                              cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(&ring.head,  sizeof(uint64_t),
+                              cudaHostAllocMapped | cudaHostAllocWriteCombined));
     *ring.head = 0;
     ring.tail  = 0;
+
+    /* GPU-visible pointers for host-mapped result ring */
+    ResultSlot *d_ring_slots = nullptr;
+    uint64_t *d_ring_head = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&d_ring_slots, ring.slots, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer(&d_ring_head, ring.head, 0));
 
     /* Quit flag — host-pinned mapped memory so CPU writes are
      * immediately visible to the GPU without cudaMemcpy */
@@ -806,8 +814,8 @@ int main(int argc, char **argv)
         doca.rxq_gpu,
         d_quit,
         d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
-        ring.slots,
-        ring.head,
+        d_ring_slots,
+        d_ring_head,
         ring.depth,
         tier);
 
