@@ -1157,13 +1157,11 @@ Loopback Mode: PHY Local Loopback
 
 **Root cause**: Port 0 was in PHY Local Loopback — all TX from p0 was looping back into p0's own RX. Signals never left the port, so p1 (connected by cable) saw no link partner.
 
-**Impact on our setup**: The data path `p0 → cable → p1 → bridge → pf1hpf → host` was physically broken. However, the alternate path `br-pf1 → pf1hpf → eswitch → host` works because the bridge TX goes directly to the representor — it doesn't need physical port connectivity.
+**Impact on our setup**: The data path was broken until the hardware setting was reset to "No Loopback" by another team member.
 
-**Current working path**: With `10.10.10.1` on `br-pf1`, packets flow:
-```
-DPU ARM app → br-pf1 (10.10.10.1) → pf1hpf → eswitch internal pairing → host PF1
-```
-This bypasses the physical ports entirely. The p0→cable→p1 path is NOT used.
+**Current working path**: With loopback off, `10.10.10.1` on `br-pf1`, and the QSFP112 cable connecting p0↔p1, the bridge forwards packets to both `p1` and `pf1hpf`. Packets arrive at the host via the representor path (`pf1hpf → eswitch → host PF1`). The physical port path also carries traffic (confirmed via tcpdump on `p1`).
+
+**How to check**: ON DPU ARM: `sudo mlxlink -d mlx5_0 -p 1 | grep Loopback` should show `No Loopback`. If it shows `PHY Local Loopback`, someone needs to reset it.
 
 ### Problem 4: `rx_packets_phy` vs DOCA Flow Counters
 
