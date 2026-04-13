@@ -151,37 +151,35 @@ __global__ void gpu_recv_process_kernel(
     }
     __syncthreads();
 
-    while (!*quit_flag) {
-        /* ── Thread 0 receives a burst (block-scope template variant) ── */
-        uint64_t first_pkt_idx = 0;
-        uint32_t n_pkts = 0;
-        doca_error_t ret = DOCA_SUCCESS;
+    /* Shared recv output — thread 0 writes, all threads read after barrier */
+    __shared__ uint64_t s_first_pkt_idx;
+    __shared__ uint32_t s_n_pkts;
+    __shared__ doca_error_t s_ret;
 
+    while (!*quit_flag) {
+        /* ── Thread 0 receives a burst (_thread variant) ── */
         if (tid == 0) {
-            ret = doca_gpu_dev_eth_rxq_recv_thread(
+            s_n_pkts = 0;
+            s_ret = doca_gpu_dev_eth_rxq_recv_thread(
                 rxq,
                 MAX_PKT_PER_BURST,
                 MAX_RX_TIMEOUT_NS,
-                &first_pkt_idx,
-                &n_pkts,
+                &s_first_pkt_idx,
+                &s_n_pkts,
                 NULL);
-        }
-        __syncthreads();
 
-        /* ── Diagnostic: periodic poll stats from thread 0 ── */
-        if (tid == 0) {
             s_poll_count++;
-            if (ret != DOCA_SUCCESS && ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
+            if (s_ret != DOCA_SUCCESS && s_ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
                 if (s_poll_count <= 5 || s_poll_count % 10000 == 0)
                     printf("[GPU] poll #%llu: recv returned error %d (n_pkts=%u)\n",
-                           (unsigned long long)s_poll_count, (int)ret, n_pkts);
+                           (unsigned long long)s_poll_count, (int)s_ret, s_n_pkts);
             }
-            if (n_pkts > 0) {
+            if (s_n_pkts > 0) {
                 s_recv_count++;
-                s_pkt_total += n_pkts;
+                s_pkt_total += s_n_pkts;
                 if (s_recv_count <= 10 || s_recv_count % 100 == 0)
                     printf("[GPU] poll #%llu: GOT %u pkts (total bursts=%llu, total pkts=%llu)\n",
-                           (unsigned long long)s_poll_count, n_pkts,
+                           (unsigned long long)s_poll_count, s_n_pkts,
                            (unsigned long long)s_recv_count,
                            (unsigned long long)s_pkt_total);
             }
@@ -196,15 +194,12 @@ __global__ void gpu_recv_process_kernel(
                        (unsigned long long)s_port_miss,
                        (unsigned long long)s_ring_writes);
         }
-
-        if (ret != DOCA_SUCCESS || n_pkts == 0) continue;
+        __syncthreads();  /* All threads now see s_n_pkts, s_first_pkt_idx, s_ret */
 
         /* ── Each thread processes one packet ── */
-        bool processed = false;
-
-        if (tid < (int)n_pkts) {
+        if (s_ret == DOCA_SUCCESS && s_n_pkts > 0 && tid < (int)s_n_pkts) {
             uintptr_t buf_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
-                rxq, first_pkt_idx + tid);
+                rxq, s_first_pkt_idx + tid);
             const uint8_t *pkt = reinterpret_cast<const uint8_t *>(buf_addr);
 
             /* Verify minimum length */
@@ -326,7 +321,6 @@ __global__ void gpu_recv_process_kernel(
         }
 
         /* Ensure all threads complete before next burst */
-        (void)processed;
         __syncthreads();
     }
 }
@@ -776,8 +770,9 @@ int main(int argc, char **argv)
     ring.depth = RESULT_QUEUE_DEPTH;
     CUDA_CHECK(cudaHostAlloc(&ring.slots, ring.depth * sizeof(ResultSlot),
                               cudaHostAllocMapped));
+    /* No WriteCombined — GPU writes this, CPU reads it */
     CUDA_CHECK(cudaHostAlloc(&ring.head,  sizeof(uint64_t),
-                              cudaHostAllocMapped | cudaHostAllocWriteCombined));
+                              cudaHostAllocMapped));
     *ring.head = 0;
     ring.tail  = 0;
 
