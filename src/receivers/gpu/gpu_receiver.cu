@@ -622,8 +622,12 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
 
         uint16_t rss_queues[1] = { 0 };
         struct doca_flow_fwd fwd = {};
-        fwd.type      = DOCA_FLOW_FWD_TYPE_QUEUE;
-        fwd.queue_id  = 0;
+        fwd.type = DOCA_FLOW_FWD_RSS;
+        fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+        fwd.rss.queues_array = rss_queues;
+        fwd.rss.outer_flags = 0;  /* No RSS hashing to force all packets to queue 0 */
+        fwd.rss.inner_flags = 0;
+        fwd.rss.nr_queues = 1;
 
         struct doca_flow_fwd miss_fwd = {};
         miss_fwd.type = DOCA_FLOW_FWD_DROP;
