@@ -55,7 +55,7 @@
 #define MAX_PKT_SIZE       2048
 #define ETH_IP_UDP_HDR     42       /* 14 + 20 + 8 */
 #define RESULT_QUEUE_DEPTH 4096
-#define MAX_RX_TIMEOUT_NS  500000ULL  /* 0.5ms timeout */
+#define MAX_RX_TIMEOUT_NS  10000000ULL  /* 10ms timeout */
 
 #define CUDA_CHECK(call) \
     do { cudaError_t _e=(call); if(_e!=cudaSuccess){ \
@@ -158,12 +158,9 @@ __global__ void gpu_recv_process_kernel(
         doca_error_t ret = DOCA_SUCCESS;
 
         if (tid == 0) {
-            ret = doca_gpu_dev_eth_rxq_recv<
-                DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
-                DOCA_GPUNETIO_ETH_MCST_AUTO,
-                DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
+            ret = doca_gpu_dev_eth_rxq_recv_thread(
                 rxq,
-                0,  /* max_rx_pkts: 0 = unlimited for block-scope */
+                MAX_PKT_PER_BURST,
                 MAX_RX_TIMEOUT_NS,
                 &first_pkt_idx,
                 &n_pkts,
