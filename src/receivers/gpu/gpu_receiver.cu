@@ -315,7 +315,6 @@ __global__ void gpu_recv_process_kernel(
                     rslot->signal.t4_ns = t4;
 
                     atomicAdd((unsigned long long *)&s_ring_writes, 1ULL);
-                    processed = true;
                 }
             }
         }
