@@ -244,6 +244,12 @@ int main(int argc, char **argv)
 
     /* Receive loop */
     int batch_n = 0;
+    uint64_t total_recv = 0;
+    uint64_t total_batches = 0;
+    auto start_time = std::chrono::steady_clock::now();
+
+    fprintf(stderr, "[T1] waiting for ticks on %s:%d...\n", mcast_addr, mcast_port);
+
     while (true) {
         ssize_t n = recvfrom(recv_fd,
                               &gpu.h_ticks[batch_n], sizeof(TickMessage),
@@ -251,12 +257,24 @@ int main(int argc, char **argv)
         if (n != sizeof(TickMessage)) continue;
 
         ++batch_n;
+        ++total_recv;
+
+        if (total_recv == 1)
+            fprintf(stderr, "[T1] first tick received (tick_id=%u)\n",
+                    gpu.h_ticks[0].tick_id);
 
         if (batch_n >= batch_size) {
             process_batch(gpu, batch_n,
                           harness_fd, harness_dest,
                           signal_fd,  signal_dest,
                           tier);
+            ++total_batches;
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - start_time).count();
+            fprintf(stderr, "[T1] batch %llu: processed %d ticks (total recv=%llu, %.0f ticks/s)\n",
+                    (unsigned long long)total_batches, batch_n,
+                    (unsigned long long)total_recv,
+                    total_recv / elapsed);
             batch_n = 0;
         }
     }
