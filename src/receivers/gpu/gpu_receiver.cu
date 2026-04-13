@@ -622,8 +622,8 @@ static int doca_init(DocaContext &doca, const char *nic_pcie, const char *gpu_pc
 
         uint16_t rss_queues[1] = { 0 };
         struct doca_flow_fwd fwd = {};
-        fwd.type      = DOCA_FLOW_FWD_QUEUE;
-        fwd.queue.id  = 0;
+        fwd.type      = DOCA_FLOW_FWD_TYPE_QUEUE;
+        fwd.queue_id  = 0;
 
         struct doca_flow_fwd miss_fwd = {};
         miss_fwd.type = DOCA_FLOW_FWD_DROP;
