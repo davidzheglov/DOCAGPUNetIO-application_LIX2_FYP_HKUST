@@ -158,7 +158,9 @@ __global__ void gpu_recv_process_kernel(
         doca_error_t ret = DOCA_SUCCESS;
 
         if (tid == 0) {
-            ret = doca_gpu_dev_eth_rxq_recv_thread(
+            ret = doca_gpu_dev_eth_rxq_recv_thread<
+                DOCA_GPUNETIO_ETH_MCST_AUTO,
+                DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
                 rxq,
                 MAX_PKT_PER_BURST,
                 MAX_RX_TIMEOUT_NS,
