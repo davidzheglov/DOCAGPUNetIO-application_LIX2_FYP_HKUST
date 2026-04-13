@@ -153,8 +153,11 @@ __global__ void gpu_recv_process_kernel(
 
     while (!*quit_flag) {
         /* ── Thread 0 receives a burst (single-thread variant) ── */
+        uint64_t first_pkt_idx = 0;
+        uint32_t n_pkts = 0;
+        doca_error_t ret = DOCA_SUCCESS;
+
         if (tid == 0) {
-            n_pkts = 0;
             ret = doca_gpu_dev_eth_rxq_recv_thread(
                 rxq,
                 MAX_PKT_PER_BURST,
