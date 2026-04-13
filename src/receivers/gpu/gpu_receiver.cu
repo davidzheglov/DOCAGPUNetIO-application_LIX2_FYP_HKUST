@@ -152,21 +152,17 @@ __global__ void gpu_recv_process_kernel(
     __syncthreads();
 
     while (!*quit_flag) {
-        /* ── Receive a burst of packets (block-scope) ── */
-        uint64_t first_pkt_idx = 0;
-        uint32_t n_pkts = 0;
-
-        doca_error_t ret = doca_gpu_dev_eth_rxq_recv<
-            DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
-            DOCA_GPUNETIO_ETH_MCST_AUTO,
-            DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
+        /* ── Thread 0 receives a burst (single-thread variant) ── */
+        if (tid == 0) {
+            n_pkts = 0;
+            ret = doca_gpu_dev_eth_rxq_recv_thread(
                 rxq,
                 MAX_PKT_PER_BURST,
                 MAX_RX_TIMEOUT_NS,
                 &first_pkt_idx,
                 &n_pkts,
                 NULL);
-
+        }
         __syncthreads();
 
         /* ── Diagnostic: periodic poll stats from thread 0 ── */
