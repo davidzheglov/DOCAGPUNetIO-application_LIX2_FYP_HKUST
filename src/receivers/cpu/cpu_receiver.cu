@@ -76,6 +76,11 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port)
     if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         perror("IP_ADD_MEMBERSHIP"); close(fd); return -1;
     }
+
+    /* Timeout so partial batches get flushed when sender stops */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     return fd;
 }
 
@@ -258,16 +263,21 @@ int main(int argc, char **argv)
         ssize_t n = recvfrom(recv_fd,
                               &gpu.h_ticks[batch_n], sizeof(TickMessage),
                               0, nullptr, nullptr);
-        if (n != sizeof(TickMessage)) continue;
 
-        ++batch_n;
-        ++total_recv;
+        if (n == sizeof(TickMessage)) {
+            ++batch_n;
+            ++total_recv;
 
-        if (total_recv == 1)
-            fprintf(stderr, "[T1] first tick received (tick_id=%u)\n",
-                    gpu.h_ticks[0].tick_id);
+            if (total_recv == 1)
+                fprintf(stderr, "[T1] first tick received (tick_id=%u)\n",
+                        gpu.h_ticks[0].tick_id);
+        }
 
-        if (batch_n >= batch_size) {
+        /* Flush when batch is full OR timeout with partial batch */
+        bool batch_full = (batch_n >= batch_size);
+        bool timeout_flush = (n != sizeof(TickMessage) && batch_n > 0);
+
+        if (batch_full || timeout_flush) {
             process_batch(gpu, batch_n,
                           harness_fd, harness_dest,
                           signal_fd,  signal_dest,
@@ -275,8 +285,9 @@ int main(int argc, char **argv)
             ++total_batches;
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - start_time).count();
-            fprintf(stderr, "[T1] batch %llu: processed %d ticks (total recv=%llu, %.0f ticks/s)\n",
+            fprintf(stderr, "[T1] batch %llu: processed %d ticks%s (total recv=%llu, %.0f ticks/s)\n",
                     (unsigned long long)total_batches, batch_n,
+                    timeout_flush ? " (partial flush)" : "",
                     (unsigned long long)total_recv,
                     total_recv / elapsed);
             batch_n = 0;
