@@ -57,6 +57,10 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port)
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+    /* Enlarge receive buffer to avoid drops during GPU batch processing */
+    int rcvbuf = 16 * 1024 * 1024;  /* 16 MB — holds ~330k TickMessages */
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((uint16_t)port);
