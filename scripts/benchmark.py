@@ -441,7 +441,7 @@ class BenchRunner:
         print("=" * 72)
         print(f"  tier={r['tier']}  target={r['rate_hz']:,} Hz  rep={r['repetition']}  "
               f"nsys={'on' if r['nsys'] else 'off'}")
-        print(f"  window: {r['warmup']}s warmup + {r['duration']}s measure")
+        print(f"  window: {r['warmup_sec']}s warmup + {r['duration_sec']}s measure")
         print()
         print(f"  Throughput:")
         print(f"    expected   : {t['expected']:>10,}")
