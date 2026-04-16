@@ -116,7 +116,8 @@ class BenchRunner:
         self.clock_oneway_ns = 0    # estimated one-way network delay
         self.clock_cal_ip    = None # which IP we pinged (mgmt vs data-path)
         self.clock_offset_applied_ns = 0   # set by collect() — what we actually used
-        self.clock_offset_source     = "none"  # "none" | "ntp" | "empirical"
+        self.clock_offset_slope      = 0.0 # ns of drift per ns of t2 (drift-aware only)
+        self.clock_offset_source     = "none"  # "none" | "ntp" | "empirical_*" | "drift_linear"
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -544,28 +545,99 @@ class BenchRunner:
             print(f"             empirical p99:    score={emp_min_score:>6,}  "
                   f"off={emp_min_off/1e9:+.6f} s")
 
+            # ── Drift-aware candidate: linear fit of (t1-t2) vs t2 ──────
+            # If the DPU clock is running at a different rate from the host,
+            # the offset isn't a constant — it changes during the run. Fit
+            # a line  (t1 - t2) = a + b*t2  to the UPPER ENVELOPE (smallest
+            # real latency) of (t1 - t2), then correct per packet:
+            #     t1' = t1 - (a + b * t2)
+            # This collapses linear drift to zero while leaving real
+            # per-packet latency variation intact.
+            #
+            # The fit uses a sparse, high-percentile sample: we bin by t2
+            # into 50 buckets, take each bucket's p99 of (t1-t2), and fit
+            # an ordinary least-squares line through those 50 points.
+            drift_slope = 0.0
+            drift_intercept = 0
+            drift_score = -1
+            full_sample = results if len(results) <= 200_000 else results[::max(1, len(results)//200_000)]
+            if len(full_sample) >= 1000:
+                t2_min = full_sample[0]["t2_ns"]
+                t2_max = full_sample[-1]["t2_ns"]
+                if t2_max > t2_min:
+                    n_bins = 50
+                    bin_width = (t2_max - t2_min) / n_bins
+                    bins = [[] for _ in range(n_bins)]
+                    for r in full_sample:
+                        idx = min(n_bins - 1,
+                                  int((r["t2_ns"] - t2_min) / bin_width))
+                        bins[idx].append(r["t1_ns"] - r["t2_ns"])
+                    xs, ys = [], []
+                    for i, b in enumerate(bins):
+                        if len(b) >= 10:
+                            xs.append(t2_min + (i + 0.5) * bin_width)
+                            ys.append(_percentile(b, 99))
+                    if len(xs) >= 5:
+                        # OLS linear fit
+                        n = len(xs)
+                        mx = sum(xs) / n
+                        my = sum(ys) / n
+                        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+                        den = sum((x - mx) ** 2 for x in xs)
+                        if den > 0:
+                            drift_slope = num / den
+                            drift_intercept = int(my - drift_slope * mx)
+                            # Score the drift-aware correction using the
+                            # same plausible-latency criterion.
+                            ok = 0
+                            for r in sample:
+                                t1c = r["t1_ns"] - (drift_intercept
+                                      + int(drift_slope * r["t2_ns"]))
+                                ing = r["t2_ns"] - t1c
+                                e2e = r["t4_ns"] - t1c
+                                if (INGEST_MIN_NS <= ing <= INGEST_MAX_NS and
+                                        INGEST_MIN_NS <= e2e <= E2E_MAX_NS):
+                                    ok += 1
+                            drift_score = ok
+                            print(f"             drift (linear fit): "
+                                  f"score={drift_score:>6,}  "
+                                  f"intercept={drift_intercept/1e9:+.6f} s  "
+                                  f"slope={drift_slope*1e9:+.3f} ns/s "
+                                  f"({len(xs)} bins fit)")
+
             # Pick the best. Prefer p99-based empirical (post-correction
-            # min ≈ 0, which is what we want).
-            candidates = [("none", 0, zero_score),
-                          ("empirical_median", emp_med_off, emp_med_score),
-                          ("empirical_p99",    emp_min_off, emp_min_score)]
+            # min ≈ 0, which is what we want). Drift-aware wins if present.
+            candidates = [("none", 0, 0, zero_score),
+                          ("empirical_median", 0, emp_med_off, emp_med_score),
+                          ("empirical_p99",    0, emp_min_off, emp_min_score)]
             if ntp_off:
-                candidates.append(("ntp", ntp_off, ntp_score))
-            candidates.sort(key=lambda c: c[2], reverse=True)
-            chosen_label, chosen_off, chosen_score = candidates[0]
+                candidates.append(("ntp", 0, ntp_off, ntp_score))
+            if drift_score >= 0:
+                candidates.append(("drift_linear",
+                                    drift_slope, drift_intercept,
+                                    drift_score))
+            candidates.sort(key=lambda c: c[3], reverse=True)
+            chosen_label, chosen_slope, chosen_off, chosen_score = candidates[0]
 
             if chosen_score < n_sample // 2:
                 print(f"[benchmark] WARN: best offset only fits "
                       f"{chosen_score}/{n_sample} rows — data may be corrupt")
 
             self.clock_offset_applied_ns = chosen_off
+            self.clock_offset_slope      = chosen_slope
             self.clock_offset_source     = chosen_label
-            print(f"[benchmark] APPLYING offset: {chosen_label} "
-                  f"({chosen_off/1e9:+.6f} s = {chosen_off} ns)")
+            if chosen_slope != 0.0:
+                print(f"[benchmark] APPLYING drift-aware correction: "
+                      f"{chosen_label}  intercept={chosen_off/1e9:+.6f} s  "
+                      f"slope={chosen_slope*1e9:+.3f} ns/s")
+            else:
+                print(f"[benchmark] APPLYING offset: {chosen_label} "
+                      f"({chosen_off/1e9:+.6f} s = {chosen_off} ns)")
 
-            if chosen_off:
+            if chosen_off != 0 or chosen_slope != 0.0:
                 for r in results:
-                    r["t1_ns"] = r["t1_ns"] - chosen_off
+                    correction = chosen_off + int(chosen_slope * r["t2_ns"])
+                    r["t1_ns"] = r["t1_ns"] - correction
 
             # Post-correction verification — print real latency distribution
             # so the user can tell at a glance whether the offset was sane.
@@ -628,6 +700,7 @@ class BenchRunner:
         # t1_ns was already corrected in collect() if calibration ran.
         # (we track both what was applied AND the raw NTP number for audit)
         off = self.clock_offset_applied_ns
+        # (slope is stored on the runner too — used by summary.json)
 
         # Anchor the measurement window on the first observed t1_ns.
         # This lines up with the DPU sender's wall clock (t1 = send timestamp).
@@ -698,8 +771,9 @@ class BenchRunner:
                 "ssh":         a.ssh if not a.manual else None,
             },
             "clock_cal": {
-                "applied":          bool(off),
+                "applied":          bool(off) or bool(self.clock_offset_slope),
                 "offset_ns":        int(off),
+                "offset_slope":     float(self.clock_offset_slope),
                 "offset_source":    self.clock_offset_source,
                 "ntp_offset_ns":    int(self.clock_offset_ns),
                 "oneway_ns_min":    int(self.clock_oneway_ns),
@@ -741,12 +815,16 @@ class BenchRunner:
         print(f"  window: {r['warmup_sec']}s warmup + {r['duration_sec']}s measure")
         cal = s.get("clock_cal", {})
         if cal.get("applied"):
-            src = cal.get("offset_source", "?")
+            src  = cal.get("offset_source", "?")
             off_s = cal["offset_ns"] / 1e9
+            slope = cal.get("offset_slope", 0.0)
             ntp_s = cal.get("ntp_offset_ns", 0) / 1e9
-            print(f"  clock offset: {off_s:+.6f} s  "
-                  f"(source={src}; NTP said {ntp_s:+.6f} s, "
-                  f"min-RTT one-way ≈ {cal['oneway_ns_min']/1000:.2f} μs)")
+            drift_line = ""
+            if slope != 0.0:
+                drift_line = f"  +  slope={slope*1e9:+.3f} ns/s (drift-corrected)"
+            print(f"  clock offset: {off_s:+.6f} s  (source={src}){drift_line}")
+            print(f"                NTP said {ntp_s:+.6f} s, "
+                  f"min-RTT one-way ≈ {cal['oneway_ns_min']/1000:.2f} μs")
         else:
             print(f"  clock offset: NOT APPLIED — e2e/ingest are meaningless")
         print()
