@@ -863,20 +863,23 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[gpu_receiver] stopping...\n");
 
-    /* End profiling window before teardown noise */
-    nvtxRangePop();              /* steady_state */
-    cudaProfilerStop();
-    fprintf(stderr, "[gpu_receiver] cudaProfilerStop()\n");
-
-    /* Signal kernel to stop — d_quit is host-mapped, GPU sees it immediately */
+    /* Signal kernel to stop FIRST — d_quit is host-mapped, GPU sees it immediately.
+     * nsys cudaProfilerStop() will hang if the GPU is still busy, so we drain it
+     * before ending the profiling window. */
     *d_quit = 1;
     __sync_synchronize();  /* memory fence */
 
-    /* Wait for kernel with timeout */
+    /* Wait for kernel to exit */
     cudaError_t sync_err = cudaDeviceSynchronize();
     if (sync_err != cudaSuccess)
         fprintf(stderr, "[gpu_receiver] cudaDeviceSynchronize: %s\n",
                 cudaGetErrorString(sync_err));
+    fprintf(stderr, "[gpu_receiver] kernel exited, ending profile window\n");
+
+    /* End profiling window now that GPU is idle */
+    nvtxRangePop();              /* steady_state */
+    cudaProfilerStop();
+    fprintf(stderr, "[gpu_receiver] cudaProfilerStop()\n");
 
     /* Stop forwarding thread */
     fwd_ctx.stop = true;
