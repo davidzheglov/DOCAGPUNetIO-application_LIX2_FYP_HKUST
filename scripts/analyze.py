@@ -11,6 +11,17 @@ Writes  results/single/<run_name>/plots/
             03_latency_timeline.png — tick_id vs e2e latency (detects tail drift)
             04_throughput.png       — receive rate over time
             05_drop_map.png         — gaps in tick_id sequence
+            06_ingest_jitter.png    — clock-INDEPENDENT ingest quality
+                                       (host-only t2 inter-arrival; does NOT
+                                       depend on DPU↔host clock alignment)
+
+NOTE on cross-machine latency: ingest (t2-t1) and e2e (t4-t1) cross the
+DPU↔host boundary, so they are limited by the ~925 μs/s DPU wall-clock
+drift vs host. The benchmark.py drift_linear correction removes first-order
+slope, but residual non-linear drift means these figures carry a noise
+floor of tens of ms and should be read as upper bounds. The jitter plot
+(#06) uses only host-side t2 timestamps and is the definitive "ingest
+quality" metric for report purposes — see docs/SPECIFICATION.md §12.5.
 
 Usage:
     python3 scripts/analyze.py results/single/T4_50000hz_rep1_20260416_143022
@@ -251,6 +262,101 @@ def plot_throughput(data: np.ndarray, run_name: str, out: Path, bin_ms: int = 10
     print(f"  wrote {out}")
 
 
+def compute_ingest_jitter(data: np.ndarray, rate_hz: int):
+    """Clock-INDEPENDENT ingest quality.
+
+    Computes inter-arrival jitter on host-side t2 timestamps only — the DPU
+    clock is NOT involved, so this metric is immune to the cross-machine
+    clock drift that inflates (t2-t1) ingest latency.
+
+    For consecutive tick_ids N, N+1:
+        observed_interval = t2[N+1] - t2[N]                (host ns)
+        expected_interval = 1e9 / rate_hz                  (host ns)
+        jitter            = observed - expected            (signed)
+
+    Returns (jitter_us, cum_drift_us, t_sec_for_drift). All three arrays are
+    aligned to the **consecutive-pair** subset so they can be plotted directly.
+    Empty arrays are returned when rate_hz is unknown or data is too short.
+    """
+    empty = (np.array([], dtype=np.float64),) * 3
+    if rate_hz <= 0 or len(data) < 2:
+        return empty
+
+    order = np.argsort(data["tick_id"])
+    tids  = data["tick_id"][order].astype(np.int64)
+    t2    = data["t2_ns"][order].astype(np.int64)
+
+    d_tid = np.diff(tids)
+    d_t2  = np.diff(t2)
+    mask  = d_tid == 1                 # consecutive ids only (skip drops)
+    if not mask.any():
+        return empty
+
+    expected_ns = 1_000_000_000.0 / float(rate_hz)
+    jitter_us   = (d_t2[mask].astype(np.float64) - expected_ns) / 1000.0
+
+    # Cumulative drift: how far the receiver's arrival clock has wandered
+    # from the ideal cadence since the first tick.
+    idx_keep = np.flatnonzero(mask) + 1     # t2 index for every kept sample
+    t2_kept  = t2[idx_keep]
+    tid_kept = tids[idx_keep]
+    t_sec    = (t2_kept - t2_kept[0]) / 1e9
+    expected_elapsed_s = (tid_kept - tid_kept[0]).astype(np.float64) * expected_ns / 1e9
+    cum_drift_us = (t_sec - expected_elapsed_s) * 1e6
+
+    return jitter_us, cum_drift_us, t_sec
+
+
+def plot_ingest_jitter(data: np.ndarray, summary: dict, run_name: str, out: Path):
+    """Plot 06 — clock-independent ingest quality."""
+    rate_hz = (summary.get("run", {}) or {}).get("rate_hz", 0)
+    jitter_us, cum_drift_us, t_sec = compute_ingest_jitter(data, rate_hz)
+    if len(jitter_us) == 0:
+        print("  [plot_ingest_jitter] insufficient data (need rate_hz + >=2 consecutive ticks) — skip")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # ── Left: jitter histogram, symmetric clip for readability ──────────
+    clip = max(abs(np.percentile(jitter_us, 0.1)),
+               abs(np.percentile(jitter_us, 99.9)))
+    clip = max(clip, 1.0)  # avoid zero-width axis on a perfectly-timed sender
+    ax1.hist(np.clip(jitter_us, -clip, clip),
+             bins=120, color="#6a4c93", edgecolor="white", linewidth=0.3)
+    abs_j = np.abs(jitter_us)
+    ap50, ap95, ap99 = np.percentile(abs_j, [50, 95, 99])
+    ax1.axvline(0, color="black", linestyle="-", linewidth=0.8, alpha=0.5)
+    for mag, c, lbl in [(ap50, "#4CAF50", f"|p50| = {ap50:.2f} μs"),
+                        (ap95, "#FF9800", f"|p95| = {ap95:.2f} μs"),
+                        (ap99, "#F44336", f"|p99| = {ap99:.2f} μs")]:
+        ax1.axvline(-mag, color=c, linestyle="--", linewidth=1.0)
+        ax1.axvline(+mag, color=c, linestyle="--", linewidth=1.0, label=lbl)
+    expected_us = 1e6 / rate_hz
+    ax1.set_xlabel("inter-arrival jitter (μs)  [host-only, clock-independent]")
+    ax1.set_ylabel("count")
+    ax1.set_title(f"Ingest jitter — expected interval {expected_us:.2f} μs @ {rate_hz:,} Hz")
+    ax1.legend(loc="upper right", fontsize=9)
+    ax1.grid(alpha=0.25)
+
+    # ── Right: cumulative arrival drift vs ideal cadence ─────────────────
+    # Downsample line for huge runs so rendering stays snappy.
+    stride = max(1, len(t_sec) // 10000)
+    ax2.plot(t_sec[::stride], cum_drift_us[::stride],
+             color="#6a4c93", linewidth=0.8)
+    ax2.axhline(0, color="black", linewidth=0.5, alpha=0.5)
+    ax2.set_xlabel("time since first tick (s)")
+    ax2.set_ylabel("cumulative arrival drift (μs)\n"
+                   "(< 0 = receiver ahead of schedule, > 0 = behind)")
+    ax2.set_title("Cumulative ingest drift — receiver vs ideal cadence")
+    ax2.grid(alpha=0.25)
+
+    fig.suptitle(f"Ingest quality (clock-independent) — {run_name}", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
 def plot_drop_map(data: np.ndarray, run_name: str, out: Path):
     tids = np.sort(data["tick_id"].astype(np.int64))
     if len(tids) < 2:
@@ -319,6 +425,7 @@ def main():
     plot_latency_timeline(data, run_name, plots_dir / "03_latency_timeline.png")
     plot_throughput(data, run_name, plots_dir / "04_throughput.png")
     plot_drop_map(data, run_name, plots_dir / "05_drop_map.png")
+    plot_ingest_jitter(data, summary, run_name, plots_dir / "06_ingest_jitter.png")
 
     # Small text summary printed so the user can sanity-check without opening PNGs.
     e2e = (data["t4_ns"].astype(np.int64) - data["t1_ns"].astype(np.int64)) / 1000.0
@@ -327,7 +434,17 @@ def main():
         p50, p95, p99 = np.percentile(e2e, [50, 95, 99])
         print(f"[analyze] e2e  n={len(e2e):,}  "
               f"p50={p50:.1f}μs  p95={p95:.1f}μs  p99={p99:.1f}μs  "
-              f"max={e2e.max():.1f}μs")
+              f"max={e2e.max():.1f}μs  (cross-machine, clock-limited)")
+
+    # Clock-independent ingest quality — this is the trustworthy number.
+    rate_hz = (summary.get("run", {}) or {}).get("rate_hz", 0)
+    jitter_us, _, _ = compute_ingest_jitter(data, rate_hz)
+    if len(jitter_us):
+        abs_j = np.abs(jitter_us)
+        p50, p95, p99 = np.percentile(abs_j, [50, 95, 99])
+        print(f"[analyze] ingest jitter  n={len(jitter_us):,}  "
+              f"|p50|={p50:.2f}μs  |p95|={p95:.2f}μs  |p99|={p99:.2f}μs  "
+              f"(host-only, clock-independent)")
     print(f"[analyze] plots → {plots_dir}")
 
 

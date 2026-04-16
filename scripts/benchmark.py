@@ -746,6 +746,24 @@ class BenchRunner:
         compute  = lat(window, "t2_ns", "t3_ns")   # GPU mem → kernel done
         egress   = lat(window, "t3_ns", "t4_ns")   # kernel done → UDP out
 
+        # ── Clock-INDEPENDENT ingest quality ─────────────────────────────
+        # DPU↔host wall-clock drift (~925 μs/s) inflates ingest (t2-t1) and
+        # e2e (t4-t1) by tens of ms in a 30 s run, even after drift_linear
+        # correction. Jitter uses ONLY host-side t2_ns: for consecutive
+        # tick_ids, jitter = (t2[N+1] - t2[N]) - (1e9 / rate_hz).
+        # Positive = packet arrived later than ideal cadence; negative = early.
+        expected_ns = 1_000_000_000.0 / a.rate if a.rate > 0 else 0.0
+        jitter_us_signed = []
+        window_by_tid = sorted(window, key=lambda r: r["tick_id"])
+        prev = window_by_tid[0]
+        for cur in window_by_tid[1:]:
+            if cur["tick_id"] == prev["tick_id"] + 1:
+                d = cur["t2_ns"] - prev["t2_ns"]
+                jitter_us_signed.append((d - expected_ns) / 1000.0)
+            prev = cur
+        jitter_us_signed.sort()
+        jitter_us_abs = sorted(abs(x) for x in jitter_us_signed)
+
         def stats(lst):
             if not lst:
                 return {"n": 0, "mean": float("nan"),
@@ -800,6 +818,21 @@ class BenchRunner:
                 "compute": stats(compute),
                 "egress":  stats(egress),
             },
+            # Clock-independent ingest quality. Always trustworthy, regardless
+            # of DPU↔host clock alignment. |p99| is the report metric for
+            # "how consistently does GPUNetIO deliver at the target cadence".
+            "ingest_jitter_us": {
+                "n":                    len(jitter_us_signed),
+                "expected_interval_us": (expected_ns / 1000.0) if expected_ns else None,
+                "signed_p01":           pct(jitter_us_signed, 1),
+                "signed_p50":           pct(jitter_us_signed, 50),
+                "signed_p99":           pct(jitter_us_signed, 99),
+                "abs_p50":              pct(jitter_us_abs, 50),
+                "abs_p95":              pct(jitter_us_abs, 95),
+                "abs_p99":              pct(jitter_us_abs, 99),
+                "abs_p999":             pct(jitter_us_abs, 99.9),
+                "abs_max":              jitter_us_abs[-1] if jitter_us_abs else float("nan"),
+            },
         }
 
         with open(self.summary_json, "w") as f:
@@ -847,9 +880,21 @@ class BenchRunner:
                           ("  egress (t4-t3)", "egress"),
                           ("  e2e    (t4-t1)", "e2e")]:
             x = L[key]
+            tag = "  [cross-machine, clock-limited]" if key in ("ingest", "e2e") else ""
             print(f"  {name:14s}  {x['n']:>7,}  {fmt_us(x['mean'])}  "
                   f"{fmt_us(x['p50'])}  {fmt_us(x['p95'])}  "
-                  f"{fmt_us(x['p99'])}  {fmt_us(x['p999'])}  {fmt_us(x['max'])}")
+                  f"{fmt_us(x['p99'])}  {fmt_us(x['p999'])}  {fmt_us(x['max'])}"
+                  f"{tag}")
+        # Clock-independent ingest quality — the trustworthy number.
+        j = s.get("ingest_jitter_us") or {}
+        if j.get("n"):
+            print()
+            print(f"  Ingest jitter (host-only, clock-independent):")
+            print(f"    expected interval : {j['expected_interval_us']:.2f} μs")
+            print(f"    |p50|             : {fmt_us(j['abs_p50'])}")
+            print(f"    |p95|             : {fmt_us(j['abs_p95'])}")
+            print(f"    |p99|             : {fmt_us(j['abs_p99'])}")
+            print(f"    signed p01..p99   : {fmt_us(j['signed_p01'])} .. {fmt_us(j['signed_p99'])}")
         print()
         print(f"  Files:")
         print(f"    {self.bench_csv}")

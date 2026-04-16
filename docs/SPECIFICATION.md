@@ -966,8 +966,56 @@ Per benchmark run, the harness computes:
 | Warmup period | 5 seconds (results discarded) |
 | Measurement window | 30 seconds |
 | Repetitions per configuration | 3 |
-| Tick rates tested | 10k, 50k, 100k, 250k, 500k ticks/sec |
+| Tick rates tested | 10k, 25k, 50k, 100k, 200k, 500k, 1M ticks/sec |
 | Data source mode | Replay (deterministic, repeatable) |
+
+### 12.5 Cross-Machine Clock Limitation
+
+The four timestamps span two machines: **T1 is captured on the DPU ARM** (`time.time_ns()` wall clock), while **T2/T3/T4 are captured on the host** (GPU `clock64()` cycles, anchored to host `CLOCK_REALTIME` at kernel start-up, see §7.7). This means that every latency metric which *crosses* the DPU↔host boundary — specifically **ingest (T2-T1)** and **end-to-end (T4-T1)** — is limited by the quality of DPU↔host clock alignment.
+
+**Observed drift characteristics** (with no time-sync daemon on the DPU):
+
+| Quantity | Typical Value |
+|----------|---------------|
+| Instantaneous DPU↔host wall-clock offset | seconds (DPU clock is unmaintained) |
+| DPU clock rate error vs host | ~925 μs per second (~925 ppm) |
+| Absolute offset drift over a 30 s run | ~28 ms accumulated |
+
+**Correction stages applied by `benchmark.py`** (see the `collect()` method):
+
+1. **NTP-style calibration** — four-timestamp UDP round-trip before the run measures the constant offset.
+2. **Empirical p99 fallback** — the 99th percentile of `(T1 - T2)` across a stratified sample of the run approximates the "smallest real latency" baseline, which is a better estimator of pure clock skew than the NTP-style number when the DPU clock is unstable.
+3. **Drift-aware linear fit** — an ordinary-least-squares line is fit through the per-bin p99 of `(T1 - T2)` vs `T2`. The resulting `(intercept, slope)` pair corrects each packet's T1 individually, removing the first-order drift component.
+
+The correction source used for each run is recorded in `summary.json::clock_cal.offset_source` (one of `none`, `ntp`, `empirical_median`, `empirical_p99`, `drift_linear`).
+
+**Residual error after correction.** Even with the drift_linear correction applied, residual non-linear clock error (thermal, scheduling jitter) produces an **ingest/e2e noise floor in the tens of ms** on a 30 s run. This is fundamental: sub-millisecond cross-machine latency measurement is not possible without PTP or chrony running on the DPU. The drift-corrected ingest/e2e figures should be read as **upper bounds**, not as point estimates of actual GPUNetIO ingest latency.
+
+**Clock-independent metric — ingest jitter.** To measure GPUNetIO ingestion quality without crossing the machine boundary, the harness computes **inter-arrival jitter** using only host-side T2 timestamps:
+
+```
+For consecutive tick_ids N, N+1:
+  observed_interval  = T2[N+1] − T2[N]          # host nanoseconds
+  expected_interval  = 1e9 / rate_hz            # nanoseconds
+  jitter[N]          = observed − expected      # signed nanoseconds
+```
+
+Because this uses only T2 (host clock), it is **completely immune to DPU↔host drift**. A well-behaved GPUNetIO path should produce |jitter| with p99 on the order of a few microseconds at moderate rates. Jitter is reported in `summary.json::ingest_jitter_us` and plotted as `plots/06_ingest_jitter.png`.
+
+**Per-stage trustworthiness.**
+
+| Metric | Trustworthy? | Why |
+|--------|--------------|-----|
+| Compute (T3-T2) | ✓ Yes | Both timestamps from the same GPU clock |
+| Egress (T4-T3) | ✓ Yes | Both timestamps from the same GPU clock |
+| Ingest jitter | ✓ Yes | Only uses host-side T2 |
+| Throughput, drop rate | ✓ Yes | Counts, no clock |
+| Ingest (T2-T1) | ⚠ Upper bound | Crosses DPU↔host, ~tens-of-ms floor |
+| End-to-end (T4-T1) | ⚠ Upper bound | Crosses DPU↔host, ~tens-of-ms floor |
+
+For the FYP report, the **trustworthy** metrics (compute latency, egress latency, jitter, throughput, drop rate) are the primary GPUNetIO performance claims. The cross-machine metrics are reported with the caveat above.
+
+**Future work to remove the limitation.** Running `chronyd` (configured to discipline the DPU wall clock against an NTP server, or — better — against the host via the management network) before benchmarks would reduce the drift to microseconds and make the cross-machine metrics directly usable. PTP over the data path would push that to sub-microsecond. Neither is currently configured on the DPU.
 
 ---
 
