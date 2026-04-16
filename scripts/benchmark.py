@@ -114,6 +114,7 @@ class BenchRunner:
         self.ssh_password  = None   # set by prompt_ssh_password() if --ask-pass
         self.clock_offset_ns = 0    # set by calibrate_clock_offset(); DPU→host
         self.clock_oneway_ns = 0    # estimated one-way network delay
+        self.clock_cal_ip    = None # which IP we pinged (mgmt vs data-path)
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -155,13 +156,17 @@ class BenchRunner:
                 print("[benchmark] skipping clock calibration (manual mode)")
             return
 
+        cal_ip = a.cal_ip or a.ssh.split("@")[-1]
+
+        # Bind the server to 0.0.0.0 so that whatever IP the client picks
+        # reaches it (mgmt path or data path).
         cal_cmd = (f"cd {shlex.quote(a.dpu_repo)} && "
                    f"python3 scripts/clock_cal_server.py "
-                   f"--ip {shlex.quote(a.dpu_bind_ip)} "
+                   f"--ip 0.0.0.0 "
                    f"--port {a.cal_port}")
 
-        print(f"[benchmark] clock calibration — starting cal server on DPU "
-              f"({a.dpu_bind_ip}:{a.cal_port})")
+        print(f"[benchmark] clock calibration — starting cal server on DPU, "
+              f"pinging {cal_ip}:{a.cal_port}")
         cal_log = self.run_dir / "cal.log"
         cal_log_fh = open(cal_log, "w")
         argv, env = self._build_ssh(cal_cmd)
@@ -185,7 +190,7 @@ class BenchRunner:
             try:
                 t_a = time.time_ns()
                 sock.sendto(struct.pack("=Q", t_a),
-                            (a.dpu_bind_ip, a.cal_port))
+                            (cal_ip, a.cal_port))
                 data, _ = sock.recvfrom(32)
                 t_d = time.time_ns()
             except socket.timeout:
@@ -227,11 +232,12 @@ class BenchRunner:
 
         self.clock_offset_ns = int(offset_ns)
         self.clock_oneway_ns = int(oneway_ns)
+        self.clock_cal_ip    = cal_ip
 
         print(f"[benchmark] clock offset (DPU→host): "
               f"{offset_ns/1000:+.2f} μs   "
               f"(min-RTT one-way ≈ {oneway_ns/1000:.2f} μs, "
-              f"{len(samples)}/{a.cal_samples} samples)")
+              f"{len(samples)}/{a.cal_samples} samples via {cal_ip})")
 
     # ── gpu_receiver (host) ──────────────────────────────────────────────────
     def start_receiver(self):
@@ -530,6 +536,7 @@ class BenchRunner:
                 "applied":         bool(off),
                 "offset_ns":       int(off),
                 "oneway_ns_min":   int(self.clock_oneway_ns),
+                "cal_ip":          self.clock_cal_ip,
             },
             "throughput": {
                 "expected":       expected,
@@ -730,6 +737,11 @@ def main():
                    help="Number of NTP-style round-trips for calibration")
     p.add_argument("--cal-port", type=int, default=6006,
                    help="UDP port for clock_cal_server.py on DPU")
+    p.add_argument("--cal-ip", default=None,
+                   help="IP to reach clock_cal_server on the DPU. "
+                        "Default: host-part of --ssh (mgmt path), which is "
+                        "known to work. Data-path IPs can work too but some "
+                        "OVS/br-pf1 configs drop unicast.")
     p.add_argument("--sender-tail-sec", type=int, default=3,
                    help="Extra seconds of ticks to send past measurement window")
     p.add_argument("--collector-tail-sec", type=int, default=2,
