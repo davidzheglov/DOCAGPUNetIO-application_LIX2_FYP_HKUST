@@ -330,6 +330,14 @@ __global__ void gpu_recv_process_kernel(
 struct ForwardCtx {
     ResultRing        *ring        = nullptr;
     double             ns_per_cyc  = 1.0;
+    /* GPU clock64() <-> host wall-clock anchor captured just before
+     * the persistent kernel starts. Lets cpu_forward_thread translate
+     * every (t2, t3, t4) from "cycles since SM reset" into "nanoseconds
+     * since Unix epoch" — the same frame as t1 (set by the sender via
+     * gettimeofday). Without this anchor, e2e/ingest latencies are
+     * nonsense because the two clocks don't even share a zero. */
+    uint64_t           gpu_cyc_anchor        = 0;
+    uint64_t           host_wall_anchor_ns   = 0;
     int                harness_fd  = -1;
     int                signal_fd   = -1;
     sockaddr_in        harness_dest{};
@@ -337,9 +345,31 @@ struct ForwardCtx {
     std::atomic<bool>  stop{false};
 };
 
-static uint64_t cyc_to_ns(uint64_t cyc, double ns_per_cyc)
+/* One-shot kernel: read clock64() once so the host can anchor the GPU
+ * cycle counter to wall-clock time. Launched just before the persistent
+ * receive kernel; see main(). */
+__global__ static void clock64_anchor_kernel(uint64_t *out)
 {
-    return (uint64_t)((double)cyc * ns_per_cyc);
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *out = clock64();
+    }
+}
+
+/* Translate a raw clock64() cycle value into nanoseconds since the Unix
+ * epoch, using the anchor pair captured at kernel launch. Preserves the
+ * 0 sentinel (used when t4 hasn't been written yet). */
+static uint64_t cyc_to_wall_ns(uint64_t cyc,
+                                uint64_t cyc_anchor,
+                                uint64_t wall_anchor_ns,
+                                double   ns_per_cyc)
+{
+    if (cyc == 0) return 0;
+    /* clock64() is 64-bit unsigned and monotonic within an SM session,
+     * but (cyc - cyc_anchor) can wrap if cyc < cyc_anchor (shouldn't
+     * happen in steady state). Cast to signed for safe subtraction. */
+    int64_t delta_cyc = (int64_t)(cyc - cyc_anchor);
+    int64_t delta_ns  = (int64_t)((double)delta_cyc * ns_per_cyc);
+    return (uint64_t)((int64_t)wall_anchor_ns + delta_ns);
 }
 
 static void cpu_forward_thread(ForwardCtx *ctx)
@@ -376,9 +406,18 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
-                br.t2_ns  = cyc_to_ns(br.t2_ns,  ctx->ns_per_cyc);
-                br.t3_ns  = cyc_to_ns(br.t3_ns,  ctx->ns_per_cyc);
-                br.t4_ns  = cyc_to_ns(br.t4_ns,  ctx->ns_per_cyc);
+                br.t2_ns  = cyc_to_wall_ns(br.t2_ns,
+                                           ctx->gpu_cyc_anchor,
+                                           ctx->host_wall_anchor_ns,
+                                           ctx->ns_per_cyc);
+                br.t3_ns  = cyc_to_wall_ns(br.t3_ns,
+                                           ctx->gpu_cyc_anchor,
+                                           ctx->host_wall_anchor_ns,
+                                           ctx->ns_per_cyc);
+                br.t4_ns  = cyc_to_wall_ns(br.t4_ns,
+                                           ctx->gpu_cyc_anchor,
+                                           ctx->host_wall_anchor_ns,
+                                           ctx->ns_per_cyc);
                 sig.t3_ns = br.t3_ns;
                 sig.t4_ns = br.t4_ns;
 
@@ -804,7 +843,9 @@ int main(int argc, char **argv)
     int harness_fd = make_udp_send(harness_ip, BENCH_RESULT_PORT, harness_dest);
     int signal_fd  = make_udp_send(fillsim_ip, SIGNAL_PORT, signal_dest);
 
-    /* CPU forwarding thread */
+    /* CPU forwarding thread context (thread launched below after the
+     * clock anchor is captured, so the anchor is valid before any ring
+     * entry is forwarded — no race). */
     ForwardCtx fwd_ctx{};
     fwd_ctx.ring         = &ring;
     fwd_ctx.ns_per_cyc   = ns_per_cyc;
@@ -812,6 +853,35 @@ int main(int argc, char **argv)
     fwd_ctx.signal_fd    = signal_fd;
     fwd_ctx.harness_dest = harness_dest;
     fwd_ctx.signal_dest  = signal_dest;
+
+    /* ── GPU-cycle ↔ host-wall-clock anchor ────────────────────────────────
+     * t2/t3/t4 are stamped via clock64() inside the GPU kernel — that's a
+     * per-SM cycle counter with no defined relationship to wall time. To
+     * make (t4 - t1) and (t2 - t1) meaningful, we capture ONE pair of
+     * (clock64() cycle, CLOCK_REALTIME ns) just before the persistent
+     * kernel begins, and use it in cpu_forward_thread to translate every
+     * stamp into Unix-epoch ns (the same frame as t1 from the sender). */
+    uint64_t *h_cyc_anchor = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_cyc_anchor, sizeof(uint64_t),
+                              cudaHostAllocMapped));
+    *h_cyc_anchor = 0;
+    clock64_anchor_kernel<<<1, 1>>>(h_cyc_anchor);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    {
+        auto now = std::chrono::system_clock::now();
+        fwd_ctx.host_wall_anchor_ns = (uint64_t)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count();
+    }
+    fwd_ctx.gpu_cyc_anchor = *h_cyc_anchor;
+    cudaFreeHost(h_cyc_anchor);
+    fprintf(stderr,
+            "[gpu_receiver] clock anchor: gpu_cyc=%llu host_wall_ns=%llu "
+            "ns_per_cyc=%.4f (clock_khz=%d)\n",
+            (unsigned long long)fwd_ctx.gpu_cyc_anchor,
+            (unsigned long long)fwd_ctx.host_wall_anchor_ns,
+            ns_per_cyc, clock_khz);
+
     std::thread fwd_thread(cpu_forward_thread, &fwd_ctx);
 
     /* Begin profiling window BEFORE launching the persistent kernel, so that
