@@ -110,7 +110,10 @@ class BenchRunner:
         self.rx_log_fh     = None
         self.ssh_proc      = None
         self.sender_log_fh = None
+        self.cal_ssh_proc  = None
         self.ssh_password  = None   # set by prompt_ssh_password() if --ask-pass
+        self.clock_offset_ns = 0    # set by calibrate_clock_offset(); DPU→host
+        self.clock_oneway_ns = 0    # estimated one-way network delay
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -122,6 +125,113 @@ class BenchRunner:
             return
         self._interrupted = True
         print(f"\n[benchmark] caught signal {signum} — shutting down", flush=True)
+
+    # ── SSH helper (same auth as the sender) ─────────────────────────────────
+    def _build_ssh(self, remote_cmd, log_fh=None, background=False):
+        """Return (argv, env) for an ssh call to self.args.ssh that uses the
+        same auth approach as start_sender()."""
+        a = self.args
+        ssh_opts = ["-o", "StrictHostKeyChecking=no"]
+        env = os.environ.copy()
+        if self.ssh_password is not None:
+            env["SSHPASS"] = self.ssh_password
+            ssh_opts += ["-o", "PreferredAuthentications=password",
+                         "-o", "PubkeyAuthentication=no"]
+            cmd = ["sshpass", "-e", "ssh", *ssh_opts, a.ssh, remote_cmd]
+        else:
+            if a.ssh_batch:
+                ssh_opts += ["-o", "BatchMode=yes"]
+            cmd = ssh_user_prefix() + ["ssh", *ssh_opts, a.ssh, remote_cmd]
+        return cmd, env
+
+    # ── Clock offset calibration ─────────────────────────────────────────────
+    def calibrate_clock_offset(self):
+        """NTP-style 4-timestamp round-trip over the data path to estimate the
+        DPU↔host clock offset. Saves results in self.clock_offset_ns so that
+        analyze() can correct t1_ns into the host frame."""
+        a = self.args
+        if not a.calibrate or a.manual:
+            if a.manual and a.calibrate:
+                print("[benchmark] skipping clock calibration (manual mode)")
+            return
+
+        cal_cmd = (f"cd {shlex.quote(a.dpu_repo)} && "
+                   f"python3 scripts/clock_cal_server.py "
+                   f"--ip {shlex.quote(a.dpu_bind_ip)} "
+                   f"--port {a.cal_port}")
+
+        print(f"[benchmark] clock calibration — starting cal server on DPU "
+              f"({a.dpu_bind_ip}:{a.cal_port})")
+        cal_log = self.run_dir / "cal.log"
+        cal_log_fh = open(cal_log, "w")
+        argv, env = self._build_ssh(cal_cmd)
+        self.cal_ssh_proc = subprocess.Popen(
+            argv, stdout=cal_log_fh, stderr=subprocess.STDOUT, env=env)
+        # Give the remote Python + socket.bind a moment
+        time.sleep(1.5)
+        if self.cal_ssh_proc.poll() is not None:
+            cal_log_fh.close()
+            err = cal_log.read_text(errors="replace").strip()
+            print(f"[benchmark] ERROR: cal server failed (rc={self.cal_ssh_proc.returncode})")
+            print(f"─── cal.log ───\n{err}\n──────────────")
+            sys.exit("[benchmark] cannot calibrate — aborting. "
+                     "Use --no-calibrate to skip (but then e2e/ingest will be NaN).")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.5)
+
+        samples = []  # list of (offset_ns, one_way_ns)
+        for i in range(a.cal_samples):
+            try:
+                t_a = time.time_ns()
+                sock.sendto(struct.pack("=Q", t_a),
+                            (a.dpu_bind_ip, a.cal_port))
+                data, _ = sock.recvfrom(32)
+                t_d = time.time_ns()
+            except socket.timeout:
+                continue
+            if len(data) < 24:
+                continue
+            _, t_b, t_c = struct.unpack("=QQQ", data[:24])
+            offset  = ((t_b - t_a) + (t_c - t_d)) // 2
+            one_way = ((t_d - t_a) - (t_c - t_b)) // 2
+            samples.append((offset, one_way))
+            time.sleep(0.002)  # small gap so we're not rate-limited
+
+        sock.close()
+
+        # Kill the cal server on the DPU
+        kill_argv, kill_env = self._build_ssh("pkill -f clock_cal_server.py || true")
+        subprocess.run(kill_argv, env=kill_env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5)
+        try:
+            self.cal_ssh_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.cal_ssh_proc.terminate()
+        cal_log_fh.close()
+
+        if not samples:
+            sys.exit("[benchmark] calibration got 0 replies — check data path "
+                     f"to {a.dpu_bind_ip}:{a.cal_port}")
+
+        # Pick the sample with the smallest round-trip (least jitter →
+        # best offset estimate). This is the standard NTP / PTP trick.
+        samples.sort(key=lambda x: x[1])
+        # Use the median of the lowest-jitter decile for robustness
+        best_n = max(5, len(samples) // 10)
+        best = samples[:best_n]
+        best.sort(key=lambda x: x[0])
+        offset_ns  = best[len(best) // 2][0]
+        oneway_ns  = samples[0][1]
+
+        self.clock_offset_ns = int(offset_ns)
+        self.clock_oneway_ns = int(oneway_ns)
+
+        print(f"[benchmark] clock offset (DPU→host): "
+              f"{offset_ns/1000:+.2f} μs   "
+              f"(min-RTT one-way ≈ {oneway_ns/1000:.2f} μs, "
+              f"{len(samples)}/{a.cal_samples} samples)")
 
     # ── gpu_receiver (host) ──────────────────────────────────────────────────
     def start_receiver(self):
@@ -340,6 +450,14 @@ class BenchRunner:
             print("[benchmark] no rows — nothing to analyze")
             return None
 
+        # Correct DPU-origin t1_ns into the host clock frame so that
+        # e2e (t4-t1) and ingest (t2-t1) are meaningful. clock_offset_ns is
+        # 0 if --no-calibrate or manual mode.
+        off = self.clock_offset_ns
+        if off:
+            for r in results:
+                r["t1_ns"] = r["t1_ns"] + off
+
         # Anchor the measurement window on the first observed t1_ns.
         # This lines up with the DPU sender's wall clock (t1 = send timestamp).
         first_t1 = results[0]["t1_ns"]
@@ -408,6 +526,11 @@ class BenchRunner:
                 "dpu_bind_ip": a.dpu_bind_ip,
                 "ssh":         a.ssh if not a.manual else None,
             },
+            "clock_cal": {
+                "applied":         bool(off),
+                "offset_ns":       int(off),
+                "oneway_ns_min":   int(self.clock_oneway_ns),
+            },
             "throughput": {
                 "expected":       expected,
                 "received":       received,
@@ -442,6 +565,12 @@ class BenchRunner:
         print(f"  tier={r['tier']}  target={r['rate_hz']:,} Hz  rep={r['repetition']}  "
               f"nsys={'on' if r['nsys'] else 'off'}")
         print(f"  window: {r['warmup_sec']}s warmup + {r['duration_sec']}s measure")
+        cal = s.get("clock_cal", {})
+        if cal.get("applied"):
+            print(f"  clock offset: {cal['offset_ns']/1000:+.2f} μs "
+                  f"(min-RTT one-way ≈ {cal['oneway_ns_min']/1000:.2f} μs)")
+        else:
+            print(f"  clock offset: NOT APPLIED — e2e/ingest are meaningless")
         print()
         print(f"  Throughput:")
         print(f"    expected   : {t['expected']:>10,}")
@@ -518,6 +647,13 @@ class BenchRunner:
                     self.rx_proc.kill()
                     self.rx_proc.wait()
 
+        if self.cal_ssh_proc and self.cal_ssh_proc.poll() is None:
+            try:
+                self.cal_ssh_proc.terminate()
+                self.cal_ssh_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.cal_ssh_proc.kill()
+
         if self.rx_log_fh:
             self.rx_log_fh.close()
         if self.sender_log_fh:
@@ -532,6 +668,7 @@ class BenchRunner:
         print(f"[benchmark] run → {self.run_dir}")
         try:
             self.start_receiver()
+            self.calibrate_clock_offset()
             self.start_sender()
             results = self.collect()
             # Sender should exit on its own (finite count). Receiver we stop.
@@ -582,6 +719,17 @@ def main():
     p.add_argument("--ask-pass", action="store_true",
                    help="Prompt once for the DPU ssh password and use sshpass "
                         "for every ssh call. Requires `sshpass` to be installed.")
+
+    # Clock calibration
+    p.add_argument("--calibrate", dest="calibrate", action="store_true",
+                   default=True,
+                   help="Estimate DPU↔host clock offset before the run (default on)")
+    p.add_argument("--no-calibrate", dest="calibrate", action="store_false",
+                   help="Skip clock calibration (e2e/ingest will be NaN).")
+    p.add_argument("--cal-samples", type=int, default=200,
+                   help="Number of NTP-style round-trips for calibration")
+    p.add_argument("--cal-port", type=int, default=6006,
+                   help="UDP port for clock_cal_server.py on DPU")
     p.add_argument("--sender-tail-sec", type=int, default=3,
                    help="Extra seconds of ticks to send past measurement window")
     p.add_argument("--collector-tail-sec", type=int, default=2,
