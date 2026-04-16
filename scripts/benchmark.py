@@ -272,8 +272,7 @@ class BenchRunner:
         if args.tier == 1:
             receiver_bin = REPO_ROOT / "bin" / "cpu_receiver"
             if not receiver_bin.exists():
-                sys.exit(f"[benchmark] ERROR: {receiver_bin} not found — "
-                         f"build with `cmake --build build --target cpu_receiver`")
+                sys.exit(f"[benchmark] ERROR: {receiver_bin} not found — run `make t1` first")
             rx_cmd = [
                 str(receiver_bin),
                 "--tier", str(args.tier),
