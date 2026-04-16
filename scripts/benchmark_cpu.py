@@ -18,6 +18,7 @@ import json
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -254,9 +255,30 @@ class BenchRunnerCPU:
             out.sort()
             return out
 
+        def compute_latencies(rows):
+            # In cpu_receiver, all ticks in a batch share one (t2, t3), so
+            # raw (t3-t2) is batch kernel time. Report both batch and
+            # amortized per-tick compute latency.
+            batch_counter = Counter()
+            for r in rows:
+                t2, t3 = r["t2_ns"], r["t3_ns"]
+                if t2 > 0 and t3 > t2:
+                    batch_counter[(t2, t3)] += 1
+
+            batch_us = []
+            per_tick_us = []
+            for (t2, t3), n in batch_counter.items():
+                dur_us = (t3 - t2) / 1000.0
+                batch_us.append(dur_us)
+                per_tick_us.append(dur_us / max(n, 1))
+
+            batch_us.sort()
+            per_tick_us.sort()
+            return per_tick_us, batch_us
+
         e2e = lat(window, "t1_ns", "t4_ns")
         ingest = lat(window, "t1_ns", "t2_ns")
-        compute = lat(window, "t2_ns", "t3_ns")
+        compute, compute_batch = compute_latencies(window)
         egress = lat(window, "t3_ns", "t4_ns")
 
         def stats(lst):
@@ -305,6 +327,7 @@ class BenchRunnerCPU:
                 "e2e": stats(e2e),
                 "ingest": stats(ingest),
                 "compute": stats(compute),
+                "compute_batch": stats(compute_batch),
                 "egress": stats(egress),
             },
         }
@@ -339,7 +362,8 @@ class BenchRunnerCPU:
         print("  Latency (us):          n       mean      p50      p95      p99     p99.9     max")
         for name, key in [
             ("  ingest(t2-t1)", "ingest"),
-            ("  compute(t3-t2)", "compute"),
+            ("  compute/tick", "compute"),
+            ("  compute/batch", "compute_batch"),
             ("  egress (t4-t3)", "egress"),
             ("  e2e    (t4-t1)", "e2e"),
         ]:
