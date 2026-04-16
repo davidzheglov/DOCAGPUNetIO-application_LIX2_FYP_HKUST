@@ -115,6 +115,8 @@ class BenchRunner:
         self.clock_offset_ns = 0    # set by calibrate_clock_offset(); DPU→host
         self.clock_oneway_ns = 0    # estimated one-way network delay
         self.clock_cal_ip    = None # which IP we pinged (mgmt vs data-path)
+        self.clock_offset_applied_ns = 0   # set by collect() — what we actually used
+        self.clock_offset_source     = "none"  # "none" | "ntp" | "empirical"
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -448,29 +450,113 @@ class BenchRunner:
 
         sock.close()
 
-        # Apply DPU→host clock offset correction to t1_ns so that the CSV
-        # and every downstream tool sees a single consistent clock frame.
-        # NTP convention: offset = D - H (DPU minus host). To bring DPU
-        # timestamps into the host frame, SUBTRACT offset:
-        #     t1_host = t1_dpu - offset
-        # (Adding would double the error — that was a sign bug.)
-        off = self.clock_offset_ns
-        if off and results:
-            for r in results:
-                r["t1_ns"] = r["t1_ns"] - off
+        # ── Clock-offset correction ──────────────────────────────────────
+        # t1_ns comes from the DPU (sender wall clock) and t2/t3/t4 come
+        # from the host (receiver wall clock). If the two machines' clocks
+        # disagree by even a few ms, (t4 - t1) and (t2 - t1) can be negative,
+        # which our downstream filter (`tb > ta`) throws out — producing
+        # n=0 on e2e and ingest.
+        #
+        # We try TWO sources for the correction and pick whichever produces
+        # sensible post-correction values:
+        #   (1) NTP-style round-trip via clock_cal_server.py (self.clock_offset_ns)
+        #   (2) EMPIRICAL: assume median ingestion latency is small and
+        #       positive (tens of μs at most), so median(t2 - t1) should
+        #       be ≈ 0 after correction. Any large median skew is clock
+        #       drift, not real latency. Compute:
+        #           empirical_offset = median(t1 - t2)
+        #       and subtract it from every t1.
+        #
+        # NTP is checked first because it's the "proper" answer; but if NTP
+        # calibration is obviously wrong (e.g. data-path blocked the UDP,
+        # or the DPU clock drifted between calibration and capture), the
+        # empirical number is the safety net.
+        def _median(xs):
+            xs = sorted(xs)
+            m = len(xs) // 2
+            return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) // 2
 
-            # Sanity check: after correction, t1 should be very close to t2
-            # on the same packet (sub-ms for a healthy data path). If not,
-            # the calibration is likely bad — warn loudly.
-            sample = results[: min(1000, len(results))]
-            skew_ns = max(abs(r["t2_ns"] - r["t1_ns"]) for r in sample)
-            if skew_ns > 1_000_000_000:  # >1 second: very suspicious
-                print(f"[benchmark] WARN: after correction, max |t2-t1| over "
-                      f"first {len(sample)} rows = {skew_ns/1e9:.2f} s — "
-                      f"calibration looks wrong. e2e/ingest will still be "
-                      f"usable as a LOWER BOUND, but the absolute numbers "
-                      f"are off. Check the DPU's wall clock "
-                      f"(ssh ubuntu@… 'date') against the host's.")
+        if results:
+            # Pre-correction snapshot (first row + median skew across a sample)
+            r0 = results[0]
+            t1_raw, t2_raw = r0["t1_ns"], r0["t2_ns"]
+            sample = results[: min(5000, len(results))]
+            pre_median_skew = _median([r["t1_ns"] - r["t2_ns"] for r in sample])
+            print(f"[benchmark] PRE-correction first row: "
+                  f"t1={t1_raw} t2={t2_raw} "
+                  f"t2-t1={(t2_raw - t1_raw)/1e9:+.6f} s")
+            print(f"[benchmark] PRE-correction median(t1-t2) over "
+                  f"{len(sample)} rows: {pre_median_skew/1e9:+.6f} s "
+                  f"(should be slightly NEGATIVE by a few μs in a healthy run)")
+
+            # Candidate offsets
+            ntp_off = int(self.clock_offset_ns)   # from calibrate_clock_offset()
+            emp_off = int(pre_median_skew)        # from the data itself
+
+            def _score(off_ns):
+                """How 'good' is this offset? Count rows where both t2>t1 and
+                t4>t1 after subtracting off_ns from t1."""
+                ok = 0
+                for r in sample:
+                    t1c = r["t1_ns"] - off_ns
+                    if r["t2_ns"] > t1c and r["t4_ns"] > t1c:
+                        ok += 1
+                return ok
+
+            n_sample = len(sample)
+            ntp_score = _score(ntp_off) if ntp_off else -1
+            emp_score = _score(emp_off)
+            zero_score = _score(0)
+            print(f"[benchmark] offset candidates (rows with t4>t1 AND t2>t1 "
+                  f"out of {n_sample}):")
+            print(f"             no-correction:    score={zero_score:>6,}  off=0")
+            if ntp_off:
+                print(f"             NTP calibration:  score={ntp_score:>6,}  "
+                      f"off={ntp_off/1e9:+.6f} s")
+            print(f"             empirical median: score={emp_score:>6,}  "
+                  f"off={emp_off/1e9:+.6f} s")
+
+            # Pick the best. Require at least 50% of the sample to look sane;
+            # otherwise warn.
+            candidates = [("none", 0, zero_score),
+                          ("empirical", emp_off, emp_score)]
+            if ntp_off:
+                candidates.append(("ntp", ntp_off, ntp_score))
+            candidates.sort(key=lambda c: c[2], reverse=True)
+            chosen_label, chosen_off, chosen_score = candidates[0]
+
+            if chosen_score < n_sample // 2:
+                print(f"[benchmark] WARN: best offset only fits "
+                      f"{chosen_score}/{n_sample} rows — data may be corrupt")
+
+            self.clock_offset_applied_ns = chosen_off
+            self.clock_offset_source     = chosen_label
+            print(f"[benchmark] APPLYING offset: {chosen_label} "
+                  f"({chosen_off/1e9:+.6f} s = {chosen_off} ns)")
+
+            if chosen_off:
+                for r in results:
+                    r["t1_ns"] = r["t1_ns"] - chosen_off
+
+            # Post-correction verification
+            r0 = results[0]
+            post_median_skew = _median([r["t1_ns"] - r["t2_ns"]
+                                        for r in sample])
+            t4gt1 = sum(1 for r in results if r["t4_ns"] > r["t1_ns"])
+            t2gt1 = sum(1 for r in results if r["t2_ns"] > r["t1_ns"])
+            n = len(results)
+            print(f"[benchmark] POST-correction first row: "
+                  f"t1={r0['t1_ns']} t2={r0['t2_ns']} "
+                  f"t2-t1={(r0['t2_ns'] - r0['t1_ns'])/1e9:+.6f} s")
+            print(f"[benchmark] POST-correction median(t1-t2): "
+                  f"{post_median_skew/1e9:+.6f} s  "
+                  f"(should be ≤ 0 by ~one ingest latency)")
+            print(f"[benchmark] POST-correction filters: "
+                  f"t2>t1 on {t2gt1:,}/{n:,} rows, "
+                  f"t4>t1 on {t4gt1:,}/{n:,} rows")
+        else:
+            self.clock_offset_applied_ns = 0
+            self.clock_offset_source     = "none"
 
         # Write CSV with corrected timestamps (single source of truth)
         with open(self.bench_csv, "w", newline="") as f:
@@ -493,7 +579,8 @@ class BenchRunner:
             return None
 
         # t1_ns was already corrected in collect() if calibration ran.
-        off = self.clock_offset_ns
+        # (we track both what was applied AND the raw NTP number for audit)
+        off = self.clock_offset_applied_ns
 
         # Anchor the measurement window on the first observed t1_ns.
         # This lines up with the DPU sender's wall clock (t1 = send timestamp).
@@ -564,10 +651,12 @@ class BenchRunner:
                 "ssh":         a.ssh if not a.manual else None,
             },
             "clock_cal": {
-                "applied":         bool(off),
-                "offset_ns":       int(off),
-                "oneway_ns_min":   int(self.clock_oneway_ns),
-                "cal_ip":          self.clock_cal_ip,
+                "applied":          bool(off),
+                "offset_ns":        int(off),
+                "offset_source":    self.clock_offset_source,
+                "ntp_offset_ns":    int(self.clock_offset_ns),
+                "oneway_ns_min":    int(self.clock_oneway_ns),
+                "cal_ip":           self.clock_cal_ip,
             },
             "throughput": {
                 "expected":       expected,
@@ -605,8 +694,12 @@ class BenchRunner:
         print(f"  window: {r['warmup_sec']}s warmup + {r['duration_sec']}s measure")
         cal = s.get("clock_cal", {})
         if cal.get("applied"):
-            print(f"  clock offset: {cal['offset_ns']/1000:+.2f} μs "
-                  f"(min-RTT one-way ≈ {cal['oneway_ns_min']/1000:.2f} μs)")
+            src = cal.get("offset_source", "?")
+            off_s = cal["offset_ns"] / 1e9
+            ntp_s = cal.get("ntp_offset_ns", 0) / 1e9
+            print(f"  clock offset: {off_s:+.6f} s  "
+                  f"(source={src}; NTP said {ntp_s:+.6f} s, "
+                  f"min-RTT one-way ≈ {cal['oneway_ns_min']/1000:.2f} μs)")
         else:
             print(f"  clock offset: NOT APPLIED — e2e/ingest are meaningless")
         print()
