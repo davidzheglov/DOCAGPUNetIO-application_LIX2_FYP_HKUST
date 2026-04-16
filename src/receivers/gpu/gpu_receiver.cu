@@ -814,6 +814,16 @@ int main(int argc, char **argv)
     fwd_ctx.signal_dest  = signal_dest;
     std::thread fwd_thread(cpu_forward_thread, &fwd_ctx);
 
+    /* Begin profiling window BEFORE launching the persistent kernel, so that
+     * nsys --capture-range=cudaProfilerApi observes the kernel launch and all
+     * of its device activity. Starting the profiler after the launch would
+     * leave the persistent kernel invisible to cuda_gpu_kern_sum. Orchestration
+     * timing (warmup, duration) is owned by benchmark.py — we keep the
+     * receiver window maximal and let the harness slice results by t1_ns. */
+    cudaProfilerStart();
+    nvtxRangePushA("steady_state");
+    fprintf(stderr, "[gpu_receiver] cudaProfilerStart() — capturing from kernel launch\n");
+
     /* Launch persistent GPU receive kernel */
     fprintf(stderr, "[gpu_receiver] launching persistent GPU kernel...\n");
     gpu_recv_process_kernel<<<1, MAX_PKT_PER_BURST>>>(
@@ -824,20 +834,6 @@ int main(int argc, char **argv)
         d_ring_head,
         ring.depth,
         tier);
-
-    /* Warmup before profiler starts. Override with NSYS_WARMUP_SEC env var. */
-    int warmup_sec = 3;
-    if (const char *env = getenv("NSYS_WARMUP_SEC")) {
-        warmup_sec = atoi(env);
-        if (warmup_sec < 0) warmup_sec = 0;
-    }
-    fprintf(stderr, "[gpu_receiver] warmup %d s before cudaProfilerStart...\n", warmup_sec);
-    std::this_thread::sleep_for(std::chrono::seconds(warmup_sec));
-
-    /* Begin profiling window. nsys --capture-range=cudaProfilerApi obeys this. */
-    cudaProfilerStart();
-    nvtxRangePushA("steady_state");
-    fprintf(stderr, "[gpu_receiver] cudaProfilerStart() — capturing steady state\n");
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;
