@@ -35,9 +35,11 @@ All command targets:
 
 import argparse
 import csv
+import getpass
 import json
 import os
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -54,6 +56,16 @@ BENCH_SIZE = 48
 BENCH_PORT = 5010
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def ssh_user_prefix():
+    """If we're running as root under sudo, prepend `sudo -u $SUDO_USER -H` so
+    that ssh/scp use the invoking user's keys, known_hosts, and ssh-agent
+    instead of root's empty ~/.ssh. Returns [] when no wrapping is needed."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        return ["sudo", "-u", sudo_user, "-H"]
+    return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +110,7 @@ class BenchRunner:
         self.rx_log_fh     = None
         self.ssh_proc      = None
         self.sender_log_fh = None
+        self.ssh_password  = None   # set by prompt_ssh_password() if --ask-pass
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -199,16 +212,34 @@ class BenchRunner:
         print(f"[benchmark]   remote cmd: {send_cmd}")
 
         ssh_opts = ["-o", "StrictHostKeyChecking=no"]
-        if a.ssh_batch:
-            # Non-interactive: fail fast if no key auth. Otherwise the ssh client
-            # would hang inside Popen waiting for a password on a closed stdin.
+        # Only use BatchMode when we have neither a password nor an interactive
+        # terminal — otherwise we want ssh to be allowed to authenticate.
+        use_sshpass = self.ssh_password is not None
+        if a.ssh_batch and not use_sshpass:
             ssh_opts += ["-o", "BatchMode=yes"]
+
+        env = os.environ.copy()
+        if use_sshpass:
+            env["SSHPASS"] = self.ssh_password
+            # -o PreferredAuthentications speeds things up and makes failures
+            # explicit (if the DPU refuses passwords we want to see that, not
+            # hang trying gssapi etc.)
+            ssh_opts += ["-o", "PreferredAuthentications=password",
+                         "-o", "PubkeyAuthentication=no"]
+            cmd = ["sshpass", "-e", "ssh", *ssh_opts, ssh_target, send_cmd]
+        else:
+            # Drop to the invoking user for ssh so it uses their ~/.ssh/ —
+            # root usually has no keys set up for the DPU.
+            cmd = ssh_user_prefix() + ["ssh", *ssh_opts, ssh_target, send_cmd]
+            if ssh_user_prefix():
+                print(f"[benchmark]   (ssh as '{os.environ['SUDO_USER']}' via sudo -u)")
 
         self.sender_log_fh = open(self.sender_log, "w")
         self.ssh_proc = subprocess.Popen(
-            ["ssh", *ssh_opts, ssh_target, send_cmd],
+            cmd,
             stdout=self.sender_log_fh,
             stderr=subprocess.STDOUT,
+            env=env,
         )
 
         # Give ssh a moment to either authenticate + start send_ticks, or fail.
@@ -451,11 +482,22 @@ class BenchRunner:
         # Belt-and-suspenders: ask the DPU to kill any lingering send_ticks.py
         a = self.args
         if not a.manual and a.ssh:
+            env = os.environ.copy()
+            if self.ssh_password is not None:
+                env["SSHPASS"] = self.ssh_password
+                kill_cmd = ["sshpass", "-e", "ssh",
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "PreferredAuthentications=password",
+                            "-o", "PubkeyAuthentication=no",
+                            a.ssh, "pkill -f send_ticks.py || true"]
+            else:
+                kill_cmd = ssh_user_prefix() + [
+                    "ssh", "-o", "BatchMode=yes", a.ssh,
+                    "pkill -f send_ticks.py || true"]
             subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", a.ssh,
-                 "pkill -f send_ticks.py || true"],
+                kill_cmd,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5,
+                timeout=5, env=env,
             )
 
         # 2) gpu_receiver: send SIGINT first so it runs its clean-shutdown path
@@ -537,6 +579,9 @@ def main():
                    action="store_false", default=True,
                    help="Allow ssh to prompt for a password on this terminal "
                         "(default: BatchMode=yes, fails fast if no key auth)")
+    p.add_argument("--ask-pass", action="store_true",
+                   help="Prompt once for the DPU ssh password and use sshpass "
+                        "for every ssh call. Requires `sshpass` to be installed.")
     p.add_argument("--sender-tail-sec", type=int, default=3,
                    help="Extra seconds of ticks to send past measurement window")
     p.add_argument("--collector-tail-sec", type=int, default=2,
@@ -556,6 +601,16 @@ def main():
                  "Try: sudo -E python3 scripts/benchmark.py ...")
 
     runner = BenchRunner(args)
+
+    if args.ask_pass and not args.manual:
+        if shutil.which("sshpass") is None:
+            sys.exit("[benchmark] ERROR: --ask-pass requires `sshpass`. "
+                     "Install with: sudo apt-get install -y sshpass")
+        runner.ssh_password = getpass.getpass(
+            f"DPU ssh password for {args.ssh}: ")
+        if not runner.ssh_password:
+            sys.exit("[benchmark] empty password — aborting")
+
     summary = runner.run()
     sys.exit(0 if summary else 1)
 
