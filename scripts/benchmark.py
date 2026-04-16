@@ -234,10 +234,22 @@ class BenchRunner:
         self.clock_oneway_ns = int(oneway_ns)
         self.clock_cal_ip    = cal_ip
 
-        print(f"[benchmark] clock offset (DPU→host): "
-              f"{offset_ns/1000:+.2f} μs   "
-              f"(min-RTT one-way ≈ {oneway_ns/1000:.2f} μs, "
+        # Human-readable description of the offset direction.
+        if offset_ns > 0:
+            direction = f"DPU is AHEAD of host by {offset_ns/1e9:.3f} s"
+        elif offset_ns < 0:
+            direction = f"DPU is BEHIND host by {-offset_ns/1e9:.3f} s"
+        else:
+            direction = "clocks appear synchronized"
+
+        print(f"[benchmark] clock offset: {offset_ns/1000:+.2f} μs   "
+              f"({direction}; min-RTT one-way ≈ {oneway_ns/1000:.2f} μs, "
               f"{len(samples)}/{a.cal_samples} samples via {cal_ip})")
+        if abs(offset_ns) > 60_000_000_000:   # >60 s is weird
+            print(f"[benchmark] NOTE: clock offset is >{abs(offset_ns)/1e9:.0f}s "
+                  f"— the DPU's wall clock is badly misset. The math still "
+                  f"works, but you probably want to `sudo date -s ...` on the "
+                  f"DPU or run chronyd on it before the real report runs.")
 
     # ── gpu_receiver (host) ──────────────────────────────────────────────────
     def start_receiver(self):
@@ -436,7 +448,31 @@ class BenchRunner:
 
         sock.close()
 
-        # Write raw CSV (everything, unfiltered)
+        # Apply DPU→host clock offset correction to t1_ns so that the CSV
+        # and every downstream tool sees a single consistent clock frame.
+        # NTP convention: offset = D - H (DPU minus host). To bring DPU
+        # timestamps into the host frame, SUBTRACT offset:
+        #     t1_host = t1_dpu - offset
+        # (Adding would double the error — that was a sign bug.)
+        off = self.clock_offset_ns
+        if off and results:
+            for r in results:
+                r["t1_ns"] = r["t1_ns"] - off
+
+            # Sanity check: after correction, t1 should be very close to t2
+            # on the same packet (sub-ms for a healthy data path). If not,
+            # the calibration is likely bad — warn loudly.
+            sample = results[: min(1000, len(results))]
+            skew_ns = max(abs(r["t2_ns"] - r["t1_ns"]) for r in sample)
+            if skew_ns > 1_000_000_000:  # >1 second: very suspicious
+                print(f"[benchmark] WARN: after correction, max |t2-t1| over "
+                      f"first {len(sample)} rows = {skew_ns/1e9:.2f} s — "
+                      f"calibration looks wrong. e2e/ingest will still be "
+                      f"usable as a LOWER BOUND, but the absolute numbers "
+                      f"are off. Check the DPU's wall clock "
+                      f"(ssh ubuntu@… 'date') against the host's.")
+
+        # Write CSV with corrected timestamps (single source of truth)
         with open(self.bench_csv, "w", newline="") as f:
             w = csv.DictWriter(
                 f,
@@ -456,13 +492,8 @@ class BenchRunner:
             print("[benchmark] no rows — nothing to analyze")
             return None
 
-        # Correct DPU-origin t1_ns into the host clock frame so that
-        # e2e (t4-t1) and ingest (t2-t1) are meaningful. clock_offset_ns is
-        # 0 if --no-calibrate or manual mode.
+        # t1_ns was already corrected in collect() if calibration ran.
         off = self.clock_offset_ns
-        if off:
-            for r in results:
-                r["t1_ns"] = r["t1_ns"] + off
 
         # Anchor the measurement window on the first observed t1_ns.
         # This lines up with the DPU sender's wall clock (t1 = send timestamp).
