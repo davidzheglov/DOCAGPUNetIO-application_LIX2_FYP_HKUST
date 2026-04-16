@@ -476,50 +476,79 @@ class BenchRunner:
             m = len(xs) // 2
             return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) // 2
 
+        def _percentile(xs, p):
+            xs = sorted(xs)
+            k = int(round(p / 100.0 * (len(xs) - 1)))
+            return xs[k]
+
         if results:
             # Pre-correction snapshot (first row + median skew across a sample)
             r0 = results[0]
             t1_raw, t2_raw = r0["t1_ns"], r0["t2_ns"]
             sample = results[: min(5000, len(results))]
-            pre_median_skew = _median([r["t1_ns"] - r["t2_ns"] for r in sample])
+            skew_vals = [r["t1_ns"] - r["t2_ns"] for r in sample]
+            pre_median_skew = _median(skew_vals)
+            # Least-negative = smallest real latency = best estimate of pure
+            # clock skew. 99th percentile for robustness against glitches.
+            pre_tight_skew  = _percentile(skew_vals, 99)
             print(f"[benchmark] PRE-correction first row: "
                   f"t1={t1_raw} t2={t2_raw} "
                   f"t2-t1={(t2_raw - t1_raw)/1e9:+.6f} s")
-            print(f"[benchmark] PRE-correction median(t1-t2) over "
-                  f"{len(sample)} rows: {pre_median_skew/1e9:+.6f} s "
-                  f"(should be slightly NEGATIVE by a few μs in a healthy run)")
+            print(f"[benchmark] PRE-correction (t1-t2) over {len(sample)} rows: "
+                  f"median={pre_median_skew/1e9:+.6f} s  "
+                  f"p99={pre_tight_skew/1e9:+.6f} s  "
+                  f"(p99 ≈ clock skew; median - p99 ≈ typical real latency)")
 
             # Candidate offsets
-            ntp_off = int(self.clock_offset_ns)   # from calibrate_clock_offset()
-            emp_off = int(pre_median_skew)        # from the data itself
+            ntp_off     = int(self.clock_offset_ns)   # from NTP calibration
+            emp_med_off = int(pre_median_skew)        # biased — half rows go neg
+            emp_min_off = int(pre_tight_skew)         # physical floor, post-min ≈ 0
+
+            # Plausible latency bounds. t2-t1 (ingest) and t4-t1 (e2e) on
+            # a working GPUNetIO data path are tens of μs — at most a few
+            # ms on outliers. Anything in the hundreds of ms or seconds is
+            # clock skew, not real latency. The scoring function rewards
+            # offsets that land most rows inside these bounds.
+            INGEST_MIN_NS =          0        # must be ≥ 0 (send before recv)
+            INGEST_MAX_NS = 50_000_000        # 50 ms ceiling for ingest
+            E2E_MAX_NS    = 100_000_000       # 100 ms ceiling for end-to-end
 
             def _score(off_ns):
-                """How 'good' is this offset? Count rows where both t2>t1 and
-                t4>t1 after subtracting off_ns from t1."""
+                """Count rows where post-correction (t2-t1) and (t4-t1) are
+                both in the plausible-latency range. This rejects offsets
+                that leave t2 - t1 stuck at seconds (clock skew) even
+                though t2 > t1 technically holds."""
                 ok = 0
                 for r in sample:
                     t1c = r["t1_ns"] - off_ns
-                    if r["t2_ns"] > t1c and r["t4_ns"] > t1c:
+                    ing = r["t2_ns"] - t1c
+                    e2e = r["t4_ns"] - t1c
+                    if (INGEST_MIN_NS <= ing <= INGEST_MAX_NS and
+                            INGEST_MIN_NS <= e2e <= E2E_MAX_NS):
                         ok += 1
                 return ok
 
             n_sample = len(sample)
-            ntp_score = _score(ntp_off) if ntp_off else -1
-            emp_score = _score(emp_off)
-            zero_score = _score(0)
-            print(f"[benchmark] offset candidates (rows with t4>t1 AND t2>t1 "
-                  f"out of {n_sample}):")
+            ntp_score      = _score(ntp_off)     if ntp_off     else -1
+            emp_med_score  = _score(emp_med_off) if emp_med_off else -1
+            emp_min_score  = _score(emp_min_off)
+            zero_score     = _score(0)
+            print(f"[benchmark] offset candidates (rows with 0 ≤ ingest ≤ 50ms "
+                  f"AND 0 ≤ e2e ≤ 100ms, out of {n_sample}):")
             print(f"             no-correction:    score={zero_score:>6,}  off=0")
             if ntp_off:
                 print(f"             NTP calibration:  score={ntp_score:>6,}  "
                       f"off={ntp_off/1e9:+.6f} s")
-            print(f"             empirical median: score={emp_score:>6,}  "
-                  f"off={emp_off/1e9:+.6f} s")
+            print(f"             empirical median: score={emp_med_score:>6,}  "
+                  f"off={emp_med_off/1e9:+.6f} s")
+            print(f"             empirical p99:    score={emp_min_score:>6,}  "
+                  f"off={emp_min_off/1e9:+.6f} s")
 
-            # Pick the best. Require at least 50% of the sample to look sane;
-            # otherwise warn.
+            # Pick the best. Prefer p99-based empirical (post-correction
+            # min ≈ 0, which is what we want).
             candidates = [("none", 0, zero_score),
-                          ("empirical", emp_off, emp_score)]
+                          ("empirical_median", emp_med_off, emp_med_score),
+                          ("empirical_p99",    emp_min_off, emp_min_score)]
             if ntp_off:
                 candidates.append(("ntp", ntp_off, ntp_score))
             candidates.sort(key=lambda c: c[2], reverse=True)
@@ -538,19 +567,37 @@ class BenchRunner:
                 for r in results:
                     r["t1_ns"] = r["t1_ns"] - chosen_off
 
-            # Post-correction verification
+            # Post-correction verification — print real latency distribution
+            # so the user can tell at a glance whether the offset was sane.
             r0 = results[0]
-            post_median_skew = _median([r["t1_ns"] - r["t2_ns"]
-                                        for r in sample])
+            post_ingest = sorted(r["t2_ns"] - r["t1_ns"]
+                                 for r in sample
+                                 if r["t2_ns"] > r["t1_ns"])
+            post_e2e    = sorted(r["t4_ns"] - r["t1_ns"]
+                                 for r in sample
+                                 if r["t4_ns"] > r["t1_ns"])
             t4gt1 = sum(1 for r in results if r["t4_ns"] > r["t1_ns"])
             t2gt1 = sum(1 for r in results if r["t2_ns"] > r["t1_ns"])
             n = len(results)
             print(f"[benchmark] POST-correction first row: "
                   f"t1={r0['t1_ns']} t2={r0['t2_ns']} "
-                  f"t2-t1={(r0['t2_ns'] - r0['t1_ns'])/1e9:+.6f} s")
-            print(f"[benchmark] POST-correction median(t1-t2): "
-                  f"{post_median_skew/1e9:+.6f} s  "
-                  f"(should be ≤ 0 by ~one ingest latency)")
+                  f"t2-t1={(r0['t2_ns'] - r0['t1_ns'])/1e3:+.3f} μs")
+            if post_ingest:
+                imin = post_ingest[0]
+                imed = _percentile(post_ingest, 50)
+                i95  = _percentile(post_ingest, 95)
+                print(f"[benchmark] POST-correction ingest (t2-t1) over "
+                      f"{len(post_ingest)} sample rows: "
+                      f"min={imin/1e3:.2f} μs  p50={imed/1e3:.2f} μs  "
+                      f"p95={i95/1e3:.2f} μs")
+            if post_e2e:
+                emin = post_e2e[0]
+                emed = _percentile(post_e2e, 50)
+                e95  = _percentile(post_e2e, 95)
+                print(f"[benchmark] POST-correction e2e    (t4-t1) over "
+                      f"{len(post_e2e)} sample rows: "
+                      f"min={emin/1e3:.2f} μs  p50={emed/1e3:.2f} μs  "
+                      f"p95={e95/1e3:.2f} μs")
             print(f"[benchmark] POST-correction filters: "
                   f"t2>t1 on {t2gt1:,}/{n:,} rows, "
                   f"t4>t1 on {t4gt1:,}/{n:,} rows")
