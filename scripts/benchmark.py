@@ -90,12 +90,14 @@ class BenchRunner:
         self.bench_csv    = self.run_dir / "bench.csv"
         self.summary_json = self.run_dir / "summary.json"
         self.receiver_log = self.run_dir / "receiver.log"
+        self.sender_log   = self.run_dir / "sender.log"
         self.nsys_report  = self.run_dir / "run.nsys-rep"
 
         # Child processes
-        self.rx_proc  = None
-        self.rx_log_fh = None
-        self.ssh_proc = None
+        self.rx_proc       = None
+        self.rx_log_fh     = None
+        self.ssh_proc      = None
+        self.sender_log_fh = None
 
         # SIGINT/SIGTERM → graceful shutdown
         self._interrupted = False
@@ -195,16 +197,43 @@ class BenchRunner:
         ssh_target = a.ssh
         print(f"[benchmark] launching sender via SSH: {ssh_target}")
         print(f"[benchmark]   remote cmd: {send_cmd}")
+
+        ssh_opts = ["-o", "StrictHostKeyChecking=no"]
+        if a.ssh_batch:
+            # Non-interactive: fail fast if no key auth. Otherwise the ssh client
+            # would hang inside Popen waiting for a password on a closed stdin.
+            ssh_opts += ["-o", "BatchMode=yes"]
+
+        self.sender_log_fh = open(self.sender_log, "w")
         self.ssh_proc = subprocess.Popen(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "BatchMode=yes",
-             ssh_target, send_cmd],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["ssh", *ssh_opts, ssh_target, send_cmd],
+            stdout=self.sender_log_fh,
+            stderr=subprocess.STDOUT,
         )
-        # Give send_ticks a moment to open the multicast socket before we start
-        # measuring — the first ~50ms of packets are not interesting anyway.
-        time.sleep(0.5)
+
+        # Give ssh a moment to either authenticate + start send_ticks, or fail.
+        # If it dies immediately, surface the log so the user sees why.
+        time.sleep(1.5)
+        if self.ssh_proc.poll() is not None:
+            rc = self.ssh_proc.returncode
+            try:
+                err = self.sender_log.read_text(errors="replace").strip()
+            except OSError:
+                err = "(sender log unreadable)"
+            self.sender_log_fh.close()
+            print(f"[benchmark] ERROR: ssh sender exited rc={rc}")
+            print("─── sender.log ───")
+            print(err)
+            print("──────────────────")
+            sys.exit(
+                "[benchmark] Could not start send_ticks on DPU.\n"
+                "  Fix: either (a) set up key-based SSH to the DPU once with\n"
+                "           ssh-copy-id ubuntu@192.168.100.2\n"
+                "       or (b) re-run with --manual and start send_ticks by hand,\n"
+                "       or (c) re-run with --no-ssh-batch to let ssh prompt for a\n"
+                "           password on this terminal (you must type it before\n"
+                "           the ~1.5s startup window elapses)."
+            )
 
     # ── Collector (this process) ─────────────────────────────────────────────
     def collect(self):
@@ -449,6 +478,8 @@ class BenchRunner:
 
         if self.rx_log_fh:
             self.rx_log_fh.close()
+        if self.sender_log_fh:
+            self.sender_log_fh.close()
 
         # 3) Anything stray (only kills what we own since we are sudo).
         subprocess.run(["pkill", "-f", "gpu_receiver"],
@@ -502,6 +533,10 @@ def main():
                    help="IP on DPU to bind multicast sender (data path, not mgmt)")
     p.add_argument("--manual", action="store_true",
                    help="Don't SSH — print send_ticks command and wait for you to run it")
+    p.add_argument("--no-ssh-batch", dest="ssh_batch",
+                   action="store_false", default=True,
+                   help="Allow ssh to prompt for a password on this terminal "
+                        "(default: BatchMode=yes, fails fast if no key auth)")
     p.add_argument("--sender-tail-sec", type=int, default=3,
                    help="Extra seconds of ticks to send past measurement window")
     p.add_argument("--collector-tail-sec", type=int, default=2,
