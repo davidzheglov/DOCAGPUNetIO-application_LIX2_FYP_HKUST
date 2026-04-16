@@ -486,7 +486,13 @@ class BenchRunner:
             # Pre-correction snapshot (first row + median skew across a sample)
             r0 = results[0]
             t1_raw, t2_raw = r0["t1_ns"], r0["t2_ns"]
-            sample = results[: min(5000, len(results))]
+            # Stratified sample spanning the WHOLE run (not just the first
+            # 5k rows). A first-5k-only sample would make constant-offset
+            # corrections look as good as drift-aware ones because there's
+            # no measurable drift in 100 ms.
+            target_n = 5000
+            step = max(1, len(results) // target_n)
+            sample = results[::step][:target_n]
             skew_vals = [r["t1_ns"] - r["t2_ns"] for r in sample]
             pre_median_skew = _median(skew_vals)
             # Least-negative = smallest real latency = best estimate of pure
