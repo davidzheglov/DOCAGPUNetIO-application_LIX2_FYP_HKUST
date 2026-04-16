@@ -52,7 +52,16 @@
 #include "signal_result.h"
 
 /* ── Constants ───────────────────────────────────────��───────────────────── */
-#define MAX_PKT_PER_BURST  64
+/*
+ * MAX_PKT_PER_BURST = 32 is deliberate: the receive kernel uses the
+ * WARP-scope template variant `doca_gpu_dev_eth_rxq_recv<WARP,...>`,
+ * which needs exactly one warp (32 threads) and processes up to one
+ * packet per thread per poll. See the kernel comment below for why we
+ * moved off the `_thread` variant — in short: `_thread` does not
+ * auto-advance the DOCA consumer cursor, causing every packet to be
+ * re-delivered ~3-4x until it wraps out of the 2048-slot DOCA RX ring.
+ */
+#define MAX_PKT_PER_BURST  32
 #define MAX_PKT_NUM        2048
 #define MAX_PKT_SIZE       2048
 #define ETH_IP_UDP_HDR     42       /* 14 + 20 + 8 */
@@ -114,12 +123,44 @@ struct ResultRing {
 
 /* ── GPUNetIO persistent receive + process kernel (DOCA 3.x API) ─────────── */
 /*
- * Uses doca_gpu_dev_eth_rxq_recv with template parameters:
- *   DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK — all threads in block participate
+ * Uses doca_gpu_dev_eth_rxq_recv<WARP_SCOPE> — the warp-scope template
+ * variant. All 32 threads in the warp participate in the recv call, which
+ * means DOCA's internal consumer cursor is advanced automatically on each
+ * call via the implicit warp-sync at the end of the template.
+ *
+ * Template parameters:
+ *   DOCA_GPUNETIO_ETH_EXEC_SCOPE_WARP  — all 32 warp threads participate
  *   DOCA_GPUNETIO_ETH_MCST_AUTO        — automatic multicast handling
  *   DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO — automatic NIC handler
  *
- * Thread 0 drives the receive; all threads process their assigned packet.
+ * Why not the `_thread` variant (which we used previously):
+ *   `doca_gpu_dev_eth_rxq_recv_thread()` does NOT auto-advance the
+ *   consumer cursor (documented in docs/DOCA_GPUNETIO_BRINGUP.md:971).
+ *   That caused every packet to be re-delivered ~3-4 times until it
+ *   wrapped out of the 2048-slot DOCA RX ring — visible as ~73% duplicate
+ *   rows at 10 kHz. The template variants (BLOCK / WARP) handle the
+ *   commit internally and produce each packet exactly once.
+ *
+ * Why WARP rather than BLOCK:
+ *   An earlier BLOCK-scope attempt crashed after ~4000 polls with
+ *   "unspecified launch failure" (root cause never diagnosed). WARP-scope
+ *   is the variant receive_icmp.cu in the DOCA reference samples uses
+ *   reliably. 32 threads × ~kHz poll rate >> target ingest rate, so one
+ *   warp is sufficient headroom through 1 MHz.
+ *
+ * KNOWN LATENT RACE (not fixed in this patch — separate from the
+ * DOCA duplication bug above):
+ *   atomicAdd(ring_head, 1) publishes the slot index BEFORE we write
+ *   the slot fields, so the CPU forwarder can in principle observe
+ *   ring_head advance and read a half-written (or stale-from-previous-
+ *   wrap) slot. In practice the CPU forwarder sleeps 10 μs between
+ *   poll iterations which gives the threadfence_system + slot writes
+ *   time to drain to host-mapped memory, so we rarely hit this. A
+ *   proper fix is a 2-phase commit (reserve locally via block atomic,
+ *   write slots, then thread 0 publishes ring_head by count). Tracked
+ *   as a follow-up — it does NOT explain the 10 kHz ~3.86x duplication,
+ *   only occasional garbled rows, and we have not seen evidence of the
+ *   latter in the current benchmark CSVs.
  */
 __global__ void gpu_recv_process_kernel(
     struct doca_gpu_eth_rxq *rxq,
@@ -159,16 +200,23 @@ __global__ void gpu_recv_process_kernel(
     __shared__ doca_error_t s_ret;
 
     while (!*quit_flag) {
-        /* ── Thread 0 receives a burst (_thread variant) ── */
+        /* ── All 32 warp threads participate in the recv (WARP-scope) ──
+         * The template variant auto-advances DOCA's internal consumer
+         * cursor via its trailing __syncwarp(), so every packet is
+         * delivered exactly once. `_thread` did NOT do this and caused
+         * ~3-4x duplication at low rates — see kernel header comment. */
+        doca_error_t warp_ret = doca_gpu_dev_eth_rxq_recv<
+                                    DOCA_GPUNETIO_ETH_EXEC_SCOPE_WARP,
+                                    DOCA_GPUNETIO_ETH_MCST_AUTO,
+                                    DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO>(
+                                rxq,
+                                MAX_PKT_PER_BURST,
+                                MAX_RX_TIMEOUT_NS,
+                                &s_first_pkt_idx,
+                                &s_n_pkts,
+                                NULL);
         if (tid == 0) {
-            s_n_pkts = 0;
-            s_ret = doca_gpu_dev_eth_rxq_recv_thread(
-                rxq,
-                MAX_PKT_PER_BURST,
-                MAX_RX_TIMEOUT_NS,
-                &s_first_pkt_idx,
-                &s_n_pkts,
-                NULL);
+            s_ret = warp_ret;
 
             s_poll_count++;
             if (s_ret != DOCA_SUCCESS && s_ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
@@ -285,7 +333,13 @@ __global__ void gpu_recv_process_kernel(
                     /* T3: kernel done */
                     uint64_t t3 = clock64();
 
-                    /* Write to result ring */
+                    /* Write to result ring. See kernel-header comment for
+                     * the known latent race — atomicAdd here publishes
+                     * ring_head BEFORE the slot writes, and the only
+                     * mitigation in this patch is the CPU forwarder's
+                     * 10 μs sleep giving the host-mapped writes time to
+                     * drain. A proper 2-phase commit is tracked as a
+                     * follow-up. */
                     uint64_t ring_idx = atomicAdd(
                         reinterpret_cast<unsigned long long *>(
                             const_cast<uint64_t *>(ring_head)), 1ULL);
@@ -295,13 +349,14 @@ __global__ void gpu_recv_process_kernel(
                     rslot->bench.t1_ns   = tick->timestamp_ns;
                     rslot->bench.t2_ns   = t2;
                     rslot->bench.t3_ns   = t3;
-                    rslot->bench.t4_ns   = 0;
+                    rslot->bench.t4_ns   = 0;   /* 0 = "in flight" sentinel */
                     rslot->bench.tier    = tier;
                     rslot->bench.dropped = 0;
                     memset(rslot->bench._pad, 0, sizeof(rslot->bench._pad));
 
                     rslot->signal.tick_id       = tick->tick_id;
                     rslot->signal.t3_ns         = t3;
+                    rslot->signal.t4_ns         = 0;
                     rslot->signal.instrument_id = tick->instrument_id;
                     rslot->signal.signal        = combined;
                     rslot->signal.rsi_signal    = rsi_sig;
@@ -894,8 +949,13 @@ int main(int argc, char **argv)
     nvtxRangePushA("steady_state");
     fprintf(stderr, "[gpu_receiver] cudaProfilerStart() — capturing from kernel launch\n");
 
-    /* Launch persistent GPU receive kernel */
-    fprintf(stderr, "[gpu_receiver] launching persistent GPU kernel...\n");
+    /* Launch persistent GPU receive kernel.
+     * Launch shape: <<<1, 32>>> — a single warp. The kernel uses the
+     * WARP-scope recv template which requires exactly one warp to
+     * participate in the recv call. MAX_PKT_PER_BURST == 32 so each
+     * thread handles at most one packet per poll. */
+    fprintf(stderr, "[gpu_receiver] launching persistent GPU kernel (1 block x %d threads = 1 warp)...\n",
+            MAX_PKT_PER_BURST);
     gpu_recv_process_kernel<<<1, MAX_PKT_PER_BURST>>>(
         doca.rxq_gpu,
         d_quit,
