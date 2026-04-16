@@ -13,6 +13,7 @@ target_include_directories(cpu_receiver PRIVATE
 target_link_libraries(cpu_receiver PRIVATE
     CUDA::cudart
     CUDA::cuda_driver
+    CUDA::nvToolsExt      # nvtxRangePushA / nvtxRangePop for nsys
     Threads::Threads
 )
 

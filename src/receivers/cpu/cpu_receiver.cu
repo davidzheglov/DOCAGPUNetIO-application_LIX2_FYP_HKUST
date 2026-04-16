@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <atomic>
 #include <chrono>
@@ -27,11 +28,18 @@
 #include <cstring>
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include "tick_message.h"
 #include "benchmark_result.h"
 #include "signal_result.h"
 #include "process_kernel.cuh"
+
+/* Clean shutdown on SIGINT/SIGTERM so cudaProfilerStop() can flush the
+ * nsys capture before the process dies. */
+static volatile sig_atomic_t g_quit = 0;
+static void sig_handler(int) { g_quit = 1; }
 
 /* ── Configuration defaults ─────────────────────────────────────────────────── */
 #define DEFAULT_BATCH       256
@@ -159,35 +167,46 @@ static void process_batch(GpuResources &r, int n,
                            int signal_fd,  sockaddr_in signal_dest,
                            uint8_t tier)
 {
+    /* Single outer range so the whole batch shows up as one bar in nsys;
+     * the inner sub-ranges give the H2D / kernel / D2H / send breakdown. */
+    nvtxRangePushA("batch");
+
     /* H → D */
+    nvtxRangePushA("batch_h2d");
     CUDA_CHECK(cudaMemcpyAsync(r.d_ticks, r.h_ticks,
                                 n * sizeof(TickMessage),
                                 cudaMemcpyHostToDevice, r.stream));
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    nvtxRangePop();
 
     /* T2: ticks are now in GPU memory */
     uint64_t t2 = now_ns();
 
     /* Launch dual-EMA + RSI processing kernel */
+    nvtxRangePushA("batch_kernel");
     launch_process_ticks(r.d_ticks, n, r.d_signals,
                           r.d_fast_ema, r.d_slow_ema,
                           r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
                           t2, r.stream);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    nvtxRangePop();
 
     /* T3: kernel complete — host wall-clock after kernel sync */
     uint64_t t3 = now_ns();
 
     /* D → H results */
+    nvtxRangePushA("batch_d2h");
     CUDA_CHECK(cudaMemcpyAsync(r.h_signals, r.d_signals,
                                 n * sizeof(SignalResult),
                                 cudaMemcpyDeviceToHost, r.stream));
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    nvtxRangePop();
 
     /* T4: results readable on host */
     uint64_t t4 = now_ns();
 
     /* Send BenchmarkResult + SignalResult for each tick */
+    nvtxRangePushA("batch_send");
     for (int i = 0; i < n; ++i) {
         const TickMessage  &tick = r.h_ticks[i];
         const SignalResult &sig  = r.h_signals[i];
@@ -213,6 +232,9 @@ static void process_batch(GpuResources &r, int n,
                reinterpret_cast<const sockaddr *>(&signal_dest),
                sizeof(signal_dest));
     }
+    nvtxRangePop();  /* batch_send */
+
+    nvtxRangePop();  /* batch */
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────────── */
@@ -237,6 +259,16 @@ int main(int argc, char **argv)
     fprintf(stderr, "[T1 cpu_receiver] mcast=%s:%d batch=%d tier=%d\n",
             mcast_addr, mcast_port, batch_size, tier);
 
+    /* Clean shutdown: SIGINT/SIGTERM set g_quit so cudaProfilerStop() gets
+     * called and the nsys capture-range is closed cleanly. Without this, Ctrl-C
+     * kills the process mid-kernel and nsys reports "no profile data". */
+    struct sigaction sa{};
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;    /* NOT SA_RESTART — we want recvfrom() to return EINTR */
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     /* Receive socket */
     int recv_fd = make_mcast_recv_socket(mcast_addr, mcast_port);
     if (recv_fd < 0) return 1;
@@ -257,9 +289,18 @@ int main(int argc, char **argv)
     uint64_t total_batches = 0;
     auto start_time = std::chrono::steady_clock::now();
 
-    fprintf(stderr, "[T1] waiting for ticks on %s:%d...\n", mcast_addr, mcast_port);
+    /* Banner detected by scripts/benchmark.py::start_receiver() */
+    fprintf(stderr, "[T1 cpu_receiver] ready — waiting for ticks on %s:%d...\n",
+            mcast_addr, mcast_port);
+    fflush(stderr);
 
-    while (true) {
+    /* Start nsys capture here (requires --capture-range=cudaProfilerApi).
+     * The outer "steady_state" NVTX range lets post-processing filter out
+     * startup batches from throughput/latency numbers. */
+    cudaProfilerStart();
+    nvtxRangePushA("steady_state");
+
+    while (!g_quit) {
         ssize_t n = recvfrom(recv_fd,
                               &gpu.h_ticks[batch_n], sizeof(TickMessage),
                               0, nullptr, nullptr);
@@ -293,6 +334,15 @@ int main(int argc, char **argv)
             batch_n = 0;
         }
     }
+
+    /* Close nsys capture-range before releasing GPU resources so the
+     * final kernel / memcpy traces are flushed to the qdrep. */
+    nvtxRangePop();          /* steady_state */
+    cudaProfilerStop();
+
+    fprintf(stderr, "[T1 cpu_receiver] shutting down: total_recv=%llu batches=%llu\n",
+            (unsigned long long)total_recv,
+            (unsigned long long)total_batches);
 
     gpu_free(gpu);
     close(recv_fd);

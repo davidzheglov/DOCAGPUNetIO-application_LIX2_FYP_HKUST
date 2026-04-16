@@ -159,6 +159,13 @@ class BenchRunner:
                 print("[benchmark] skipping clock calibration (manual mode)")
             return
 
+        # Tier 1 runs the sender on the host (same machine as cpu_receiver), so
+        # T1 and T2 are both captured on the same wall clock. No DPU↔host offset
+        # to measure — skip the remote cal server handshake.
+        if a.tier == 1:
+            print("[benchmark] skipping clock calibration (tier 1: host-only sender, same clock)")
+            return
+
         cal_ip = a.cal_ip or a.ssh.split("@")[-1]
 
         # Bind the server to 0.0.0.0 so that whatever IP the client picks
@@ -256,20 +263,40 @@ class BenchRunner:
 
     # ── gpu_receiver (host) ──────────────────────────────────────────────────
     def start_receiver(self):
-        receiver_bin = REPO_ROOT / "bin" / "gpu_receiver"
-        if not receiver_bin.exists():
-            sys.exit(f"[benchmark] ERROR: {receiver_bin} not found — run `make t4` first")
-
         args = self.args
-        rx_cmd = [
-            str(receiver_bin),
-            "--tier", str(args.tier),
-            "--gpu", str(args.gpu_index),
-            "--gpu-pcie", args.gpu_pcie,
-            "--nic-pcie", args.nic_pcie,
-            "--harness", "127.0.0.1",
-            "--fillsim", "127.0.0.1",
-        ]
+
+        # Tier 1 uses the CPU naive receiver (recvfrom + cudaMemcpy). Tiers
+        # 4/5 use the persistent DOCA GPUNetIO kernel. Both binaries share
+        # --tier / --harness / --fillsim flags; only the DOCA one needs the
+        # GPU/NIC PCIe addresses.
+        if args.tier == 1:
+            receiver_bin = REPO_ROOT / "bin" / "cpu_receiver"
+            if not receiver_bin.exists():
+                sys.exit(f"[benchmark] ERROR: {receiver_bin} not found — "
+                         f"build with `cmake --build build --target cpu_receiver`")
+            rx_cmd = [
+                str(receiver_bin),
+                "--tier", str(args.tier),
+                "--harness", "127.0.0.1",
+                "--fillsim", "127.0.0.1",
+            ]
+            receiver_label = "cpu_receiver"
+            init_sentinel  = "[T1 cpu_receiver] ready"
+        else:
+            receiver_bin = REPO_ROOT / "bin" / "gpu_receiver"
+            if not receiver_bin.exists():
+                sys.exit(f"[benchmark] ERROR: {receiver_bin} not found — run `make t4` first")
+            rx_cmd = [
+                str(receiver_bin),
+                "--tier", str(args.tier),
+                "--gpu", str(args.gpu_index),
+                "--gpu-pcie", args.gpu_pcie,
+                "--nic-pcie", args.nic_pcie,
+                "--harness", "127.0.0.1",
+                "--fillsim", "127.0.0.1",
+            ]
+            receiver_label = "gpu_receiver"
+            init_sentinel  = "launching persistent GPU kernel"
 
         # We are already running as root (script requires sudo). Pass through
         # the env the receiver needs (LD_LIBRARY_PATH for DOCA, PATH for nsys).
@@ -286,7 +313,7 @@ class BenchRunner:
                 "-o", str(self.nsys_report.with_suffix("")),  # nsys adds .nsys-rep
             ] + rx_cmd
 
-        print(f"[benchmark] starting gpu_receiver: {' '.join(shlex.quote(a) for a in rx_cmd)}")
+        print(f"[benchmark] starting {receiver_label}: {' '.join(shlex.quote(a) for a in rx_cmd)}")
         self.rx_log_fh = open(self.receiver_log, "w")
         self.rx_proc = subprocess.Popen(
             rx_cmd,
@@ -296,11 +323,11 @@ class BenchRunner:
             cwd=str(REPO_ROOT),
         )
 
-        # Wait for receiver to print "cudaProfilerStart" or hit init timeout
+        # Wait for receiver to print its ready banner, or hit init timeout
         deadline = time.time() + args.receiver_init_sec
         while time.time() < deadline:
             if self.rx_proc.poll() is not None:
-                sys.exit(f"[benchmark] ERROR: gpu_receiver exited during init "
+                sys.exit(f"[benchmark] ERROR: {receiver_label} exited during init "
                          f"(rc={self.rx_proc.returncode}); see {self.receiver_log}")
             # Light sleep; receiver streams to log file which we read below
             time.sleep(0.2)
@@ -308,10 +335,10 @@ class BenchRunner:
                 log = self.receiver_log.read_text(errors="replace")
             except OSError:
                 log = ""
-            if "launching persistent GPU kernel" in log:
-                print("[benchmark] gpu_receiver initialized")
+            if init_sentinel in log:
+                print(f"[benchmark] {receiver_label} initialized")
                 return
-        print("[benchmark] WARN: gpu_receiver init banner not seen — continuing anyway")
+        print(f"[benchmark] WARN: {receiver_label} init banner not seen — continuing anyway")
 
     # ── send_ticks (DPU) ─────────────────────────────────────────────────────
     def start_sender(self):
@@ -319,6 +346,42 @@ class BenchRunner:
         # Send enough ticks to cover warmup + measure + safety margin
         total_sec = a.warmup + a.duration + a.sender_tail_sec
         count = a.rate * total_sec
+
+        # Tier 1: sender runs on the host alongside cpu_receiver. The kernel
+        # loops multicast back to any locally-joined socket (IP_MULTICAST_LOOP
+        # default on), so binding to 127.0.0.1 is the minimal-noise path. No
+        # SSH, no DPU — this is why tier 1 skips clock calibration.
+        if a.tier == 1:
+            local_cmd = [
+                "python3", str(REPO_ROOT / "scripts" / "send_ticks.py"),
+                "--mode", "generate",
+                "--rate", str(a.rate),
+                "--iface", "127.0.0.1",
+                "--count", str(count),
+            ]
+            print(f"[benchmark] launching local sender (tier 1): "
+                  f"{' '.join(shlex.quote(x) for x in local_cmd)}")
+            self.sender_log_fh = open(self.sender_log, "w")
+            self.ssh_proc = subprocess.Popen(       # reuse the field for cleanup
+                local_cmd,
+                stdout=self.sender_log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=str(REPO_ROOT),
+            )
+            time.sleep(0.5)  # let the socket bind
+            if self.ssh_proc.poll() is not None:
+                rc = self.ssh_proc.returncode
+                try:
+                    err = self.sender_log.read_text(errors="replace").strip()
+                except OSError:
+                    err = "(sender log unreadable)"
+                self.sender_log_fh.close()
+                print(f"[benchmark] ERROR: local sender exited rc={rc}")
+                print("─── sender.log ───")
+                print(err)
+                print("──────────────────")
+                sys.exit("[benchmark] tier-1 local sender failed to start.")
+            return
 
         send_cmd = (
             f"cd {shlex.quote(a.dpu_repo)} && "
@@ -916,8 +979,10 @@ class BenchRunner:
             except subprocess.TimeoutExpired:
                 self.ssh_proc.kill()
         # Belt-and-suspenders: ask the DPU to kill any lingering send_ticks.py
+        # (tier 1 runs the sender locally — ssh_proc.terminate() above already
+        # killed it, and there's no DPU process to reach).
         a = self.args
-        if not a.manual and a.ssh:
+        if not a.manual and a.ssh and a.tier != 1:
             env = os.environ.copy()
             if self.ssh_password is not None:
                 env["SSHPASS"] = self.ssh_password
@@ -969,6 +1034,8 @@ class BenchRunner:
         # 3) Anything stray (only kills what we own since we are sudo).
         subprocess.run(["pkill", "-f", "gpu_receiver"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", "cpu_receiver"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # ── Main sequence ────────────────────────────────────────────────────────
     def run(self):
@@ -992,8 +1059,11 @@ class BenchRunner:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Run ONE T4/T5 benchmark and emit bench.csv + summary.json.")
-    p.add_argument("--tier", type=int, required=True, choices=[4, 5])
+        description="Run ONE T1/T4/T5 benchmark and emit bench.csv + summary.json.")
+    p.add_argument("--tier", type=int, required=True, choices=[1, 4, 5],
+                   help="1 = CPU naive (cpu_receiver, host-only); "
+                        "4 = GPUNetIO host (gpu_receiver); "
+                        "5 = GPUNetIO + DPU (gpu_receiver, DPU-side sender)")
     p.add_argument("--rate", type=int, required=True,
                    help="Target send rate in ticks/sec (e.g. 10000, 50000)")
     p.add_argument("--repetition", type=int, default=1)
