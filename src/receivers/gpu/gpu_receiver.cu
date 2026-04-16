@@ -44,6 +44,8 @@
 #include <chrono>
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include "tick_message.h"
 #include "benchmark_result.h"
@@ -364,33 +366,42 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                     (unsigned long long)fwd_count);
         }
 
-        while (ctx->ring->tail < head) {
-            uint64_t idx = ctx->ring->tail % ctx->ring->depth;
-            ResultSlot *rs = &ctx->ring->slots[idx];
+        if (ctx->ring->tail < head) {
+            nvtxRangePushA("forward_batch");
+            uint64_t batch_n = head - ctx->ring->tail;
+            while (ctx->ring->tail < head) {
+                uint64_t idx = ctx->ring->tail % ctx->ring->depth;
+                ResultSlot *rs = &ctx->ring->slots[idx];
 
-            BenchmarkResult br  = rs->bench;
-            SignalResult    sig = rs->signal;
+                BenchmarkResult br  = rs->bench;
+                SignalResult    sig = rs->signal;
 
-            br.t2_ns  = cyc_to_ns(br.t2_ns,  ctx->ns_per_cyc);
-            br.t3_ns  = cyc_to_ns(br.t3_ns,  ctx->ns_per_cyc);
-            br.t4_ns  = cyc_to_ns(br.t4_ns,  ctx->ns_per_cyc);
-            sig.t3_ns = br.t3_ns;
-            sig.t4_ns = br.t4_ns;
+                br.t2_ns  = cyc_to_ns(br.t2_ns,  ctx->ns_per_cyc);
+                br.t3_ns  = cyc_to_ns(br.t3_ns,  ctx->ns_per_cyc);
+                br.t4_ns  = cyc_to_ns(br.t4_ns,  ctx->ns_per_cyc);
+                sig.t3_ns = br.t3_ns;
+                sig.t4_ns = br.t4_ns;
 
-            ssize_t s1 = sendto(ctx->harness_fd, &br, sizeof(br), 0,
-                   reinterpret_cast<const sockaddr *>(&ctx->harness_dest),
-                   sizeof(ctx->harness_dest));
-            ssize_t s2 = sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
-                   reinterpret_cast<const sockaddr *>(&ctx->signal_dest),
-                   sizeof(ctx->signal_dest));
+                nvtxRangePushA("sendto_pair");
+                ssize_t s1 = sendto(ctx->harness_fd, &br, sizeof(br), 0,
+                       reinterpret_cast<const sockaddr *>(&ctx->harness_dest),
+                       sizeof(ctx->harness_dest));
+                ssize_t s2 = sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
+                       reinterpret_cast<const sockaddr *>(&ctx->signal_dest),
+                       sizeof(ctx->signal_dest));
+                nvtxRangePop();
 
-            fwd_count++;
-            if (fwd_count <= 5 || fwd_count % 500 == 0) {
-                fprintf(stderr, "[CPU-FWD] #%llu: tick=%u sendto=%zd/%zd\n",
-                        (unsigned long long)fwd_count, br.tick_id, s1, s2);
+                fwd_count++;
+                if (fwd_count <= 5 || fwd_count % 500 == 0) {
+                    fprintf(stderr, "[CPU-FWD] #%llu: tick=%u sendto=%zd/%zd\n",
+                            (unsigned long long)fwd_count, br.tick_id, s1, s2);
+                }
+
+                ++ctx->ring->tail;
             }
-
-            ++ctx->ring->tail;
+            nvtxMarkA("batch_done");
+            (void)batch_n;
+            nvtxRangePop();
         }
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
@@ -814,6 +825,20 @@ int main(int argc, char **argv)
         ring.depth,
         tier);
 
+    /* Warmup before profiler starts. Override with NSYS_WARMUP_SEC env var. */
+    int warmup_sec = 3;
+    if (const char *env = getenv("NSYS_WARMUP_SEC")) {
+        warmup_sec = atoi(env);
+        if (warmup_sec < 0) warmup_sec = 0;
+    }
+    fprintf(stderr, "[gpu_receiver] warmup %d s before cudaProfilerStart...\n", warmup_sec);
+    std::this_thread::sleep_for(std::chrono::seconds(warmup_sec));
+
+    /* Begin profiling window. nsys --capture-range=cudaProfilerApi obeys this. */
+    cudaProfilerStart();
+    nvtxRangePushA("steady_state");
+    fprintf(stderr, "[gpu_receiver] cudaProfilerStart() — capturing steady state\n");
+
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;
     while (!g_quit) {
@@ -837,6 +862,11 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "[gpu_receiver] stopping...\n");
+
+    /* End profiling window before teardown noise */
+    nvtxRangePop();              /* steady_state */
+    cudaProfilerStop();
+    fprintf(stderr, "[gpu_receiver] cudaProfilerStop()\n");
 
     /* Signal kernel to stop — d_quit is host-mapped, GPU sees it immediately */
     *d_quit = 1;
