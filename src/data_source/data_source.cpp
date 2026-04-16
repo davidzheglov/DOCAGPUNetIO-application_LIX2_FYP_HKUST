@@ -231,7 +231,15 @@ static void process_binance_message(const char *msg, LiveContext *ctx)
 {
     /* bookTicker: {"u":...,"s":"BTCUSDT","b":"42000","B":"1","a":"42001","A":"1"} */
     /* aggTrade:   {"e":"aggTrade","s":"BTCUSDT","p":"42000","q":"0.1",...} */
+    fprintf(stderr, "[live] Received: %.200s\n", msg);
 
+    static int msg_count = 0;
+    static double current_bid = 0;
+    static double current_ask = 0;
+
+    if (++msg_count % 100 == 0) {
+        fprintf(stderr, "[live] Sample msg: %.200s\n", msg);
+    }
     char symbol[16] = {};
     if (!json_get_string(msg, "\"s\"", symbol, sizeof(symbol))) return;
 
@@ -247,18 +255,20 @@ static void process_binance_message(const char *msg, LiveContext *ctx)
                     json_get_double(msg, "\"q\"", qty);
 
     if (is_book) {
+        current_bid = bid;
+        current_ask = ask;
         tick.bid        = bid;
         tick.ask        = ask;
         tick.last_price = (bid + ask) * 0.5;
         tick.volume     = 0;
-        send_tick(ctx->fd, ctx->dest, tick);
+        
     } else if (is_trade) {
-        tick.bid        = price;
-        tick.ask        = price;
+        tick.bid        = current_bid;
+        tick.ask        = current_ask;
         tick.last_price = price;
         tick.volume     = qty;
-        send_tick(ctx->fd, ctx->dest, tick);
     }
+    send_tick(ctx->fd, ctx->dest, tick);
 }
 
 static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason,
