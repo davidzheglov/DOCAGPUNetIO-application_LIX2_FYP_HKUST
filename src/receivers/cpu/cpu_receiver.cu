@@ -1,21 +1,28 @@
 /*
  * cpu_receiver.cu — T1: CPU naive receiver.
  *
- * Data path:
- *   NIC → kernel UDP socket → recvfrom() (CPU) → host buffer
- *       → cudaMemcpy H→D → process_ticks_kernel → results back to host
+ * Data path (Option A — DPU sender, real NIC):
+ *   DPU ARM → ConnectX PF1 (ens21f1np1) → kernel UDP socket
+ *       → recvfrom() (CPU) → host pinned buffer
+ *       → cudaMemcpy H→D → process_ticks_kernel → cudaMemcpy D→H
  *       → BenchmarkResult UDP → harness on port 5010
  *       → SignalResult UDP   → fill_simulator on port 5006
+ *
+ * The --iface flag binds the multicast join to a specific interface
+ * (e.g. ens21f1np1) so that frames arriving from the DPU are accepted.
+ * Without it, INADDR_ANY may pick lo and drop real-NIC traffic.
  *
  * Batches up to BATCH_SIZE ticks before launching the kernel.
  * T2 is stamped on the host immediately after cudaMemcpy H→D completes.
  *
  * Usage:
  *   cpu_receiver [--mcast 239.0.0.1] [--port 5005] [--batch 256]
- *                [--tier 1] [--harness <ip>] [--fillsim <ip>]
+ *                [--tier 1] [--iface ens21f1np1]
+ *                [--harness <ip>] [--fillsim <ip>]
  */
 
 #include <arpa/inet.h>
+#include <net/if.h>          /* if_nametoindex() */
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -57,7 +64,14 @@ static void sig_handler(int) { g_quit = 1; }
     } while (0)
 
 /* ── Multicast receive socket ───────────────────────────────────────────────── */
-static int make_mcast_recv_socket(const char *mcast_addr, int port)
+/*
+ * iface_name — Linux interface name to join the mcast group on, e.g.
+ *              "ens21f1np1" for the ConnectX PF1 that faces the DPU.
+ *              Pass NULL to use INADDR_ANY (kernel picks; loopback-only works
+ *              but DPU-sent frames will be silently dropped).
+ */
+static int make_mcast_recv_socket(const char *mcast_addr, int port,
+                                  const char *iface_name)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
@@ -78,9 +92,27 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port)
         perror("bind"); close(fd); return -1;
     }
 
-    ip_mreq mreq{};
+    /* ip_mreqn lets us specify the interface by index, not by IP address.
+     * This is the only reliable way when the interface has no unicast IP
+     * in the same subnet, or when INADDR_ANY would pick lo instead of the
+     * physical NIC that actually receives the DPU-sourced multicast frames. */
+    ip_mreqn mreq{};
     mreq.imr_multiaddr.s_addr = inet_addr(mcast_addr);
-    mreq.imr_interface.s_addr = INADDR_ANY;
+    mreq.imr_address.s_addr   = INADDR_ANY;
+    if (iface_name && iface_name[0] != '\0') {
+        mreq.imr_ifindex = (int)if_nametoindex(iface_name);
+        if (mreq.imr_ifindex == 0) {
+            fprintf(stderr, "[cpu_receiver] ERROR: interface '%s' not found "
+                    "(check --iface flag or `ip link`)\n", iface_name);
+            close(fd); return -1;
+        }
+        fprintf(stderr, "[cpu_receiver] joining mcast %s on %s (ifindex=%d)\n",
+                mcast_addr, iface_name, mreq.imr_ifindex);
+    } else {
+        mreq.imr_ifindex = 0;  /* let kernel pick — works for loopback tests */
+        fprintf(stderr, "[cpu_receiver] joining mcast %s on INADDR_ANY "
+                "(loopback only — use --iface for real-NIC traffic)\n", mcast_addr);
+    }
     if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
         perror("IP_ADD_MEMBERSHIP"); close(fd); return -1;
     }
@@ -246,6 +278,7 @@ int main(int argc, char **argv)
     uint8_t     tier          = DEFAULT_TIER;
     const char *harness_addr  = "127.0.0.1";
     const char *fillsim_addr  = "127.0.0.1";
+    const char *iface_name    = nullptr;   /* NULL = INADDR_ANY (loopback ok) */
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--mcast")   && i+1<argc) mcast_addr   = argv[++i];
@@ -254,10 +287,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tier")    && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--harness") && i+1<argc) harness_addr = argv[++i];
         else if (!strcmp(argv[i], "--fillsim") && i+1<argc) fillsim_addr = argv[++i];
+        else if (!strcmp(argv[i], "--iface")   && i+1<argc) iface_name   = argv[++i];
     }
 
-    fprintf(stderr, "[T1 cpu_receiver] mcast=%s:%d batch=%d tier=%d\n",
-            mcast_addr, mcast_port, batch_size, tier);
+    fprintf(stderr, "[T1 cpu_receiver] mcast=%s:%d batch=%d tier=%d iface=%s\n",
+            mcast_addr, mcast_port, batch_size, tier,
+            iface_name ? iface_name : "INADDR_ANY");
 
     /* Clean shutdown: SIGINT/SIGTERM set g_quit so cudaProfilerStop() gets
      * called and the nsys capture-range is closed cleanly. Without this, Ctrl-C
@@ -269,8 +304,8 @@ int main(int argc, char **argv)
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    /* Receive socket */
-    int recv_fd = make_mcast_recv_socket(mcast_addr, mcast_port);
+    /* Receive socket — bind multicast join to the specified interface */
+    int recv_fd = make_mcast_recv_socket(mcast_addr, mcast_port, iface_name);
     if (recv_fd < 0) return 1;
 
     /* Output sockets */

@@ -159,12 +159,9 @@ class BenchRunner:
                 print("[benchmark] skipping clock calibration (manual mode)")
             return
 
-        # Tier 1 runs the sender on the host (same machine as cpu_receiver), so
-        # T1 and T2 are both captured on the same wall clock. No DPU↔host offset
-        # to measure — skip the remote cal server handshake.
-        if a.tier == 1:
-            print("[benchmark] skipping clock calibration (tier 1: host-only sender, same clock)")
-            return
+        # Tier 1 (Option A) uses the DPU ARM as sender, same as tiers 4/5.
+        # T1 is captured on the DPU clock, T2 on the host clock — calibration
+        # is needed for the same reason as tier 4.
 
         cal_ip = a.cal_ip or a.ssh.split("@")[-1]
 
@@ -276,6 +273,7 @@ class BenchRunner:
             rx_cmd = [
                 str(receiver_bin),
                 "--tier", str(args.tier),
+                "--iface",   args.host_iface,   # join mcast on real NIC, not lo
                 "--harness", "127.0.0.1",
                 "--fillsim", "127.0.0.1",
             ]
@@ -346,41 +344,9 @@ class BenchRunner:
         total_sec = a.warmup + a.duration + a.sender_tail_sec
         count = a.rate * total_sec
 
-        # Tier 1: sender runs on the host alongside cpu_receiver. The kernel
-        # loops multicast back to any locally-joined socket (IP_MULTICAST_LOOP
-        # default on), so binding to 127.0.0.1 is the minimal-noise path. No
-        # SSH, no DPU — this is why tier 1 skips clock calibration.
-        if a.tier == 1:
-            local_cmd = [
-                "python3", str(REPO_ROOT / "scripts" / "send_ticks.py"),
-                "--mode", "generate",
-                "--rate", str(a.rate),
-                "--iface", "127.0.0.1",
-                "--count", str(count),
-            ]
-            print(f"[benchmark] launching local sender (tier 1): "
-                  f"{' '.join(shlex.quote(x) for x in local_cmd)}")
-            self.sender_log_fh = open(self.sender_log, "w")
-            self.ssh_proc = subprocess.Popen(       # reuse the field for cleanup
-                local_cmd,
-                stdout=self.sender_log_fh,
-                stderr=subprocess.STDOUT,
-                cwd=str(REPO_ROOT),
-            )
-            time.sleep(0.5)  # let the socket bind
-            if self.ssh_proc.poll() is not None:
-                rc = self.ssh_proc.returncode
-                try:
-                    err = self.sender_log.read_text(errors="replace").strip()
-                except OSError:
-                    err = "(sender log unreadable)"
-                self.sender_log_fh.close()
-                print(f"[benchmark] ERROR: local sender exited rc={rc}")
-                print("─── sender.log ───")
-                print(err)
-                print("──────────────────")
-                sys.exit("[benchmark] tier-1 local sender failed to start.")
-            return
+        # Tier 1 (Option A): sender runs on the DPU ARM over the real NIC,
+        # exactly as for tiers 4/5. The only difference is the receiver binary.
+        # Fall through to the DPU SSH sender path below.
 
         send_cmd = (
             f"cd {shlex.quote(a.dpu_repo)} && "
@@ -977,11 +943,10 @@ class BenchRunner:
                 self.ssh_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.ssh_proc.kill()
-        # Belt-and-suspenders: ask the DPU to kill any lingering send_ticks.py
-        # (tier 1 runs the sender locally — ssh_proc.terminate() above already
-        # killed it, and there's no DPU process to reach).
+        # Belt-and-suspenders: ask the DPU to kill any lingering send_ticks.py.
+        # All tiers (1, 4, 5) now send from the DPU ARM, so all need this.
         a = self.args
-        if not a.manual and a.ssh and a.tier != 1:
+        if not a.manual and a.ssh:
             env = os.environ.copy()
             if self.ssh_password is not None:
                 env["SSHPASS"] = self.ssh_password
@@ -1116,9 +1081,15 @@ def main():
     p.add_argument("--collector-tail-sec", type=int, default=2,
                    help="Extra seconds to keep the collector listening past measurement")
 
+    # Tier-1 specific
+    p.add_argument("--host-iface", default="ens21f1np1",
+                   help="Host NIC interface to join the multicast group on for tier 1 "
+                        "(e.g. ens21f1np1 — the ConnectX PF1 facing the DPU). "
+                        "Passed as --iface to cpu_receiver. Default: ens21f1np1")
+
     # Nsight Systems
     p.add_argument("--nsys", action="store_true",
-                   help="Wrap gpu_receiver in `nsys profile`")
+                   help="Wrap the receiver in `nsys profile`")
     p.add_argument("--nsys-bin", default=None,
                    help="Override path to nsys binary (default: PATH lookup)")
 
