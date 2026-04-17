@@ -19,7 +19,7 @@ RATES="${RATES:-10000 25000 50000 100000 200000 500000 1000000}"
 REPS="${REPS:-3}"
 DURATION="${DURATION:-30}"
 WARMUP="${WARMUP:-5}"
-SENDER_IFACE="${SENDER_IFACE:-127.0.0.1}"
+SENDER_IFACE="${SENDER_IFACE:-10.10.10.2}"
 
 echo "========================================================"
 echo "  T1 cpu_receiver rate sweep"

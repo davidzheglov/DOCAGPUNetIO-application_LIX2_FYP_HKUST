@@ -511,9 +511,10 @@ def main():
     plot_drop_rate(agg,  out_dir / "02_drop_rate.png")
 
     _plot_latency_metric(
-        agg, "compute", "Compute latency (μs)",
-        "Compute latency (T3−T2): T1 vs T4",
-        "T1: per-tick (batch kernel / batch_size)\nT4: inline persistent GPU kernel",
+        agg, "compute", "Compute latency per tick (μs)",
+        "Compute latency per tick (T3−T2 ÷ batch): T1 vs T4",
+        "T1: batch kernel time ÷ ticks-in-batch  →  per-tick cost\n"
+        "T4: persistent GPU kernel, genuine per-tick time",
         out_dir / "03_compute_latency.png",
     )
     _plot_latency_metric(
