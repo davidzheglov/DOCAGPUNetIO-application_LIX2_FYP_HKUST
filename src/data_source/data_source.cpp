@@ -62,34 +62,74 @@ using NS    = std::chrono::nanoseconds;
 /* Global: if set via --iface, forces multicast out a specific NIC */
 static const char *g_mcast_iface = nullptr;
 
-static int make_mcast_send_socket(const char *mcast_addr, int port,
-                                   sockaddr_in &dest)
+/*
+ * Global: if set via --dest <ip:port>, overrides the default multicast
+ * destination (239.0.0.1:5005) with a user-specified unicast address.
+ *
+ * Use case: --mode live on the HOST needs to hand the tick stream to a
+ * relay on the DPU ARM (e.g. 192.168.100.2:6005 over tmfifo_net0) because
+ * the bridge split-horizon rule on DPU prevents a direct host→PF1 TX
+ * multicast from looping back to host PF1 RX / DOCA Flow.
+ */
+static const char *g_dest_override = nullptr;
+
+static int make_send_socket(sockaddr_in &dest)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
 
-    /* Multicast TTL = 1 (LAN only) */
-    int ttl = 1;
-    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+    /* Parse destination: either --dest <ip:port> or default multicast. */
+    const char *dst_ip   = TICK_MCAST_ADDR;
+    int         dst_port = TICK_MCAST_PORT;
+    char        dst_buf[64] = {};
 
-    /* Bind multicast output to a specific NIC interface (bypasses loopback) */
-    if (g_mcast_iface) {
-        struct in_addr iface_addr{};
-        iface_addr.s_addr = inet_addr(g_mcast_iface);
-        if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
-                        &iface_addr, sizeof(iface_addr)) < 0) {
-            perror("IP_MULTICAST_IF");
-        } else {
-            fprintf(stderr, "[data_source] multicast bound to interface %s\n",
-                    g_mcast_iface);
+    if (g_dest_override) {
+        strncpy(dst_buf, g_dest_override, sizeof(dst_buf) - 1);
+        char *colon = strchr(dst_buf, ':');
+        if (colon) {
+            *colon = '\0';
+            dst_port = atoi(colon + 1);
+        }
+        dst_ip = dst_buf;
+        fprintf(stderr, "[data_source] unicast dest override: %s:%d\n",
+                dst_ip, dst_port);
+    }
+
+    uint32_t dst_addr = inet_addr(dst_ip);
+    bool is_mcast = (ntohl(dst_addr) & 0xF0000000u) == 0xE0000000u;
+
+    if (is_mcast) {
+        /* Multicast TTL = 1 (LAN only) */
+        int ttl = 1;
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+        /* Bind multicast output to a specific NIC (bypasses loopback) */
+        if (g_mcast_iface) {
+            struct in_addr iface_addr{};
+            iface_addr.s_addr = inet_addr(g_mcast_iface);
+            if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF,
+                            &iface_addr, sizeof(iface_addr)) < 0) {
+                perror("IP_MULTICAST_IF");
+            } else {
+                fprintf(stderr, "[data_source] multicast bound to interface %s\n",
+                        g_mcast_iface);
+            }
         }
     }
 
     memset(&dest, 0, sizeof(dest));
     dest.sin_family      = AF_INET;
-    dest.sin_port        = htons((uint16_t)port);
-    dest.sin_addr.s_addr = inet_addr(mcast_addr);
+    dest.sin_port        = htons((uint16_t)dst_port);
+    dest.sin_addr.s_addr = dst_addr;
     return fd;
+}
+
+/* Back-compat wrapper: old signature (ignores its mcast_addr/port args when
+ * g_dest_override is set; otherwise uses them as defaults). */
+static int make_mcast_send_socket(const char * /*mcast_addr*/, int /*port*/,
+                                   sockaddr_in &dest)
+{
+    return make_send_socket(dest);
 }
 
 static void send_tick(int fd, const sockaddr_in &dest, TickMessage &tick)
@@ -409,7 +449,10 @@ static void usage(const char *prog)
         "\n"
         "Network options:\n"
         "  --iface <IP>          bind multicast to NIC with this IP\n"
-        "                        (required for T2/T4 — sends via physical NIC)\n",
+        "                        (required for T2/T4 — sends via physical NIC)\n"
+        "  --dest <IP:PORT>      override destination (default 239.0.0.1:5005).\n"
+        "                        Use for live-on-host: send unicast to DPU ARM\n"
+        "                        relay, e.g. --dest 192.168.100.2:6005\n",
         prog);
 }
 
@@ -425,7 +468,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--csv")     && i + 1 < argc) csv_path    = argv[++i];
         else if (!strcmp(argv[i], "--rate")    && i + 1 < argc) rate_hz     = atol(argv[++i]);
         else if (!strcmp(argv[i], "--symbols") && i + 1 < argc) symbols_str = argv[++i];
-        else if (!strcmp(argv[i], "--iface")   && i + 1 < argc) g_mcast_iface = argv[++i];
+        else if (!strcmp(argv[i], "--iface")   && i + 1 < argc) g_mcast_iface   = argv[++i];
+        else if (!strcmp(argv[i], "--dest")    && i + 1 < argc) g_dest_override = argv[++i];
         else if (!strcmp(argv[i], "--help"))  { usage(argv[0]); return 0; }
     }
 
