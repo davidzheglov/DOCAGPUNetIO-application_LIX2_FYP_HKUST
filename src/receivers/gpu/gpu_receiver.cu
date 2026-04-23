@@ -263,7 +263,7 @@ __global__ void gpu_recv_process_kernel(
                 uint16_t dst_port = (uint16_t)((udp_hdr[2] << 8) | udp_hdr[3]);
 
                 /* Diagnostic: print first few packet headers */
-                if (s_pkt_total <= 5 && tid == 0) {
+                if (s_recv_count <= 5 && tid == 0) {
                     printf("[GPU] pkt header dump (first 48 bytes):\n");
                     printf("[GPU]   ETH dst=%02x:%02x:%02x:%02x:%02x:%02x "
                            "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
