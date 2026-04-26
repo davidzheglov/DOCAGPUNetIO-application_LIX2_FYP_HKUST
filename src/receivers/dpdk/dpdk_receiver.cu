@@ -258,6 +258,16 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[T2 dpdk_receiver] dpdk_port=%u batch=%d\n", dpdk_port, batch_size);
 
+    uint16_t nb_ports = rte_eth_dev_count_avail();
+    fprintf(stderr, "[T2] DPDK ports available: %u\n", nb_ports);
+    for (uint16_t p = 0; p < nb_ports; ++p) {
+        struct rte_ether_addr mac;
+        rte_eth_macaddr_get(p, &mac);
+        fprintf(stderr, "[T2]   port %u MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", p,
+                mac.addr_bytes[0], mac.addr_bytes[1], mac.addr_bytes[2],
+                mac.addr_bytes[3], mac.addr_bytes[4], mac.addr_bytes[5]);
+    }
+
     struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create(
         "MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SZ, 0,
         RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
@@ -276,28 +286,54 @@ int main(int argc, char **argv)
     struct rte_mbuf *burst[BURST_SIZE];
     int batch_n = 0;
 
+    struct rte_eth_stats stats_before{};
+    rte_eth_stats_get(dpdk_port, &stats_before);
+    fprintf(stderr, "[T2] initial stats: ipackets=%lu imissed=%lu ierrors=%lu rx_nombuf=%lu\n",
+            stats_before.ipackets, stats_before.imissed,
+            stats_before.ierrors, stats_before.rx_nombuf);
+
     fprintf(stderr, "[T2] polling on DPDK port %u...\n", dpdk_port);
+
+    uint64_t poll_count = 0;
+    uint64_t total_rx = 0;
+    uint64_t total_filtered = 0;
+    uint64_t total_short = 0;
 
     while (true) {
         uint16_t nb_rx = rte_eth_rx_burst(dpdk_port, 0, burst, BURST_SIZE);
+        poll_count++;
+
+        if (nb_rx > 0 && total_rx == 0)
+            fprintf(stderr, "[T2] first burst: %u pkts after %lu polls\n", nb_rx, poll_count);
+
+        if (poll_count % 10000000 == 0) {
+            struct rte_eth_stats st{};
+            rte_eth_stats_get(dpdk_port, &st);
+            fprintf(stderr, "[T2] poll=%luM hw: ipkts=%lu imissed=%lu ierr=%lu nombuf=%lu | "
+                    "sw: rx=%lu filtered=%lu short=%lu\n",
+                    poll_count / 1000000, st.ipackets, st.imissed,
+                    st.ierrors, st.rx_nombuf, total_rx, total_filtered, total_short);
+        }
 
         for (uint16_t p = 0; p < nb_rx; ++p) {
             struct rte_mbuf *m = burst[p];
             uint32_t pkt_len   = rte_pktmbuf_pkt_len(m);
 
             if (pkt_len < ETH_IP_UDP_HDR + sizeof(TickMessage)) {
+                total_short++;
                 rte_pktmbuf_free(m);
                 continue;
             }
 
-            /* Verify destination port (UDP dst = TICK_MCAST_PORT) */
             const uint8_t *data = rte_pktmbuf_mtod(m, uint8_t *);
             const struct rte_udp_hdr *udp =
                 reinterpret_cast<const struct rte_udp_hdr *>(data + 14 + 20);
             if (ntohs(udp->dst_port) != TICK_MCAST_PORT) {
+                total_filtered++;
                 rte_pktmbuf_free(m);
                 continue;
             }
+            total_rx++;
 
             const TickMessage *tick =
                 reinterpret_cast<const TickMessage *>(data + ETH_IP_UDP_HDR);
