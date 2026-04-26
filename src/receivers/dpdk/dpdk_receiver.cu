@@ -112,8 +112,8 @@ static int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 
     struct rte_flow_item pattern[] = {
         { RTE_FLOW_ITEM_TYPE_ETH,  nullptr, nullptr, nullptr },
-        { RTE_FLOW_ITEM_TYPE_IPV4, &ipv4_spec, &ipv4_mask, nullptr },
-        { RTE_FLOW_ITEM_TYPE_UDP,  &udp_spec, &udp_mask, nullptr },
+        { RTE_FLOW_ITEM_TYPE_IPV4, &ipv4_spec, nullptr, &ipv4_mask },
+        { RTE_FLOW_ITEM_TYPE_UDP,  &udp_spec, nullptr, &udp_mask },
         { RTE_FLOW_ITEM_TYPE_END,  nullptr, nullptr, nullptr },
     };
 
