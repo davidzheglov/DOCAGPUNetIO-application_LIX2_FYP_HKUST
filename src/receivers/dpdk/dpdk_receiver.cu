@@ -24,6 +24,7 @@
 #include <rte_udp.h>
 #include <rte_ip.h>
 #include <rte_ether.h>
+#include <rte_flow.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -93,6 +94,45 @@ static int port_init(uint16_t port, struct rte_mempool *mbuf_pool)
     mcast_mac.addr_bytes[4] = 0x00;
     mcast_mac.addr_bytes[5] = 0x01;
     rte_eth_dev_set_mc_addr_list(port, &mcast_mac, 1);
+
+    /* rte_flow rule: steer UDP dst port 5005 to RX queue 0.
+     * Required for mlx5 bifurcated driver — without this, kernel gets all traffic. */
+    struct rte_flow_attr attr{};
+    attr.ingress = 1;
+
+    struct rte_flow_item_ipv4 ipv4_spec{};
+    ipv4_spec.hdr.next_proto_id = IPPROTO_UDP;
+    struct rte_flow_item_ipv4 ipv4_mask{};
+    ipv4_mask.hdr.next_proto_id = 0xFF;
+
+    struct rte_flow_item_udp udp_spec{};
+    udp_spec.hdr.dst_port = rte_cpu_to_be_16(TICK_MCAST_PORT);
+    struct rte_flow_item_udp udp_mask{};
+    udp_mask.hdr.dst_port = 0xFFFF;
+
+    struct rte_flow_item pattern[] = {
+        { RTE_FLOW_ITEM_TYPE_ETH,  nullptr, nullptr, nullptr },
+        { RTE_FLOW_ITEM_TYPE_IPV4, &ipv4_spec, &ipv4_mask, nullptr },
+        { RTE_FLOW_ITEM_TYPE_UDP,  &udp_spec, &udp_mask, nullptr },
+        { RTE_FLOW_ITEM_TYPE_END,  nullptr, nullptr, nullptr },
+    };
+
+    struct rte_flow_action_queue queue_action{};
+    queue_action.index = 0;
+
+    struct rte_flow_action actions[] = {
+        { RTE_FLOW_ACTION_TYPE_QUEUE, &queue_action },
+        { RTE_FLOW_ACTION_TYPE_END,   nullptr },
+    };
+
+    struct rte_flow_error flow_err{};
+    struct rte_flow *flow = rte_flow_create(port, &attr, pattern, actions, &flow_err);
+    if (!flow) {
+        fprintf(stderr, "  WARN: rte_flow_create failed: %s (falling back to promiscuous)\n",
+                flow_err.message ? flow_err.message : "unknown");
+    } else {
+        fprintf(stderr, "  rte_flow: steering UDP dst port %d → queue 0\n", TICK_MCAST_PORT);
+    }
 
     return 0;
 }
