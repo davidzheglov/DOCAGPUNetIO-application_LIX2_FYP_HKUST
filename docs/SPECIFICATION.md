@@ -55,8 +55,8 @@ The five benchmark tiers use progressively more advanced hardware features:
 | GPU PCIe Address | `0000:ac:00.0` |
 | GPU CUDA Device Index | 1 (GPU 0 reserved for other workloads) |
 | NIC | BlueField-3 DPU (ConnectX-7 ASIC) |
-| NIC PF0 PCIe Address | `0000:bd:00.0` (host interface: `ens21f0np0`) |
-| NIC PF1 PCIe Address | `0000:bd:00.1` (host interface: `ens21f1np1`) — **used for data path** |
+| NIC PF0 PCIe Address | `0000:bd:00.0` (host interface: `ens21f0np0`) — **data path** (cable side) |
+| NIC PF1 PCIe Address | `0000:bd:00.1` (host interface: `ens21f1np1`) — unused |
 | NVIDIA Driver | 570.x (nvidia-dkms-570) |
 | CUDA Toolkit | 12.8 (`/usr/local/cuda-12.8/`) |
 | DOCA SDK | 3.3 (`/opt/mellanox/doca/`) |
@@ -90,35 +90,65 @@ The ASIC sits on **both** the DPU's internal bus and the host's PCIe bus. This d
 | Management Access | SSH to `192.168.100.2` |
 | Firmware | Queried via `mlxfwmanager` on DPU ARM |
 
-### 2.3 Network Interfaces
+### 2.3 Two-Server Cross-DPU Topology
 
-**On the DPU ARM** (visible when SSH'd into `192.168.100.2`):
+The benchmark uses two servers connected by a direct cable between their BlueField-3 DPUs:
+
+| Server | Hostname | Role |
+|--------|----------|------|
+| cpu1 | `lxcpu1` | Receiver — runs all tier receivers + GPU processing |
+| cpu2 | `lxcpu2` | Sender — DPU ARM runs `send_ticks.py` |
+
+**Cable connection**: cpu2 DPU port `p0` ↔ cpu1 DPU port `p0` (direct, no switch).
+
+### 2.4 Network Addresses
+
+| Address | What | Where |
+|---------|------|-------|
+| `10.10.10.2/24` | cpu1 host PF0 | Interface `ens21f0np0` on `lxcpu1` — receiver endpoint |
+| `10.10.10.3/24` | cpu2 DPU ARM | Interface `p0` on cpu2's DPU ARM — sender endpoint |
+| `239.0.0.1` | Multicast group | Virtual address; receivers join this group. NIC maps to Ethernet MAC `01:00:5e:00:00:01` |
+| `5005` | UDP port | `TICK_MCAST_PORT` — identifies tick data traffic |
+| `192.168.100.2` | DPU ARM management | Via `tmfifo_net0` (rshim) on each host — SSH access to local DPU ARM |
+| `127.0.0.1` | Loopback | Harness (port 5010) and fill_simulator (port 5006) on cpu1 |
+
+### 2.5 Network Interfaces
+
+**cpu1 DPU ARM** (SSH via `192.168.100.2` from `lxcpu1`):
 
 | Interface | Type | Description | IP Address |
 |-----------|------|-------------|-----------|
-| `p0` | Physical | Physical Ethernet port 0 | `10.10.10.1/24` |
-| `p1` | Physical | Physical Ethernet port 1 | None |
-| `pf0hpf` | Representor | Internal pairing to host PF0 | None |
+| `p0` | Physical | Physical port 0 — cable to cpu2 | None (bridged) |
+| `p1` | Physical | Physical port 1 — unused | None |
+| `pf0hpf` | Representor | Internal pairing to host PF0 | None (bridged) |
 | `pf1hpf` | Representor | Internal pairing to host PF1 | None |
-| `br-pf1` | Bridge | Bridges `p1` and `pf1hpf` | None |
+| `ovsbr1` | OVS Bridge | Bridges `p0` and `pf0hpf` | None |
 
-**On the host** (visible on `lxcpu1`):
+**cpu1 host** (`lxcpu1`):
 
 | Interface | Type | PCIe Address | Description | IP Address |
 |-----------|------|-------------|-------------|-----------|
-| `ens21f0np0` | PF0 | `0000:bd:00.0` | Host view of Physical Function 0 | None |
-| `ens21f1np1` | PF1 | `0000:bd:00.1` | Host view of Physical Function 1 | `10.10.10.2/24` |
+| `ens21f0np0` | PF0 | `0000:bd:00.0` | Host PF0 — **data path** (cable side) | `10.10.10.2/24` |
+| `ens21f1np1` | PF1 | `0000:bd:00.1` | Host PF1 — unused | None |
 
-### 2.4 PCIe Topology
+**cpu2 DPU ARM** (SSH via `192.168.100.2` from `lxcpu2`):
+
+| Interface | Type | Description | IP Address |
+|-----------|------|-------------|-----------|
+| `p0` | Physical | Physical port 0 — cable to cpu1 | `10.10.10.3/24` |
+| `pf0hpf` | Representor | Internal pairing to cpu2 host PF0 | None |
+| `ovsbr1` | OVS Bridge | Bridges `p0` and `pf0hpf` | None |
+
+### 2.6 PCIe Topology (cpu1)
 
 ```
-Host PCIe Root Complex
+Host PCIe Root Complex (lxcpu1)
 ├── 0000:ac:00.0  NVIDIA A2 GPU
 │     └── GPU VRAM (16 GB, DMA target for NIC)
 │
 └── 0000:bd:00.x  BlueField-3 DPU (ConnectX-7 ASIC)
-      ├── 0000:bd:00.0  PF0 (not used for data path)
-      └── 0000:bd:00.1  PF1 (DOCA Flow + GPUNetIO data path)
+      ├── 0000:bd:00.0  PF0 — data path (ens21f0np0, mlx5_0)
+      └── 0000:bd:00.1  PF1 — unused
 
 DPU Internal Bus (separate from host PCIe)
 ├── ARM Cortex-A78 cores + DDR memory
@@ -127,35 +157,62 @@ DPU Internal Bus (separate from host PCIe)
 
 The ConnectX-7 ASIC bridges both buses. This is the only hardware component that can move data between the DPU-side network and the host-side GPU.
 
-### 2.5 Physical Packet Path (T4/T5)
+### 2.7 Physical Packet Path
+
+All four tiers share the same physical path from sender to the NIC ASIC:
 
 ```
-DPU ARM sends on p0
-        │
-        │ physical cable (or internal loopback)
-        ▼
-Physical port 1 ─► eswitch ─► p1 ─► br-pf1 bridge ─► pf1hpf
-                                                          │
-                     ┌────────────────────────────────────┘
-                     │ eswitch internal pairing
-                     ▼
-              Host PF1 eswitch port
-                     │
-                     ▼
-              Packet parser (inside ASIC)
-                     │
-                     ▼
-              Flow table lookup (DOCA Flow rules)
-                     │
-                     ▼
-              DMA engine ──── PCIe peer-to-peer ────► GPU VRAM
-                                                          │
-                                                          ▼
-                                                   GPU kernel polls
-                                                   and processes
+cpu2 DPU ARM                 cpu1 DPU ARM                    cpu1 Host
+┌───────────┐                ┌────────────┐                  ┌──────────────┐
+│send_ticks │                │            │                  │              │
+│(10.10.10.3│──► p0 ═══cable═══► p0 ──►  │                  │              │
+│  :5005)   │                │  ovsbr1    │                  │              │
+└───────────┘                │  (bridge)  │                  │              │
+                             │    │       │                  │              │
+                             │  pf0hpf ───┼── eswitch ──►   │ PF0          │
+                             │            │   pairing        │(ens21f0np0)  │
+                             └────────────┘                  │(0000:bd:00.0)│
+                                                             └──────┬───────┘
+                                                                    │
+                                                        ┌───────────┘
+                                                        ▼
+                                              Tier-specific receive path
+                                                   (see below)
 ```
 
-All stages from the eswitch onward execute inside the ConnectX-7 ASIC on the DPU card. The host CPU is not involved in the per-packet data path.
+From PF0, each tier diverges:
+
+**T1 — cpu_receiver (kernel socket)**:
+```
+PF0 → kernel network stack → recvfrom() → host RAM
+    → cudaMemcpy H→D → GPU VRAM → process kernel
+    → cudaMemcpy D→H → host RAM → sendto(harness/fillsim)
+```
+
+**T2 — dpdk_receiver (DPDK poll-mode)**:
+```
+PF0 → rte_flow steers UDP:5005 to DPDK queue (mlx5 bifurcated driver)
+    → rte_eth_rx_burst → mbuf in host RAM
+    → cudaMemcpy H→D → GPU VRAM → process kernel
+    → cudaMemcpy D→H → host RAM → sendto(harness/fillsim)
+```
+
+**T3 — rdma_receiver (GPU RDMA, raw packet QP)**:
+```
+PF0 → ibv_create_flow steers UDP:5005 to RAW_PACKET QP
+    → NIC DMA engine writes directly into GPU VRAM (nvidia-peermem)
+    → extract_ticks_kernel parses ETH/IP/UDP headers on GPU
+    → process kernel (already in GPU memory, NO cudaMemcpy H→D)
+    → cudaMemcpy D→H → host RAM → sendto(harness/fillsim)
+```
+
+**T4 — gpu_receiver (DOCA GPUNetIO)**:
+```
+PF0 → DOCA Flow root CONTROL pipe → non-root BASIC pipe
+    → RSS to GPU RX queue → NIC DMA into GPU VRAM
+    → GPU kernel polls doca_gpu_dev_eth_rxq (already in GPU memory)
+    → process kernel → CPU forwarder reads ring → sendto(harness/fillsim)
+```
 
 ---
 

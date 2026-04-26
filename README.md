@@ -23,13 +23,13 @@ reference/               # Archived prior DOCA/CUDA prototypes
 
 ## Benchmark Tiers
 
-| Tier | Technology | Network path |
-|------|-----------|--------------|
-| T1 | CPU naive | `recvfrom()` → `cudaMemcpy` |
-| T2 | DPDK | Poll-mode driver, no OS kernel, `cudaMemcpy` |
-| T3 | GPU RDMA | `libibverbs` + `nv_peer_mem`, NIC writes GPU directly |
-| T4 | GPUNetIO | DOCA `doca_gpu_eth_rxq_recv_strong`, adapter on host CPU |
-| T5 | GPUNetIO + BlueField DPU | Same GPU binary as T4, adapter on DPU ARM |
+| Tier | Technology | Network path | CPU copies |
+|------|-----------|--------------|------------|
+| T1 | CPU naive | `recvfrom()` → `cudaMemcpy` | 3 |
+| T2 | DPDK | Poll-mode driver + `rte_flow`, `cudaMemcpy` | 2 |
+| T3 | GPU RDMA | `libibverbs` RAW_PACKET QP + `nvidia-peermem`, NIC DMAs to GPU | 0 (DMA) |
+| T4 | GPUNetIO | DOCA Flow → GPU RX queue, NIC DMAs to GPU | 0 (DMA) |
+| T5 | GPUNetIO + BlueField DPU | Same GPU binary as T4, adapter on DPU ARM | 0 (DMA) |
 
 ## Build
 
@@ -42,17 +42,35 @@ cmake -B build-arm -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-toolchain.cmake
 cmake --build build-arm -j$(nproc)
 ```
 
-## Benchmark Run
+## Cross-DPU Test (two servers)
+
+Sender: `send_ticks.py` on cpu2's DPU ARM (`10.10.10.3`).
+Receiver: any tier on cpu1 host (`lxcpu1`), packets arrive on PF0 (`ens21f0np0`, `0000:bd:00.0`).
 
 ```bash
-# Start data source (replay mode)
-./build/data_source --mode replay --csv data/ticks.csv --rate 500000
+# ON cpu2 DPU ARM — sender (same for all tiers)
+python3 send_ticks.py --mode generate --rate 1000 --count 1000 --iface 10.10.10.3
 
-# Run a tier receiver (example: T1)
-./build/cpu_receiver --multicast 239.0.0.1 --port 5005
+# ON cpu1 HOST — T1: CPU socket receiver
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/cpu_receiver --tier 1 --iface ens21f0np0 \
+    --harness 127.0.0.1 --fillsim 127.0.0.1
 
-# Run benchmark harness (all 75 runs)
-./build/benchmark_harness --output results/
+# ON cpu1 HOST — T2: DPDK receiver (run scripts/setup_dpdk.sh first)
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/dpdk_receiver -a 0000:bd:00.0 -l 0-1 -n 4 -- \
+    --port 0 --tier 2 --harness 127.0.0.1 --fillsim 127.0.0.1
+
+# ON cpu1 HOST — T3: RDMA receiver
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/rdma_receiver --dev mlx5_0 --tier 3 \
+    --harness 127.0.0.1 --fillsim 127.0.0.1
+
+# ON cpu1 HOST — T4: GPU receiver (DOCA GPUNetIO)
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/gpu_receiver --tier 4 --gpu 1 \
+    --gpu-pcie 0000:ac:00.0 --nic-pcie 0000:bd:00.0 \
+    --harness 127.0.0.1 --fillsim 127.0.0.1
 ```
 
 ## Timestamps
