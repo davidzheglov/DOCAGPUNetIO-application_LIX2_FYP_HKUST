@@ -304,7 +304,7 @@ int main(int argc, char **argv)
         uint16_t nb_rx = rte_eth_rx_burst(dpdk_port, 0, burst, BURST_SIZE);
         poll_count++;
 
-        if (nb_rx > 0 && total_rx == 0)
+        if (nb_rx > 0 && total_rx == 0 && total_filtered == 0 && total_short == 0)
             fprintf(stderr, "[T2] first burst: %u pkts after %lu polls\n", nb_rx, poll_count);
 
         if (poll_count % 10000000 == 0) {
