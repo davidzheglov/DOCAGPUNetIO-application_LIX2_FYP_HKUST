@@ -345,8 +345,18 @@ int main(int argc, char **argv)
             if (batch_n >= batch_size) {
                 process_batch(gpu, batch_n, tier,
                                harness_fd, harness_dest, signal_fd, signal_dest);
+                fprintf(stderr, "[T2] batch: processed %d ticks (total_rx=%lu)\n",
+                        batch_n, total_rx);
                 batch_n = 0;
             }
+        }
+
+        if (nb_rx == 0 && batch_n > 0) {
+            process_batch(gpu, batch_n, tier,
+                           harness_fd, harness_dest, signal_fd, signal_dest);
+            fprintf(stderr, "[T2] batch: processed %d ticks (partial flush, total_rx=%lu)\n",
+                    batch_n, total_rx);
+            batch_n = 0;
         }
     }
 
