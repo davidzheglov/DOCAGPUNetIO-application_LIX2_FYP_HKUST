@@ -86,6 +86,19 @@ $(DATA_LIVE): $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
 	@echo "  [OK] $@  (with Binance WebSocket)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DPU Relay (bridges host unicast -> DPU multicast for live feed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+DPU_RELAY_SRC := src/dpu_relay/dpu_relay.cpp
+DPU_RELAY_BIN := $(BINDIR)/dpu_relay
+
+dpu_relay: $(DPU_RELAY_BIN)
+
+$(DPU_RELAY_BIN): $(DPU_RELAY_SRC) | $(BINDIR)
+	$(CXX) $(CXXFLAGS) $< -o $@
+	@echo "  [OK] $@"
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  T1: CPU naive receiver
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -222,6 +235,12 @@ data_source_dpu: $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
 	$(DPU_CXX) $(DPU_FLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $(DPU_BIN) $(WS_LIBS)
 	@echo "  [OK] $(DPU_BIN)  (aarch64 — deploy to DPU with scp)"
 
+DPU_RELAY_DPU_BIN := $(BINDIR)/dpu_relay_dpu
+
+dpu_relay_dpu: $(DPU_RELAY_SRC) | $(BINDIR)
+	$(DPU_CXX) $(DPU_FLAGS) $< -o $(DPU_RELAY_DPU_BIN)
+	@echo "  [OK] $(DPU_RELAY_DPU_BIN)  (aarch64 — deploy to DPU with scp)"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Test: DOCA Flow + GPUNetIO minimal receiver test
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -247,4 +266,5 @@ clean:
 
 .PHONY: all core bench clean dashboard
 .PHONY: data_source data_source_live data_source_dpu
+.PHONY: dpu_relay dpu_relay_dpu
 .PHONY: t1 t2 t3 t4 fill_sim harness

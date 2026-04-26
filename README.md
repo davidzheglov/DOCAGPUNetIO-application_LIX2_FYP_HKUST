@@ -73,6 +73,67 @@ sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
     --harness 127.0.0.1 --fillsim 127.0.0.1
 ```
 
+## Live Binance Pipeline
+
+The `data_source` binary supports `--mode live` which connects directly to the Binance WebSocket API (`stream.binance.com:9443`), subscribes to `bookTicker` + `aggTrade` streams, and converts JSON tick data into the same 48-byte `TickMessage` format used by replay mode.
+
+### Network Topology Challenge
+
+When running `data_source --mode live` on the **host**, the DPU bridge's split-horizon rule prevents host-sourced UDP multicast from looping back to the host's PF0/PF1 interfaces where receivers listen. This is the same reason `send_ticks.py` must run on the **DPU ARM** (not the host) for cross-machine tests.
+
+### Solution: DPU ARM UDP Relay
+
+A lightweight C++ relay (`dpu_relay`) runs on the DPU ARM, receives unicast UDP from the host via the management network (`tmfifo_net0`, `192.168.100.x`), and forwards to the working multicast path:
+
+```
+Host: data_source --mode live --dest 192.168.100.2:6005
+    ↓ (tmfifo_net0, unicast UDP)
+DPU ARM: dpu_relay --listen-port 6005 --iface 10.10.10.1
+    ↓ (p0 → bridge → host PF0, multicast UDP)
+Host receivers: T1–T4 listening on 239.0.0.1:5005
+```
+
+### Build
+
+```bash
+# Host binary (for local testing)
+make dpu_relay
+
+# Cross-compile for DPU ARM
+make dpu_relay_dpu
+```
+
+### Deploy and Run
+
+```bash
+# 1. Copy relay to DPU ARM
+scp bin/dpu_relay_dpu ubuntu@192.168.100.2:~/dpu_relay_dpu
+
+# 2. Start relay on DPU ARM
+ssh ubuntu@192.168.100.2 "./dpu_relay_dpu --listen-port 6005 --iface 10.10.10.1"
+
+# 3. Start receiver on host (example: T1)
+sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
+    bin/cpu_receiver --tier 1 --iface ens21f0np0 \
+    --harness 127.0.0.1 --fillsim 127.0.0.1
+
+# 4. Start live data source on host
+bin/data_source_live --mode live --symbols BTCUSDT,ETHUSDT \
+    --dest 192.168.100.2:6005
+```
+
+### Convenience Script
+
+For automated startup, use the provided pipeline script:
+
+```bash
+# Build everything first
+make data_source_live dpu_relay_dpu t1
+
+# Run full pipeline (starts relay, receiver, and data source)
+./scripts/run_live_pipeline.sh --tier 1 --symbols BTCUSDT,ETHUSDT
+```
+
 ## Timestamps
 
 Each tick carries four timestamps for latency decomposition:

@@ -100,6 +100,12 @@ endif()
 add_subdirectory(src/fill_simulator)
 add_subdirectory(src/benchmark_harness)
 
+# ── DPU relay (live Binance feed bridge) ──────────────────────────────────────
+add_executable(dpu_relay src/dpu_relay/dpu_relay.cpp)
+set_target_properties(dpu_relay PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+)
+
 # ── Install targets ────────────────────────────────────────────────────────────
 install(DIRECTORY src/common/ DESTINATION include/tick_pipeline)
 

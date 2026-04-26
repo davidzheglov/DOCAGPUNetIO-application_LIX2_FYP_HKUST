@@ -257,6 +257,7 @@ The system consists of six executable components that communicate over UDP:
 | Dashboard | `src/dashboard/dashboard.py` | Python | Plotly visualization of benchmark results |
 | Flow Test | `bin/doca_flow_test` | CUDA/C++ | Standalone DOCA Flow + GPUNetIO diagnostic |
 | Tick Sender | `scripts/send_ticks.py` | Python | Lightweight tick sender for manual testing |
+| DPU Relay | `bin/dpu_relay_dpu` | C++ | Bridges host unicast → DPU multicast for live feed |
 
 ---
 
@@ -377,6 +378,19 @@ Generates financial tick data and broadcasts it as TickMessage packets over UDP 
 make data_source_dpu    # Uses aarch64-linux-gnu-g++, static-linked
 scp bin/data_source_dpu ubuntu@192.168.100.2:~/
 ```
+
+**Live Mode Deployment with DPU Relay**:
+When `--mode live` runs on the host, the DPU bridge's split-horizon rule prevents host-sourced multicast from looping back to host receivers. The solution is a lightweight UDP relay (`dpu_relay`) running on the DPU ARM:
+
+```
+Host: data_source --mode live --dest 192.168.100.2:6005
+    ↓ (tmfifo_net0, unicast UDP)
+DPU ARM: dpu_relay --listen-port 6005 --iface 10.10.10.1
+    ↓ (p0 → bridge → host PF0, multicast UDP)
+Host receivers: T1–T4 listening on 239.0.0.1:5005
+```
+
+The relay receives unicast UDP from the host management network and forwards to the working multicast path. This preserves the zero-copy architectures of T2–T4 while allowing the host (which has internet access) to connect to Binance WebSocket.
 
 ### 5.2 T1 CPU Receiver (`bin/cpu_receiver`)
 
@@ -538,6 +552,46 @@ Used to isolate DOCA issues from application logic issues.
 **Source**: `scripts/send_ticks.py` (195 lines)
 
 Lightweight Python script for manual testing. Sends TickMessage packets matching the exact binary format. Supports generate mode (random-walk prices) and replay mode (from CSV).
+
+### 5.11 DPU Relay (`bin/dpu_relay_dpu`)
+
+**Source**: `src/dpu_relay/dpu_relay.cpp`
+
+Lightweight UDP relay that bridges host-sourced unicast UDP to the DPU's working multicast path. Required for `--mode live` when the data source runs on the host (which has internet access) but receivers listen on the DPU-attached NIC.
+
+**Problem**: The DPU bridge's split-horizon rule prevents host-sourced UDP multicast from looping back to host PF0/PF1. This is the same reason `send_ticks.py` must run on the DPU ARM (not the host) for cross-machine tests.
+
+**Solution**: The relay runs on the DPU ARM, receives unicast UDP from the host via `tmfifo_net0` (management network, `192.168.100.x`), and forwards to multicast `239.0.0.1:5005` via `p0` (`10.10.10.1`). The multicast then traverses the working path (p0 → bridge → pf0hpf → eswitch → host PF0) to reach receivers.
+
+**Data path**:
+1. Host `data_source --mode live` sends UDP unicast to `192.168.100.2:6005`
+2. DPU ARM `dpu_relay` receives on port `6005`
+3. Relay forwards to multicast `239.0.0.1:5005` bound to `p0` (`10.10.10.1`)
+4. Multicast traverses DPU bridge to host PF0
+5. Host receivers (T1–T4) receive as usual
+
+**Parameters**:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--listen-port` | `6005` | UDP port to listen on (host unicast destination) |
+| `--mcast-addr` | `239.0.0.1` | Multicast destination address |
+| `--mcast-port` | `5005` | Multicast destination port (`TICK_MCAST_PORT`) |
+| `--iface` | `10.10.10.1` | Interface IP for multicast output (`p0` on DPU ARM) |
+
+**Build**:
+```bash
+make dpu_relay        # Host binary (for local testing)
+make dpu_relay_dpu    # Cross-compile for DPU ARM (aarch64)
+```
+
+**Deploy**:
+```bash
+scp bin/dpu_relay_dpu ubuntu@192.168.100.2:~/dpu_relay_dpu
+ssh ubuntu@192.168.100.2 "./dpu_relay_dpu --listen-port 6005 --iface 10.10.10.1"
+```
+
+**Resource usage**: The relay is a simple `recvfrom`/`sendto` loop with no memory allocation after startup. CPU usage is negligible at tick rates below 1M/sec.
 
 ---
 
@@ -1117,6 +1171,7 @@ For the FYP report, the **trustworthy** metrics (compute latency, egress latency
 | DOCA libraries | `/opt/mellanox/doca/lib/x86_64-linux-gnu/` | Host |
 | Project repository | `~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/` | Host |
 | send_ticks.py | `~/send_ticks.py` | DPU ARM |
+| dpu_relay_dpu | `~/dpu_relay_dpu` | DPU ARM |
 | Benchmark results | `results/benchmark.csv` | Host |
 | Dashboard plots | `results/plots/` | Host |
 
