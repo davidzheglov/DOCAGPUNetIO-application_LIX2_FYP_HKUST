@@ -295,7 +295,7 @@ fi
 # ── Section 7: gpu_receiver readiness ───────────────────────────────────
 hdr "7. gpu_receiver readiness (cpu1 host)"
 
-BINARY="./build/src/receivers/gpu/gpu_receiver"
+BINARY="./bin/gpu_receiver"
 if [[ -x "$BINARY" ]]; then
     ok "gpu_receiver binary exists and is executable"
 else
@@ -352,7 +352,7 @@ if [[ "$fail" -eq 0 ]]; then
     echo -e "  ${GRN}All checks passed! Ready to test:${RST}"
     echo ""
     echo "  ON cpu1 host:"
-    echo "    sudo ./build/src/receivers/gpu/gpu_receiver --nic-addr ${NIC_PCIE#0000:} --gpu-addr ${GPU_PCIE#0000:}"
+    echo "    sudo ./bin/gpu_receiver --nic-addr ${NIC_PCIE#0000:} --gpu-addr ${GPU_PCIE#0000:}"
     echo ""
     echo "  ON cpu2 DPU ARM:"
     echo "    python3 ~/send_ticks.py --mode generate --rate 1000 --count 1000 --iface $CPU2_DPU_IP"
