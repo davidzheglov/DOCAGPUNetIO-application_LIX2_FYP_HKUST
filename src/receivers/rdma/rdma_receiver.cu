@@ -409,7 +409,7 @@ int main(int argc, char **argv)
         /* Partial flush after idle period */
         if (nc == 0 && batch_n > 0) {
             idle_polls++;
-            if (idle_polls >= 100000) {
+            if (idle_polls >= 1000000) {
                 CUDA_CHECK(cudaMemcpyAsync(d_slots, batch_slots,
                                             batch_n * sizeof(uint32_t),
                                             cudaMemcpyHostToDevice, gpu.stream));
