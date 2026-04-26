@@ -298,6 +298,7 @@ int main(int argc, char **argv)
     uint64_t total_rx = 0;
     uint64_t total_filtered = 0;
     uint64_t total_short = 0;
+    uint64_t idle_polls = 0;
 
     while (true) {
         uint16_t nb_rx = rte_eth_rx_burst(dpdk_port, 0, burst, BURST_SIZE);
@@ -352,11 +353,17 @@ int main(int argc, char **argv)
         }
 
         if (nb_rx == 0 && batch_n > 0) {
-            process_batch(gpu, batch_n, tier,
-                           harness_fd, harness_dest, signal_fd, signal_dest);
-            fprintf(stderr, "[T2] batch: processed %d ticks (partial flush, total_rx=%lu)\n",
-                    batch_n, total_rx);
-            batch_n = 0;
+            idle_polls++;
+            if (idle_polls >= 100000) {
+                process_batch(gpu, batch_n, tier,
+                               harness_fd, harness_dest, signal_fd, signal_dest);
+                fprintf(stderr, "[T2] batch: processed %d ticks (partial flush, total_rx=%lu)\n",
+                        batch_n, total_rx);
+                batch_n = 0;
+                idle_polls = 0;
+            }
+        } else if (nb_rx > 0) {
+            idle_polls = 0;
         }
     }
 
