@@ -58,8 +58,9 @@ ssh_cpu2_host() {
 }
 
 ssh_cpu2_dpu() {
+    local cmd="$*"
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes \
-        "$CPU2_HOST_SSH" "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $CPU2_DPU_SSH_VIA_CPU2 '$*'" 2>/dev/null
+        "$CPU2_HOST_SSH" "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes $CPU2_DPU_SSH_VIA_CPU2 $(printf '%q' "$cmd")" 2>/dev/null
 }
 
 echo -e "${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
@@ -246,7 +247,7 @@ else
     bad "cpu2 DPU: $CPU2_DPU_REP NOT in $CPU2_DPU_BRIDGE"
 fi
 
-DPU2_IP=$(ssh_cpu2_dpu "ip -4 addr show $CPU2_DPU_BRIDGE 2>/dev/null | grep -oP 'inet \K[0-9.]+'" || echo "")
+DPU2_IP=$(ssh_cpu2_dpu "ip -4 addr show $CPU2_DPU_BRIDGE 2>/dev/null | awk '/inet /{split(\$2,a,\"/\"); print a[1]}'" || echo "")
 if [[ "$DPU2_IP" == "$CPU2_DPU_IP" ]]; then
     ok "cpu2 DPU $CPU2_DPU_BRIDGE has IP $CPU2_DPU_IP"
 else
