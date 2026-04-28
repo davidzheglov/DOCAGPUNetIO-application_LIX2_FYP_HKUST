@@ -112,6 +112,7 @@ static std::string g_sender_bin
 static std::string g_sender_csv
     = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/data/ticks.csv";
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
+static std::string g_sender_control_path; /* optional shared SSH control socket */
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
@@ -239,13 +240,24 @@ static pid_t launch_sender_ssh(long rate_hz)
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
-        execlp("ssh", "ssh",
-               "-o", "BatchMode=yes",
-               "-o", "ServerAliveInterval=10",
-               "-o", "StrictHostKeyChecking=accept-new",
-               g_sender_ssh.c_str(),
-               remote_cmd.c_str(),
-               (char *)nullptr);
+        std::vector<std::string> owned_args;
+        std::vector<const char *> argv = {
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ServerAliveInterval=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+        };
+        if (!g_sender_control_path.empty()) {
+            owned_args.push_back("ControlPath=" + g_sender_control_path);
+            argv.push_back("-o");
+            argv.push_back("ControlMaster=no");
+            argv.push_back("-o");
+            argv.push_back(owned_args.back().c_str());
+        }
+        argv.push_back(g_sender_ssh.c_str());
+        argv.push_back(remote_cmd.c_str());
+        argv.push_back(nullptr);
+        execvp("ssh", const_cast<char *const *>(argv.data()));
         perror("execlp ssh");
         _exit(127);
     }
@@ -255,10 +267,13 @@ static pid_t launch_sender_ssh(long rate_hz)
 static void kill_remote_sender(void)
 {
     if (g_sender_ssh.empty()) return;
-    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 "
-                    + g_sender_ssh
-                    + " 'pkill -x data_source 2>/dev/null || true'"
-                      " >/dev/null 2>&1";
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    if (!g_sender_control_path.empty()) {
+        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+    }
+    cmd += g_sender_ssh
+        + " 'pkill -x data_source 2>/dev/null || true'"
+          " >/dev/null 2>&1";
     (void)system(cmd.c_str());
 }
 
@@ -517,6 +532,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--sender-bin")  && i+1<argc) g_sender_bin  = argv[++i];
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
         else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
+        else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
     }
 
     /* Parse tier list */

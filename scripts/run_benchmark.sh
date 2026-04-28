@@ -17,6 +17,7 @@
 #    ./scripts/run_benchmark.sh --tiers 1,4 --quick                # smoke test
 #    ./scripts/run_benchmark.sh --rates 100000,500000,1000000      # custom rates
 #    ./scripts/run_benchmark.sh --duration 60 --warmup 10
+#    ./scripts/run_benchmark.sh --sender-password                   # prompt once for lxcpu2 SSH password
 #    ./scripts/run_benchmark.sh --receiver-iface ens21f0np0
 #    ./scripts/run_benchmark.sh --symbols 64 --csv-rows 2000000    # bigger stress
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -55,6 +56,8 @@ DPU_MCAST_IFACE="${DPU_MCAST_IFACE:-10.10.10.3}"
 RELAY_PORT="${RELAY_PORT:-6005}"
 
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
+SENDER_PASSWORD=0
+SSH_CONTROL_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -70,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --iface)        IFACE_ARG="--iface $2"; shift 2 ;;
         --receiver-iface) RECEIVER_IFACE_ARG="--receiver-iface $2"; shift 2 ;;
         --sender-ssh)   SENDER_SSH="$2"; shift 2 ;;
+        --sender-password) SENDER_PASSWORD=1; shift ;;
         --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
         --quick)        QUICK=1; shift ;;
         --help|-h)      sed -n '2,22p' "$0"; exit 0 ;;
@@ -93,9 +97,28 @@ else
 fi
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+SCP_OPTS=(-q)
 log()    { printf "%s[bench]%s %s\n" "$C" "$R" "$*"; }
 log_ok() { printf "%s[bench]%s %s✓%s %s\n" "$C" "$R" "$OK" "$R" "$*"; }
 log_err(){ printf "%s[bench]%s %s✗%s %s\n" "$C" "$R" "$ERR" "$R" "$*" >&2; }
+
+sender_ssh() { ssh "${SSH_OPTS[@]}" "$@"; }
+sender_scp() { scp "${SCP_OPTS[@]}" "$@"; }
+
+if [[ -n "$SENDER_SSH" && $SENDER_PASSWORD -eq 1 ]]; then
+    SSH_CONTROL_PATH="/tmp/bench_sender_ssh_${USER}_$$"
+    log "Opening reusable SSH session to $SENDER_SSH (password may be prompted once)..."
+    if ! ssh -o BatchMode=no -o ConnectTimeout=5 \
+             -o ControlMaster=yes -o ControlPersist=yes \
+             -o ControlPath="$SSH_CONTROL_PATH" \
+             "$SENDER_SSH" "true"; then
+        log_err "SSH to $SENDER_SSH failed"
+        exit 1
+    fi
+    SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH")
+    SCP_OPTS=(-q -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH")
+    log_ok "Reusable SSH session established"
+fi
 
 # ── Pre-flight ───────────────────────────────────────────────────────────────
 log "Checking binaries..."
@@ -121,16 +144,19 @@ log_ok "All required binaries present for tiers: $TIERS"
 # ── Remote sender pre-flight (skip if --local-sender) ────────────────────────
 if [[ -n "$SENDER_SSH" ]]; then
     log "Verifying keyless SSH to $SENDER_SSH..."
-    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" "true" 2>/dev/null; then
-        log_err "SSH to $SENDER_SSH failed (BatchMode — no password prompts)"
-        log_err "  Set up keyless auth once: ssh-copy-id $SENDER_SSH"
+    if ! sender_ssh "$SENDER_SSH" "true" 2>/dev/null; then
+        log_err "SSH to $SENDER_SSH failed"
+        if [[ $SENDER_PASSWORD -eq 0 ]]; then
+            log_err "  Set up keyless auth once: ssh-copy-id $SENDER_SSH"
+            log_err "  Or rerun with: --sender-password"
+        fi
         exit 1
     fi
     log_ok "SSH OK"
 
     log "Checking remote data_source binary..."
-    EXPANDED_BIN=$(ssh "$SENDER_SSH" "echo $SENDER_BIN")
-    if ! ssh "$SENDER_SSH" "test -x $EXPANDED_BIN" 2>/dev/null; then
+    EXPANDED_BIN=$(sender_ssh "$SENDER_SSH" "echo $SENDER_BIN")
+    if ! sender_ssh "$SENDER_SSH" "test -x $EXPANDED_BIN" 2>/dev/null; then
         log_err "Remote sender not found at $EXPANDED_BIN"
         log_err "  On $SENDER_SSH run: cd ~/$SENDER_REMOTE_DIR && make data_source"
         exit 1
@@ -138,7 +164,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     log_ok "Remote data_source: $EXPANDED_BIN"
 
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
-    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+    if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
         log_err "lxcpu2 host cannot SSH to its DPU ARM ($DPU_USER@$DPU_IP)"
         log_err "  On $SENDER_SSH: ssh-copy-id ${DPU_USER}@${DPU_IP}"
@@ -147,7 +173,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     log_ok "lxcpu2 → DPU ARM SSH OK"
 
     log "Checking dpu_relay on DPU ARM..."
-    if ! ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'test -x $DPU_RELAY_PATH'" 2>/dev/null; then
+    if ! sender_ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'test -x $DPU_RELAY_PATH'" 2>/dev/null; then
         log_err "dpu_relay missing on DPU ARM at $DPU_RELAY_PATH"
         log_err "  On $SENDER_SSH: cd ~/$SENDER_REMOTE_DIR && make dpu_relay_dpu && \\"
         log_err "    scp bin/dpu_relay_dpu ${DPU_USER}@${DPU_IP}:$DPU_RELAY_PATH"
@@ -170,13 +196,13 @@ fi
 
 # scp the CSV to lxcpu2 host so its data_source can replay it
 if [[ -n "$SENDER_SSH" ]]; then
-    EXPANDED_CSV=$(ssh "$SENDER_SSH" "echo $SENDER_CSV")
+    EXPANDED_CSV=$(sender_ssh "$SENDER_SSH" "echo $SENDER_CSV")
     LOCAL_HASH=$(sha256sum "$CSV_PATH" | awk '{print $1}')
-    REMOTE_HASH=$(ssh "$SENDER_SSH" "test -f $EXPANDED_CSV && sha256sum $EXPANDED_CSV | awk '{print \$1}'" 2>/dev/null || echo "")
+    REMOTE_HASH=$(sender_ssh "$SENDER_SSH" "test -f $EXPANDED_CSV && sha256sum $EXPANDED_CSV | awk '{print \$1}'" 2>/dev/null || echo "")
     if [[ "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
         log "Copying tick CSV → $SENDER_SSH:$EXPANDED_CSV"
-        ssh "$SENDER_SSH" "mkdir -p $(dirname "$EXPANDED_CSV")"
-        scp -q "$CSV_PATH" "$SENDER_SSH:$EXPANDED_CSV"
+        sender_ssh "$SENDER_SSH" "mkdir -p $(dirname "$EXPANDED_CSV")"
+        sender_scp "$CSV_PATH" "$SENDER_SSH:$EXPANDED_CSV"
         log_ok "CSV synced"
     else
         log_ok "Remote CSV up to date (sha256 matches)"
@@ -215,17 +241,17 @@ EOF
 # ── Start dpu_relay on lxcpu2 DPU ARM (via lxcpu2 host) ──────────────────────
 if [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
-    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+    if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
               > /tmp/dpu_relay.log 2>&1 &'" ; then
         log_err "relay launch command returned non-zero; checking DPU log and port anyway"
     fi
     sleep 1
-    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+    if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
         log_err "dpu_relay failed to bind port $RELAY_PORT on DPU ARM"
-        ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+        sender_ssh "$SENDER_SSH" \
             "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
         exit 1
     fi
@@ -246,10 +272,13 @@ cleanup() {
     pkill -f bin/gpu_receiver  2>/dev/null || true
     pkill -f bin/data_source   2>/dev/null || true
     if [[ -n "$SENDER_SSH" ]]; then
-        ssh -o BatchMode=yes -o ConnectTimeout=3 "$SENDER_SSH" \
+        sender_ssh "$SENDER_SSH" \
             "pkill -x data_source 2>/dev/null || true; \
              ssh ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
             >/dev/null 2>&1 || true
+        if [[ -n "$SSH_CONTROL_PATH" ]]; then
+            ssh -o ControlPath="$SSH_CONTROL_PATH" -O exit "$SENDER_SSH" >/dev/null 2>&1 || true
+        fi
     fi
 }
 trap cleanup INT TERM EXIT
@@ -264,6 +293,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     SENDER_ARGS+=(--sender-bin  "$SENDER_BIN")
     SENDER_ARGS+=(--sender-csv  "$SENDER_CSV")
     SENDER_ARGS+=(--sender-dest "$SENDER_DEST")
+    [[ -n "$SSH_CONTROL_PATH" ]] && SENDER_ARGS+=(--sender-control-path "$SSH_CONTROL_PATH")
 fi
 
 "$HARNESS" \
