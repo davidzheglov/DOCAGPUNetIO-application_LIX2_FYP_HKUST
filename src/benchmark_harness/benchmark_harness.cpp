@@ -178,7 +178,7 @@ static void kill_proc(pid_t pid)
 static pid_t launch_sender_ssh(long rate_hz)
 {
     std::string remote_cmd =
-        "pkill -f data_source 2>/dev/null; sleep 0.2; "
+        "pkill -x data_source 2>/dev/null || true; sleep 0.2; "
         + g_sender_bin
         + " --mode replay"
         + " --csv "  + g_sender_csv
@@ -206,7 +206,7 @@ static void kill_remote_sender(void)
     if (g_sender_ssh.empty()) return;
     std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 "
                     + g_sender_ssh
-                    + " 'pkill -f data_source 2>/dev/null; true'"
+                    + " 'pkill -x data_source 2>/dev/null || true'"
                       " >/dev/null 2>&1";
     (void)system(cmd.c_str());
 }

@@ -216,7 +216,7 @@ EOF
 if [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
     if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null || true; sleep 0.3; \
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
               > /tmp/dpu_relay.log 2>&1 &'" ; then
         log_err "relay launch command returned non-zero; checking DPU log and port anyway"
@@ -247,8 +247,8 @@ cleanup() {
     pkill -f bin/data_source   2>/dev/null || true
     if [[ -n "$SENDER_SSH" ]]; then
         ssh -o BatchMode=yes -o ConnectTimeout=3 "$SENDER_SSH" \
-            "pkill -f data_source 2>/dev/null; \
-             ssh ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null; true'" \
+            "pkill -x data_source 2>/dev/null || true; \
+             ssh ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
             >/dev/null 2>&1 || true
     fi
 }
