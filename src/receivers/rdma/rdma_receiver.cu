@@ -7,8 +7,13 @@
  *       → process_ticks_kernel → BenchmarkResult → harness
  *
  * Key difference from T1/T2: nv_peer_mem (or nvidia_peermem) kernel module
- * allows ibverbs to register GPU memory regions.  The NIC writes received
+ * allows ibverbs to register GPU memory regions. The NIC writes received
  * packets straight into device memory — the cudaMemcpy H→D step is eliminated.
+ *
+ * Benchmark definition for T3:
+ *   t1 = receiver-side ingress timestamp on lxcpu1, taken when the RAW_PACKET
+ *        CQ completion is harvested for each packet. This keeps all benchmark
+ *        timestamps in the receiver clock domain without cross-host sync.
  *
  * Uses IBV_QPT_RAW_PACKET so regular UDP multicast from send_ticks.py works
  * (same sender as T1/T2/T4 — fair benchmark comparison).  ibv_create_flow
@@ -307,6 +312,7 @@ static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
 static void process_rdma_batch(GpuRdmaResources &gpu,
                                 uint32_t *d_slots,
                                 const uint32_t *h_slots,
+                                const uint64_t *h_rx_ts_ns,
                                 int batch_n, uint8_t tier,
                                 int harness_fd, sockaddr_in &harness_dest,
                                 int signal_fd,  sockaddr_in &signal_dest)
@@ -345,7 +351,7 @@ static void process_rdma_batch(GpuRdmaResources &gpu,
 
         brs[i] = BenchmarkResult{};
         brs[i].tick_id = tick.tick_id;
-        brs[i].t1_ns   = tick.timestamp_ns;
+        brs[i].t1_ns   = h_rx_ts_ns[i];
         brs[i].t2_ns   = t2;
         brs[i].t3_ns   = t3;
         brs[i].t4_ns   = t4;
@@ -394,6 +400,7 @@ int main(int argc, char **argv)
 
     ibv_wc wcs[MAX_RECV_WR];
     uint32_t batch_slots[DEFAULT_BATCH];
+    uint64_t batch_t1_ns[DEFAULT_BATCH];
     uint32_t *d_slots = nullptr;
     CUDA_CHECK(cudaMalloc(&d_slots, batch_size * sizeof(uint32_t)));
 
@@ -408,7 +415,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "[T3] waiting for packets (raw packet QP)...\n");
 
     auto flush_batch = [&](const char *reason) {
-        process_rdma_batch(gpu, d_slots, batch_slots, batch_n, tier,
+        process_rdma_batch(gpu, d_slots, batch_slots, batch_t1_ns, batch_n, tier,
                             harness_fd, harness_dest, signal_fd, signal_dest);
         ++total_batches;
         uint64_t now_n = now_ns();
@@ -436,8 +443,10 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            if (batch_n == 0) batch_start_ns = now_ns();
+            uint64_t rx_ts_ns = now_ns();
+            if (batch_n == 0) batch_start_ns = rx_ts_ns;
             batch_slots[batch_n++] = (uint32_t)wcs[w].wr_id;
+            batch_t1_ns[batch_n - 1] = rx_ts_ns;
             total_rx++;
             post_recv_wrs(gpu, (int)wcs[w].wr_id, 1);
 

@@ -6,7 +6,12 @@
  *       → cudaMemcpy H→D → process_ticks_kernel → BenchmarkResult → harness
  *
  * Key difference from T1: no OS socket overhead, DPDK bypasses the kernel
- * entirely.  The cudaMemcpy step is identical to T1.
+ * entirely. The cudaMemcpy step is identical to T1.
+ *
+ * Benchmark definition for T2:
+ *   t1 = receiver-side ingress timestamp on lxcpu1, taken at the earliest
+ *        host-visible point in the DPDK RX path after the packet is accepted
+ *        by the NIC/PMD and passes the UDP dst-port filter.
  *
  * Build requires DPDK installed (pkg-config libdpdk).
  *
@@ -364,8 +369,10 @@ int main(int argc, char **argv)
 
             const TickMessage *tick =
                 reinterpret_cast<const TickMessage *>(data + ETH_IP_UDP_HDR);
+            uint64_t rx_ts_ns = now_ns();
             if (batch_n == 0) batch_start_ns = now_ns();
             memcpy(&gpu.h_ticks[batch_n], tick, sizeof(TickMessage));
+            gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
             ++batch_n;
 
             rte_pktmbuf_free(m);

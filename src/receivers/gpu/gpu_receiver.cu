@@ -13,6 +13,13 @@
  *       -> BenchmarkResult -> harness (via host UDP thread)
  *       -> SignalResult -> fill_simulator
  *
+ * Benchmark definition for T4/T5:
+ *   t1 = receiver-side ingress timestamp on lxcpu1, taken inside the
+ *        persistent GPU receive kernel when the packet becomes visible in the
+ *        GPUNetIO RX queue. The raw GPU clock64() value is translated into the
+ *        host wall-clock domain by the CPU forwarding thread using the same
+ *        anchor pair already used for t2/t3/t4.
+ *
  * DOCA SDK version: 3.x (uses doca_gpunetio_dev_eth_rxq.cuh)
  *
  * Usage:
@@ -340,13 +347,14 @@ __global__ void gpu_recv_process_kernel(
                      * 10 μs sleep giving the host-mapped writes time to
                      * drain. A proper 2-phase commit is tracked as a
                      * follow-up. */
+                    uint64_t t1 = clock64();
                     uint64_t ring_idx = atomicAdd(
                         reinterpret_cast<unsigned long long *>(
                             const_cast<uint64_t *>(ring_head)), 1ULL);
                     ResultSlot *rslot = &result_ring[ring_idx % ring_depth];
 
                     rslot->bench.tick_id = tick->tick_id;
-                    rslot->bench.t1_ns   = tick->timestamp_ns;
+                    rslot->bench.t1_ns   = t1;
                     rslot->bench.t2_ns   = t2;
                     rslot->bench.t3_ns   = t3;
                     rslot->bench.t4_ns   = 0;   /* 0 = "in flight" sentinel */
@@ -387,10 +395,10 @@ struct ForwardCtx {
     double             ns_per_cyc  = 1.0;
     /* GPU clock64() <-> host wall-clock anchor captured just before
      * the persistent kernel starts. Lets cpu_forward_thread translate
-     * every (t2, t3, t4) from "cycles since SM reset" into "nanoseconds
-     * since Unix epoch" — the same frame as t1 (set by the sender via
-     * gettimeofday). Without this anchor, e2e/ingest latencies are
-     * nonsense because the two clocks don't even share a zero. */
+     * every (t1, t2, t3, t4) from "cycles since SM reset" into
+     * "nanoseconds since Unix epoch" in the receiver host clock domain.
+     * Without this anchor, ingress/e2e latencies are nonsense because the
+     * GPU clock and host wall clock don't even share a zero. */
     uint64_t           gpu_cyc_anchor        = 0;
     uint64_t           host_wall_anchor_ns   = 0;
     int                harness_fd  = -1;
@@ -461,6 +469,10 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
+                br.t1_ns  = cyc_to_wall_ns(br.t1_ns,
+                                           ctx->gpu_cyc_anchor,
+                                           ctx->host_wall_anchor_ns,
+                                           ctx->ns_per_cyc);
                 br.t2_ns  = cyc_to_wall_ns(br.t2_ns,
                                            ctx->gpu_cyc_anchor,
                                            ctx->host_wall_anchor_ns,
