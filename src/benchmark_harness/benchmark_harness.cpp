@@ -179,6 +179,7 @@ static pid_t launch_receiver(int tier, const char *binary,
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
+        std::vector<std::string> owned_args;
         std::vector<const char *> argv;
 
         /* T2/T3/T4 need the same privilege model as their manual bring-up
@@ -189,10 +190,10 @@ static pid_t launch_receiver(int tier, const char *binary,
             argv.push_back("sudo");
             argv.push_back("-E");
             argv.push_back("env");
-            std::string path_env = make_env_assignment("PATH");
-            std::string ld_env   = make_env_assignment("LD_LIBRARY_PATH");
-            argv.push_back(path_env.c_str());
-            argv.push_back(ld_env.c_str());
+            owned_args.push_back(make_env_assignment("PATH"));
+            owned_args.push_back(make_env_assignment("LD_LIBRARY_PATH"));
+            argv.push_back(owned_args[0].c_str());
+            argv.push_back(owned_args[1].c_str());
         }
 
         argv.push_back(binary);
