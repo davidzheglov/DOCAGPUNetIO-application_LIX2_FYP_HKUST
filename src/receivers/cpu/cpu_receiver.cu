@@ -12,8 +12,14 @@
  * (e.g. ens21f1np1) so that frames arriving from the DPU are accepted.
  * Without it, INADDR_ANY may pick lo and drop real-NIC traffic.
  *
- * Batches up to BATCH_SIZE ticks before launching the kernel.
- * T2 is stamped on the host immediately after cudaMemcpy H→D completes.
+ * Benchmark definition for T1:
+ *   t1 = receiver-side ingress timestamp on lxcpu1, requested from the
+ *        socket timestamping API with hardware RX preference and software
+ *        fallback, so all benchmark timestamps stay in the receiver clock
+ *        domain.
+ *
+ * Batches up to BATCH_SIZE ticks before launching the kernel. T2 is stamped
+ * on the host immediately after cudaMemcpy H→D completes.
  *
  * Usage:
  *   cpu_receiver [--mcast 239.0.0.1] [--port 5005] [--batch 256]
@@ -22,6 +28,7 @@
  */
 
 #include <arpa/inet.h>
+#include <linux/net_tstamp.h>
 #include <net/if.h>          /* if_nametoindex() */
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -48,6 +55,11 @@
  * nsys capture before the process dies. */
 static volatile sig_atomic_t g_quit = 0;
 static void sig_handler(int) { g_quit = 1; }
+
+static inline uint64_t timespec_to_ns(const struct timespec &ts)
+{
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 /* ── Configuration defaults ─────────────────────────────────────────────────── */
 #define DEFAULT_BATCH                256
@@ -126,7 +138,75 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port,
     struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    int ts_flags = SOF_TIMESTAMPING_RX_HARDWARE
+                 | SOF_TIMESTAMPING_RX_SOFTWARE
+                 | SOF_TIMESTAMPING_SOFTWARE
+                 | SOF_TIMESTAMPING_RAW_HARDWARE;
+#ifdef SOF_TIMESTAMPING_SYS_HARDWARE
+    ts_flags |= SOF_TIMESTAMPING_SYS_HARDWARE;
+#endif
+    if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
+                   &ts_flags, sizeof(ts_flags)) < 0) {
+        perror("SO_TIMESTAMPING");
+        fprintf(stderr,
+                "[cpu_receiver] continuing without socket timestamping; "
+                "t1 will fall back to recv completion time\n");
+    } else {
+        fprintf(stderr,
+                "[cpu_receiver] enabled RX timestamping (hardware preferred)\n");
+    }
+
     return fd;
+}
+
+static ssize_t recv_tick_with_timestamp(int fd, TickMessage *tick,
+                                        uint64_t *rx_ts_ns)
+{
+    alignas(struct cmsghdr) char control[256];
+    iovec iov{};
+    iov.iov_base = tick;
+    iov.iov_len  = sizeof(*tick);
+
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    ssize_t n = recvmsg(fd, &msg, 0);
+    if (n < 0) return n;
+
+    uint64_t best_ts = 0;
+    for (cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+         cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level != SOL_SOCKET) continue;
+
+        if (cmsg->cmsg_type == SCM_TIMESTAMPING) {
+            auto *ts = reinterpret_cast<struct timespec *>(CMSG_DATA(cmsg));
+            if ((ts[0].tv_sec | ts[0].tv_nsec) != 0) {
+                best_ts = timespec_to_ns(ts[0]);
+                break;
+            }
+            if ((ts[1].tv_sec | ts[1].tv_nsec) != 0) {
+                best_ts = timespec_to_ns(ts[1]);
+                break;
+            }
+            if ((ts[2].tv_sec | ts[2].tv_nsec) != 0) {
+                best_ts = timespec_to_ns(ts[2]);
+            }
+        } else if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+            auto *ts = reinterpret_cast<struct timespec *>(CMSG_DATA(cmsg));
+            if ((ts->tv_sec | ts->tv_nsec) != 0) {
+                best_ts = timespec_to_ns(*ts);
+                break;
+            }
+        }
+    }
+
+    if (best_ts == 0) best_ts = now_ns();
+    *rx_ts_ns = best_ts;
+    return n;
 }
 
 /* ── UDP send to harness / fill-sim ─────────────────────────────────────────── */
@@ -329,7 +409,7 @@ int main(int argc, char **argv)
     struct sigaction sa{};
     sa.sa_handler = sig_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;    /* NOT SA_RESTART — we want recvfrom() to return EINTR */
+    sa.sa_flags = 0;    /* NOT SA_RESTART — we want recvmsg() to return EINTR */
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
@@ -367,11 +447,12 @@ int main(int argc, char **argv)
     uint64_t batch_start_ns  = 0;        /* when first tick of current batch landed */
     uint64_t last_report_ns  = 0;
     while (!g_quit) {
-        ssize_t n = recvfrom(recv_fd,
-                              &gpu.h_ticks[batch_n], sizeof(TickMessage),
-                              0, nullptr, nullptr);
+        uint64_t rx_ts_ns = 0;
+        ssize_t n = recv_tick_with_timestamp(recv_fd, &gpu.h_ticks[batch_n],
+                                             &rx_ts_ns);
 
         if (n == sizeof(TickMessage)) {
+            gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
             if (batch_n == 0) batch_start_ns = now_ns();
             ++batch_n;
             ++total_recv;
