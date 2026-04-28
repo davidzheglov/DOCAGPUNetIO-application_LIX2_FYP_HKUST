@@ -26,6 +26,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -43,6 +44,7 @@
 #include <vector>
 
 #include "benchmark_result.h"
+#include "signal_result.h"
 
 using Clock = std::chrono::steady_clock;
 using Sec   = std::chrono::seconds;
@@ -179,6 +181,9 @@ struct RunResult {
     double ingest_p50, ingest_p95, ingest_p99, ingest_mean;
     double compute_p50, compute_p95, compute_p99, compute_mean;
     double throughput;
+    /* Signal-rate metrics (post-kernel SignalResult emissions on port 5006) */
+    double signals_total_per_sec;       /* every processed tick → throughput proxy */
+    double signals_actionable_per_sec;  /* only signal != 0 (real buy/sell decisions) */
 };
 
 static void write_header(std::ofstream &f)
@@ -187,7 +192,8 @@ static void write_header(std::ofstream &f)
       << "e2e_p50_us,e2e_p95_us,e2e_p99_us,e2e_mean_us,"
       << "ingest_p50_us,ingest_p95_us,ingest_p99_us,ingest_mean_us,"
       << "compute_p50_us,compute_p95_us,compute_p99_us,compute_mean_us,"
-      << "throughput_per_sec\n";
+      << "throughput_per_sec,"
+      << "signals_total_per_sec,signals_actionable_per_sec\n";
 }
 
 static void write_row(std::ofstream &f, const RunResult &r)
@@ -205,13 +211,15 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << ns_to_us(r.ingest_p99)  << ',' << ns_to_us(r.ingest_mean) << ','
       << ns_to_us(r.compute_p50)  << ',' << ns_to_us(r.compute_p95)  << ','
       << ns_to_us(r.compute_p99)  << ',' << ns_to_us(r.compute_mean) << ','
-      << r.throughput   << '\n';
+      << r.throughput   << ','
+      << r.signals_total_per_sec << ','
+      << r.signals_actionable_per_sec << '\n';
     f.flush();
 }
 
 /* ── Single benchmark run ────────────────────────────────────────────────── */
 static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
-                          const char *csv_path, int result_fd,
+                          const char *csv_path, int result_fd, int signal_fd,
                           int warmup_sec, int duration_sec)
 {
     fprintf(stderr,
@@ -253,39 +261,60 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
     }
 
-    /* Drain socket during warmup */
+    /* Drain both sockets during warmup */
     auto t_start = Clock::now();
     {
         BenchmarkResult br{};
+        SignalResult    sr{};
         auto warmup_end = t_start + Sec(warmup_sec);
         fprintf(stderr, "[harness] warming up for %d s...\n", warmup_sec);
         while (Clock::now() < warmup_end) {
             recv(result_fd, &br, sizeof(br), 0);  /* discard */
+            recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);  /* non-blocking drain */
         }
     }
 
-    /* Collect during measurement window */
+    /* Collect during measurement window — poll both sockets */
     std::vector<double> e2e_ns, ingest_ns, compute_ns;
     e2e_ns.reserve(rate_hz * duration_sec);
     ingest_ns.reserve(rate_hz * duration_sec);
     compute_ns.reserve(rate_hz * duration_sec);
 
     uint64_t n_dropped = 0;
+    uint64_t n_signals_total = 0;       /* every SignalResult received */
+    uint64_t n_signals_actionable = 0;  /* signal != 0 only */
     auto measure_end = Clock::now() + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
+    pollfd pfds[2];
+    pfds[0].fd = result_fd; pfds[0].events = POLLIN;
+    pfds[1].fd = signal_fd; pfds[1].events = POLLIN;
+
     while (Clock::now() < measure_end) {
-        BenchmarkResult br{};
-        ssize_t n = recv(result_fd, &br, sizeof(br), 0);
-        if (n != sizeof(BenchmarkResult)) continue;
+        int pr = poll(pfds, 2, 50);  /* 50 ms tick */
+        if (pr <= 0) continue;
 
-        if (br.dropped) { ++n_dropped; continue; }
-        if (br.t4_ns <= br.t1_ns) continue;            /* clock glitch */
-        if (br.t4_ns - br.t1_ns > 10000000000ULL) continue;  /* > 10 s: stale */
-
-        e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
-        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
-        compute_ns.push_back((double)(br.t3_ns - br.t2_ns));
+        if (pfds[0].revents & POLLIN) {
+            BenchmarkResult br{};
+            ssize_t n = recv(result_fd, &br, sizeof(br), 0);
+            if (n == sizeof(BenchmarkResult)) {
+                if (br.dropped) { ++n_dropped; }
+                else if (br.t4_ns > br.t1_ns &&
+                         br.t4_ns - br.t1_ns <= 10000000000ULL) {
+                    e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
+                    ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
+                    compute_ns.push_back((double)(br.t3_ns - br.t2_ns));
+                }
+            }
+        }
+        if (pfds[1].revents & POLLIN) {
+            SignalResult sr{};
+            ssize_t n = recv(signal_fd, &sr, sizeof(sr), 0);
+            if (n == sizeof(SignalResult)) {
+                ++n_signals_total;
+                if (sr.signal != 0) ++n_signals_actionable;
+            }
+        }
     }
 
     /* Kill subprocesses */
@@ -318,11 +347,17 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.compute_mean = mean_of(compute_ns);
     r.throughput   = duration_sec > 0
         ? (double)n_ticks / (double)duration_sec : 0.0;
+    r.signals_total_per_sec      = duration_sec > 0
+        ? (double)n_signals_total / (double)duration_sec : 0.0;
+    r.signals_actionable_per_sec = duration_sec > 0
+        ? (double)n_signals_actionable / (double)duration_sec : 0.0;
 
     fprintf(stderr,
-        "[harness] T%d @%ld: n=%zu drop=%.2f%% e2e_p50=%.1fus e2e_p99=%.1fus tput=%.0f/s\n",
+        "[harness] T%d @%ld: n=%zu drop=%.2f%% e2e_p50=%.1fus e2e_p99=%.1fus "
+        "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
-        r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput);
+        r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput,
+        r.signals_total_per_sec, r.signals_actionable_per_sec);
 
     return r;
 }
@@ -393,6 +428,11 @@ int main(int argc, char **argv)
     int result_fd = make_result_socket(BENCH_RESULT_PORT);
     if (result_fd < 0) return 1;
 
+    /* Also intercept SignalResult on port 5006 — we count signals here so the
+     * fill_simulator does not need to be running during benchmarks. */
+    int signal_fd = make_result_socket(SIGNAL_PORT);
+    if (signal_fd < 0) { close(result_fd); return 1; }
+
     /* Open CSV */
     std::ofstream csv_out(results_path);
     if (!csv_out) { fprintf(stderr, "Cannot write %s\n", results_path); return 1; }
@@ -404,7 +444,7 @@ int main(int argc, char **argv)
             for (int rep = 0; rep < reps; ++rep) {
                 ++run_id;
                 RunResult r = run_one(run_id, tier, rate, rep + 1,
-                                       csv_path.c_str(), result_fd,
+                                       csv_path.c_str(), result_fd, signal_fd,
                                        warmup_sec, duration_sec);
                 write_row(csv_out, r);
             }
@@ -412,6 +452,7 @@ int main(int argc, char **argv)
     }
 
     close(result_fd);
+    close(signal_fd);
 
     fprintf(stderr, "\n[harness] all %d runs complete. Results in %s\n",
             run_id, results_path);

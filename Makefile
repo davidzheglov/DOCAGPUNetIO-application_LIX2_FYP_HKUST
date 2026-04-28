@@ -209,16 +209,17 @@ all: core t2 t3 t4
 	@echo ""
 	@echo "  Full build complete."
 
-# ── Quick end-to-end validation (replay mode, T1 only) ────────────────────
-bench: core
-	@echo ""
-	@echo "  Starting 10s pipeline smoke test (T1, replay mode)..."
-	@echo "  Terminal 1 (harness)  : $(BINDIR)/benchmark_harness --tiers 1 --rates 10000 --reps 1"
-	@echo "  Terminal 2 (receiver) : $(BINDIR)/cpu_receiver --tier 1"
-	@echo "  Terminal 3 (source)   : $(BINDIR)/data_source --mode replay --rate 10000"
-	@echo "  Terminal 4 (fill sim) : $(BINDIR)/fill_simulator"
-	@echo ""
-	@echo "  Or use scripts/pipeline_test.py for a single-process test."
+# ── Full T1-T4 benchmark sweep + plots ────────────────────────────────────
+benchmark: all
+	@bash scripts/run_benchmark.sh
+	@python3 scripts/plot_benchmark.py --latest
+
+benchmark-quick: core
+	@bash scripts/run_benchmark.sh --quick
+	@python3 scripts/plot_benchmark.py --latest
+
+plots:
+	@python3 scripts/plot_benchmark.py --latest
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
 dashboard:
@@ -264,7 +265,7 @@ $(TEST_FLOW_BIN): $(TEST_FLOW_SRC) | $(BINDIR)
 clean:
 	rm -rf $(BINDIR)/
 
-.PHONY: all core bench clean dashboard
+.PHONY: all core benchmark benchmark-quick plots clean dashboard
 .PHONY: data_source data_source_live data_source_dpu
 .PHONY: dpu_relay dpu_relay_dpu
 .PHONY: t1 t2 t3 t4 fill_sim harness
