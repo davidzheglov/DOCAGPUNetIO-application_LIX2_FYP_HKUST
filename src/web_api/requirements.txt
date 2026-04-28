@@ -1,0 +1,7 @@
+fastapi[standard]>=0.115
+pandas>=2.2
+numpy>=1.26
+plotly>=5.24
+kaleido>=0.2
+matplotlib>=3.8
+psutil>=6.0

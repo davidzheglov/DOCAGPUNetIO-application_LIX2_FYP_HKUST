@@ -1,6 +1,7 @@
 # Build outputs
 build/
 cmake-build-*/
+bin/
 *.o
 *.a
 *.so
@@ -19,6 +20,14 @@ src/benchmark_harness/benchmark_harness
 results/
 *.csv
 *.json
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+!web/tsconfig.app.json
+!web/tsconfig.node.json
+!web/components.json
+web/node_modules/
+web/dist/
 
 # Python
 __pycache__/
