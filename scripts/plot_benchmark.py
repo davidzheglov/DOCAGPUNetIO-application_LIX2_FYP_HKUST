@@ -9,12 +9,14 @@ and writes 6 PNGs to results/plots_<timestamp>/:
   02_drop_curve.png         — drop_rate vs offered rate, all tiers (saturation)
   03_throughput.png         — achieved tick throughput vs offered rate
   04_signal_rate.png        — total + actionable signal rate vs offered rate
-  05_stage_breakdown.png    — stacked p50 ingest/compute/egress per tier @ 100k Hz
-  06_e2e_upper_bound.png    — e2e p50/p99 (clearly labeled cross-machine UB)
+  05_stage_breakdown.png    — stacked p50 ingress/compute/egress per tier @ 100k Hz
+  06_e2e_latency.png        — receiver-ingress-to-output p50/p99
 
-Trustworthy metrics (single-clock): compute, drop_rate, throughput, signals.
-Cross-machine metrics (DPU↔host clock drift): ingest, e2e — shown as upper
-bounds only, per the project clock-drift limitation.
+Current benchmark definition for T1-T4 uses a single receiver-side clock on
+lxcpu1:
+  ingress = T2 - T1
+  compute = T3 - T2
+  e2e = T4 - T1
 
 Usage:
   python3 scripts/plot_benchmark.py results/benchmark_20260428_193500.csv
@@ -128,7 +130,7 @@ def save(fig, outdir: Path, name: str):
 # ─── Plot functions ───────────────────────────────────────────────────────────
 
 def plot_compute_latency(agg, outdir):
-    """The trustworthy single-clock latency comparison."""
+    """Single-clock latency comparison."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "compute_p50")
@@ -138,7 +140,7 @@ def plot_compute_latency(agg, outdir):
                 label=f"{TIER_LABEL[tier]}  p50")
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
                 alpha=0.6, label=f"{TIER_LABEL[tier]}  p99")
-    setup_axes(ax, "GPU compute latency (single-clock, trustworthy)",
+    setup_axes(ax, "GPU compute latency (receiver-side single clock)",
                "Offered tick rate (Hz)", "Compute latency T3−T2 (µs)")
     ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
     save(fig, outdir, "01_compute_latency.png")
@@ -200,9 +202,7 @@ def plot_signal_rate(agg, outdir):
 
 
 def plot_stage_breakdown(agg, outdir, target_rate=100000):
-    """Stacked bar of where time goes per tier at a fixed rate.
-    NOTE: ingest is cross-machine and an upper bound — kept for context but
-    flagged in the title."""
+    """Stacked bar of where time goes per tier at a fixed rate."""
     rates_avail = sorted({r for (_, r) in agg.keys()})
     if target_rate not in rates_avail:
         target_rate = min(rates_avail, key=lambda r: abs(r - target_rate))
@@ -210,14 +210,14 @@ def plot_stage_breakdown(agg, outdir, target_rate=100000):
     tiers = sorted({t for (t, _) in agg.keys()})
     ingest  = [agg[(t, target_rate)]["ingest_p50"]  for t in tiers]
     compute = [agg[(t, target_rate)]["compute_p50"] for t in tiers]
-    # egress = e2e - ingest - compute (lower bound; e2e itself is UB)
+    # egress = e2e - ingress - compute
     e2e_v   = [agg[(t, target_rate)]["e2e_p50"]     for t in tiers]
     egress  = [max(0.0, e2e_v[i] - ingest[i] - compute[i]) for i in range(len(tiers))]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     labels = [TIER_LABEL[t] for t in tiers]
     x = np.arange(len(tiers))
-    ax.bar(x, ingest,  label="Ingest (T2−T1, UB)", color="#cccccc")
+    ax.bar(x, ingest,  label="Ingress (T2−T1)", color="#cccccc")
     ax.bar(x, compute, bottom=ingest, label="Compute (T3−T2)",
            color="#2a9d8f")
     ax.bar(x, egress,  bottom=[i+c for i, c in zip(ingest, compute)],
@@ -225,15 +225,15 @@ def plot_stage_breakdown(agg, outdir, target_rate=100000):
     ax.set_xticks(x)
     ax.set_xticklabels([l.split(" ")[0] for l in labels], fontsize=9)
     ax.set_title(f"p50 stage breakdown @ {target_rate:,} Hz "
-                 f"(ingest is cross-machine upper bound)", fontsize=11, pad=10)
+                 f"(receiver-side single clock)", fontsize=11, pad=10)
     ax.set_ylabel("Latency (µs)", fontsize=10)
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(fontsize=9, loc="upper right")
     save(fig, outdir, "05_stage_breakdown.png")
 
 
-def plot_e2e_upper_bound(agg, outdir):
-    """End-to-end latency, clearly flagged as cross-machine UB."""
+def plot_e2e_latency(agg, outdir):
+    """Receiver-ingress-to-output latency."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "e2e_p50")
@@ -244,11 +244,11 @@ def plot_e2e_upper_bound(agg, outdir):
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
                 alpha=0.6, label=f"{TIER_LABEL[tier]}  p99")
     setup_axes(ax,
-               "End-to-end latency (cross-machine — interpret as UPPER BOUND)",
+               "End-to-end latency (receiver ingress → output)",
                "Offered tick rate (Hz)", "E2E latency T4−T1 (µs)",
                xlog=True, ylog=True)
     ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
-    save(fig, outdir, "06_e2e_upper_bound.png")
+    save(fig, outdir, "06_e2e_latency.png")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -294,7 +294,7 @@ def main():
     plot_throughput(agg, outdir)
     plot_signal_rate(agg, outdir)
     plot_stage_breakdown(agg, outdir)
-    plot_e2e_upper_bound(agg, outdir)
+    plot_e2e_latency(agg, outdir)
     print(f"\nDone. {len(rows)} runs across "
           f"{len({t for t,_ in agg})} tier(s) × {len({r for _,r in agg})} rate(s).")
 

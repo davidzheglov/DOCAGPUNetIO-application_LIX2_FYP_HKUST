@@ -136,8 +136,12 @@ make data_source_live dpu_relay_dpu t1
 
 ## Timestamps
 
-Each tick carries four timestamps for latency decomposition:
-- **T1** — stamped by data source at `sendto()`
-- **T2** — stamped when tick arrives in GPU memory
-- **T3** — stamped by CUDA kernel on completion
-- **T4** — stamped when signal written to output buffer
+For the current T1-T4 benchmark path, latency decomposition uses a single
+receiver-side clock domain on `lxcpu1`:
+- **T1** — receiver-side ingress timestamp on `lxcpu1`
+- **T2** — stamped when the tick reaches the tier's ingest point / GPU memory
+- **T3** — stamped when compute completes
+- **T4** — stamped when the result is available to send back to the harness
+
+This means the reported benchmark latencies are receiver-ingress-to-output
+measurements rather than cross-machine sender-to-receiver wall-clock times.
