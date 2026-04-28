@@ -20,9 +20,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 static volatile bool g_running = true;
 
@@ -38,7 +40,9 @@ static void usage(const char *prog) {
         "  --listen-port <port>   UDP port to listen on (default: 6005)\n"
         "  --mcast-addr <ip>      Multicast destination address (default: 239.0.0.1)\n"
         "  --mcast-port <port>    Multicast destination port (default: 5005)\n"
-        "  --iface <ip>           Interface IP for multicast output (default: 10.10.10.1)\n"
+        "  --iface <ip>           Interface IP for multicast output (default: 10.10.10.3)\n"
+        "  --no-restamp           Forward bytes verbatim (default: re-stamp first 8\n"
+        "                         bytes with egress wall-clock ns — TickMessage T1)\n"
         "\n"
         "Forwards UDP packets received on listen-port to multicast group.\n"
         "Run on DPU ARM to bridge host unicast -> working multicast path.\n",
@@ -49,7 +53,9 @@ int main(int argc, char **argv) {
     int listen_port = 6005;
     const char *mcast_addr = "239.0.0.1";
     int mcast_port = 5005;
-    const char *iface_ip = "10.10.10.1";
+    /* lxcpu2 DPU ARM p0 address per project topology. Override with --iface. */
+    const char *iface_ip = "10.10.10.3";
+    bool restamp_t1 = true;  /* Overwrite first 8 bytes (TickMessage.timestamp_ns) at egress */
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--listen-port") && i + 1 < argc) {
@@ -60,6 +66,8 @@ int main(int argc, char **argv) {
             mcast_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--iface") && i + 1 < argc) {
             iface_ip = argv[++i];
+        } else if (!strcmp(argv[i], "--no-restamp")) {
+            restamp_t1 = false;
         } else if (!strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -78,6 +86,13 @@ int main(int argc, char **argv) {
 
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    /* Larger RX buffer — Binance bursts during volatile periods can exceed
+     * the default ~256KB and silently drop on the kernel side. */
+    int rcvbuf = 4 * 1024 * 1024;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("SO_RCVBUF");
+    }
 
     sockaddr_in listen_addr{};
     listen_addr.sin_family = AF_INET;
@@ -138,6 +153,17 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             perror("recvfrom");
             break;
+        }
+
+        /* Re-stamp T1 (TickMessage.timestamp_ns at offset 0) at the moment of
+         * egress onto the measured wire. This excludes the host->DPU tmfifo
+         * hop from downstream T1->Tx latency math, which is what we want for
+         * the T1-T4 tier comparison. Skip with --no-restamp. */
+        if (restamp_t1 && n >= (ssize_t)sizeof(uint64_t)) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+            memcpy(buf, &now_ns, sizeof(now_ns));
         }
 
         ssize_t sent = sendto(send_fd, buf, n, 0,
