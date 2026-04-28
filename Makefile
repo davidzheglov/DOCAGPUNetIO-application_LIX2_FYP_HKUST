@@ -211,11 +211,11 @@ all: core t2 t3 t4
 
 # ── Full T1-T4 benchmark sweep + plots ────────────────────────────────────
 benchmark: all
-	@bash scripts/run_benchmark.sh
+	@bash scripts/run_benchmark.sh $(BENCHMARK_ARGS)
 	@python3 scripts/plot_benchmark.py --latest
 
 benchmark-quick: core
-	@bash scripts/run_benchmark.sh --quick
+	@bash scripts/run_benchmark.sh --quick $(BENCHMARK_ARGS)
 	@python3 scripts/plot_benchmark.py --latest
 
 plots:
