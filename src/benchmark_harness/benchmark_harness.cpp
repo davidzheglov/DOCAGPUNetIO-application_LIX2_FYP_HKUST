@@ -84,9 +84,16 @@ static const char *receiver_binary(int tier)
     }
 }
 
+static std::string make_env_assignment(const char *name)
+{
+    const char *val = getenv(name);
+    return std::string(name) + "=" + (val ? val : "");
+}
+
 /* ── Hardware config for tier-specific args ──────────────────────────────── */
 static std::string g_dpdk_pci  = "0000:bd:00.0";   /* T2: ConnectX-7 NIC PCIe */
-static std::string g_gpu_pcie  = "00000000:AC:00.0"; /* T4: GPU 1 PCIe */
+static std::string g_rdma_dev  = "mlx5_0";         /* T3: RDMA device */
+static std::string g_gpu_pcie  = "0000:ac:00.0";   /* T4: GPU 1 PCIe */
 static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
 static int         g_gpu_id    = 1;                   /* T4: CUDA device */
 static std::string g_mcast_iface;                     /* NIC IP for multicast output */
@@ -120,6 +127,11 @@ static std::vector<std::string> receiver_args(int tier)
         args.push_back("-n");
         args.push_back("4");
         args.push_back("--");
+    }
+
+    if (tier == 3) {
+        args.push_back("--dev");
+        args.push_back(g_rdma_dev);
     }
 
     args.push_back("--tier");
@@ -176,6 +188,11 @@ static pid_t launch_receiver(int tier, const char *binary,
         if (need_sudo) {
             argv.push_back("sudo");
             argv.push_back("-E");
+            argv.push_back("env");
+            std::string path_env = make_env_assignment("PATH");
+            std::string ld_env   = make_env_assignment("LD_LIBRARY_PATH");
+            argv.push_back(path_env.c_str());
+            argv.push_back(ld_env.c_str());
         }
 
         argv.push_back(binary);
@@ -489,6 +506,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tiers")    && i+1<argc) tiers_str    = argv[++i];
         else if (!strcmp(argv[i],"--rates")    && i+1<argc) rates_str    = argv[++i];
         else if (!strcmp(argv[i],"--dpdk-pci") && i+1<argc) g_dpdk_pci   = argv[++i];
+        else if (!strcmp(argv[i],"--rdma-dev") && i+1<argc) g_rdma_dev   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-pcie") && i+1<argc) g_gpu_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
