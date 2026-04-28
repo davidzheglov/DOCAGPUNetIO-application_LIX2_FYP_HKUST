@@ -38,6 +38,22 @@ REGEN_CSV=0
 QUICK=0
 IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for T2/T4 mcast egress)
 
+# ── Remote sender (lxcpu2 host) — set to empty to use local sender ──────────
+SENDER_SSH="${SENDER_SSH:-lix2@lxcpu2.cse.ust.hk}"
+SENDER_REMOTE_DIR="${SENDER_REMOTE_DIR:-DOCAGPUNetIO-application_LIX2_FYP_HKUST}"
+SENDER_BIN="${SENDER_BIN:-\$HOME/$SENDER_REMOTE_DIR/bin/data_source}"
+SENDER_CSV="${SENDER_CSV:-\$HOME/$SENDER_REMOTE_DIR/data/ticks.csv}"
+SENDER_DEST="${SENDER_DEST:-192.168.100.2:6005}"
+
+# ── DPU relay (lxcpu2 DPU ARM, reached *from* lxcpu2 host) ──────────────────
+DPU_USER="${DPU_USER:-ubuntu}"
+DPU_IP="${DPU_IP:-192.168.100.2}"
+DPU_RELAY_PATH="${DPU_RELAY_PATH:-/home/ubuntu/dpu_relay}"
+DPU_MCAST_IFACE="${DPU_MCAST_IFACE:-10.10.10.3}"
+RELAY_PORT="${RELAY_PORT:-6005}"
+
+LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --tiers)        TIERS="$2"; shift 2 ;;
@@ -50,6 +66,8 @@ while [[ $# -gt 0 ]]; do
         --csv)          CSV_PATH="$2"; shift 2 ;;
         --regen-csv)    REGEN_CSV=1; shift ;;
         --iface)        IFACE_ARG="--iface $2"; shift 2 ;;
+        --sender-ssh)   SENDER_SSH="$2"; shift 2 ;;
+        --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
         --quick)        QUICK=1; shift ;;
         --help|-h)      sed -n '2,22p' "$0"; exit 0 ;;
         *)              echo "Unknown option: $1" >&2; exit 1 ;;
@@ -95,6 +113,45 @@ for tier in ${TIERS//,/ }; do
 done
 log_ok "All required binaries present for tiers: $TIERS"
 
+# ── Remote sender pre-flight (skip if --local-sender) ────────────────────────
+if [[ -n "$SENDER_SSH" ]]; then
+    log "Verifying keyless SSH to $SENDER_SSH..."
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$SENDER_SSH" "true" 2>/dev/null; then
+        log_err "SSH to $SENDER_SSH failed (BatchMode — no password prompts)"
+        log_err "  Set up keyless auth once: ssh-copy-id $SENDER_SSH"
+        exit 1
+    fi
+    log_ok "SSH OK"
+
+    log "Checking remote data_source binary..."
+    EXPANDED_BIN=$(ssh "$SENDER_SSH" "echo $SENDER_BIN")
+    if ! ssh "$SENDER_SSH" "test -x $EXPANDED_BIN" 2>/dev/null; then
+        log_err "Remote sender not found at $EXPANDED_BIN"
+        log_err "  On $SENDER_SSH run: cd ~/$SENDER_REMOTE_DIR && make data_source"
+        exit 1
+    fi
+    log_ok "Remote data_source: $EXPANDED_BIN"
+
+    log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
+    if ! ssh "$SENDER_SSH" "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
+        log_err "lxcpu2 host cannot SSH to its DPU ARM ($DPU_USER@$DPU_IP)"
+        log_err "  On $SENDER_SSH: ssh-copy-id ${DPU_USER}@${DPU_IP}"
+        exit 1
+    fi
+    log_ok "lxcpu2 → DPU ARM SSH OK"
+
+    log "Checking dpu_relay on DPU ARM..."
+    if ! ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'test -x $DPU_RELAY_PATH'" 2>/dev/null; then
+        log_err "dpu_relay missing on DPU ARM at $DPU_RELAY_PATH"
+        log_err "  On $SENDER_SSH: cd ~/$SENDER_REMOTE_DIR && make dpu_relay_dpu && \\"
+        log_err "    scp bin/dpu_relay_dpu ${DPU_USER}@${DPU_IP}:$DPU_RELAY_PATH"
+        exit 1
+    fi
+    log_ok "dpu_relay binary present on DPU ARM"
+else
+    log "--local-sender: spawning data_source on this host (loopback, T1 only)"
+fi
+
 # ── Tick CSV ─────────────────────────────────────────────────────────────────
 if [[ ! -s "$CSV_PATH" || $REGEN_CSV -eq 1 ]]; then
     log "Generating tick CSV: $CSV_ROWS rows × $SYMBOLS symbols → $CSV_PATH"
@@ -103,6 +160,21 @@ if [[ ! -s "$CSV_PATH" || $REGEN_CSV -eq 1 ]]; then
 else
     rows=$(wc -l < "$CSV_PATH")
     log_ok "Reusing existing $CSV_PATH ($((rows-1)) rows). Use --regen-csv to refresh."
+fi
+
+# scp the CSV to lxcpu2 host so its data_source can replay it
+if [[ -n "$SENDER_SSH" ]]; then
+    EXPANDED_CSV=$(ssh "$SENDER_SSH" "echo $SENDER_CSV")
+    LOCAL_HASH=$(sha256sum "$CSV_PATH" | awk '{print $1}')
+    REMOTE_HASH=$(ssh "$SENDER_SSH" "test -f $EXPANDED_CSV && sha256sum $EXPANDED_CSV | awk '{print \$1}'" 2>/dev/null || echo "")
+    if [[ "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
+        log "Copying tick CSV → $SENDER_SSH:$EXPANDED_CSV"
+        ssh "$SENDER_SSH" "mkdir -p $(dirname "$EXPANDED_CSV")"
+        scp -q "$CSV_PATH" "$SENDER_SSH:$EXPANDED_CSV"
+        log_ok "CSV synced"
+    else
+        log_ok "Remote CSV up to date (sha256 matches)"
+    fi
 fi
 
 # ── Output path ──────────────────────────────────────────────────────────────
@@ -134,6 +206,22 @@ ${C}═════════════════════════�
 
 EOF
 
+# ── Start dpu_relay on lxcpu2 DPU ARM (via lxcpu2 host) ──────────────────────
+if [[ -n "$SENDER_SSH" ]]; then
+    log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
+    ssh "$SENDER_SSH" \
+        "ssh ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null; sleep 0.3; \
+         nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
+              > /tmp/dpu_relay.log 2>&1 &'" 2>/dev/null
+    sleep 1
+    if ! ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
+        log_err "dpu_relay failed to bind port $RELAY_PORT on DPU ARM"
+        ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
+        exit 1
+    fi
+    log_ok "dpu_relay listening on $DPU_IP:$RELAY_PORT"
+fi
+
 # ── Cleanup trap ─────────────────────────────────────────────────────────────
 HARNESS_PID=""
 cleanup() {
@@ -147,12 +235,26 @@ cleanup() {
     pkill -f bin/rdma_receiver 2>/dev/null || true
     pkill -f bin/gpu_receiver  2>/dev/null || true
     pkill -f bin/data_source   2>/dev/null || true
+    if [[ -n "$SENDER_SSH" ]]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=3 "$SENDER_SSH" \
+            "pkill -f data_source 2>/dev/null; \
+             ssh ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null; true'" \
+            >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup INT TERM EXIT
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 log "Starting harness — Ctrl+C to abort"
 echo ""
+
+SENDER_ARGS=()
+if [[ -n "$SENDER_SSH" ]]; then
+    SENDER_ARGS+=(--sender-ssh  "$SENDER_SSH")
+    SENDER_ARGS+=(--sender-bin  "$SENDER_BIN")
+    SENDER_ARGS+=(--sender-csv  "$SENDER_CSV")
+    SENDER_ARGS+=(--sender-dest "$SENDER_DEST")
+fi
 
 "$HARNESS" \
     --csv-dir  "$(dirname "$CSV_PATH")" \
@@ -162,7 +264,8 @@ echo ""
     --reps     "$REPS" \
     --warmup   "$WARMUP" \
     --duration "$DURATION" \
-    $IFACE_ARG &
+    $IFACE_ARG \
+    "${SENDER_ARGS[@]}" &
 HARNESS_PID=$!
 wait "$HARNESS_PID"
 HARNESS_PID=""

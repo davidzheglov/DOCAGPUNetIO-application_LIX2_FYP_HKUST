@@ -91,6 +91,20 @@ static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
 static int         g_gpu_id    = 1;                   /* T4: CUDA device */
 static std::string g_mcast_iface;                     /* NIC IP for multicast output */
 
+/* ── Remote sender config (lxcpu2 host) ──────────────────────────────────── */
+/* When g_sender_ssh is non-empty, the harness drives the sender over SSH on
+ * the remote host (e.g. lxcpu2), unicasting to g_sender_dest (the DPU relay
+ * on tmfifo). The DPU relay is expected to be already running.
+ *
+ * When g_sender_ssh is empty, the harness falls back to spawning data_source
+ * locally (legacy same-host T1 loopback mode). */
+static std::string g_sender_ssh;          /* user@host for ssh; empty = local */
+static std::string g_sender_bin
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/bin/data_source";
+static std::string g_sender_csv
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/data/ticks.csv";
+static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
+
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
 {
@@ -148,6 +162,47 @@ static void kill_proc(pid_t pid)
     kill(pid, SIGTERM);
     int status;
     waitpid(pid, &status, 0);
+}
+
+/* ── Launch the sender on lxcpu2 over SSH ────────────────────────────────────
+ * Runs data_source in replay mode on the remote host, unicasting to the DPU
+ * relay (which fans it out as multicast onto the wire). Returns the local
+ * ssh-client pid; the actual remote process must also be killed via SSH on
+ * teardown (kill_remote_sender). */
+static pid_t launch_sender_ssh(long rate_hz)
+{
+    std::string remote_cmd =
+        "pkill -f data_source 2>/dev/null; sleep 0.2; "
+        + g_sender_bin
+        + " --mode replay"
+        + " --csv "  + g_sender_csv
+        + " --rate " + std::to_string(rate_hz)
+        + " --dest " + g_sender_dest;
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        execlp("ssh", "ssh",
+               "-o", "BatchMode=yes",
+               "-o", "ServerAliveInterval=10",
+               "-o", "StrictHostKeyChecking=accept-new",
+               g_sender_ssh.c_str(),
+               remote_cmd.c_str(),
+               (char *)nullptr);
+        perror("execlp ssh");
+        _exit(127);
+    }
+    return pid;
+}
+
+static void kill_remote_sender(void)
+{
+    if (g_sender_ssh.empty()) return;
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 "
+                    + g_sender_ssh
+                    + " 'pkill -f data_source 2>/dev/null; true'"
+                      " >/dev/null 2>&1";
+    (void)system(cmd.c_str());
 }
 
 /* ── UDP receiver socket for BenchmarkResult ─────────────────────────────── */
@@ -226,32 +281,42 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "\n[harness] RUN %d | tier=T%d | rate=%ld | rep=%d\n",
         run_id, tier, rate_hz, repetition);
 
-    /* Build data_source args */
-    std::vector<std::string> ds_args = {
-        "--mode", "replay",
-        "--csv",  csv_path,
-        "--rate", std::to_string(rate_hz)
-    };
-    /* For T2/T4: route multicast through the physical NIC */
-    if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
-        ds_args.push_back("--iface");
-        ds_args.push_back(g_mcast_iface);
-    }
-
-    /* Kill any leftover receivers/sources from a previous run */
+    /* Kill any leftover receivers locally; on remote host the SSH launcher
+     * will pkill data_source itself before starting the new one. */
     system("pkill -f bin/cpu_receiver  2>/dev/null; "
            "pkill -f bin/dpdk_receiver 2>/dev/null; "
            "pkill -f bin/rdma_receiver 2>/dev/null; "
            "pkill -f bin/gpu_receiver  2>/dev/null; "
-           "pkill -f bin/data_source   2>/dev/null; true");
-    usleep(300000);   /* wait for ports to be released */
+           "true");
+    if (g_sender_ssh.empty()) {
+        system("pkill -f bin/data_source 2>/dev/null; true");
+    } else {
+        kill_remote_sender();
+    }
+    usleep(300000);
 
-    /* Launch data_source */
-    pid_t ds_pid = launch("./bin/data_source", ds_args);
+    /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
+    pid_t ds_pid = -1;
+    if (!g_sender_ssh.empty()) {
+        fprintf(stderr, "[harness] launching remote sender on %s\n",
+                g_sender_ssh.c_str());
+        ds_pid = launch_sender_ssh(rate_hz);
+    } else {
+        std::vector<std::string> ds_args = {
+            "--mode", "replay",
+            "--csv",  csv_path,
+            "--rate", std::to_string(rate_hz)
+        };
+        if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
+            ds_args.push_back("--iface");
+            ds_args.push_back(g_mcast_iface);
+        }
+        ds_pid = launch("./bin/data_source", ds_args);
+    }
     if (ds_pid < 0) { fprintf(stderr, "Failed to launch data_source\n"); }
 
-    /* Brief pause for data_source to start */
-    usleep(200000);
+    /* Brief pause for data_source to start (longer for remote — SSH + pkill) */
+    usleep(g_sender_ssh.empty() ? 200000 : 800000);
 
     /* Launch receiver */
     std::vector<std::string> rx_args = receiver_args(tier);
@@ -319,8 +384,11 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     /* Kill subprocesses */
     kill_proc(rx_pid);
-    kill_proc(ds_pid);
-    usleep(100000);   /* allow ports to be released */
+    if (!g_sender_ssh.empty()) {
+        kill_remote_sender();   /* tells the remote machine to stop sending */
+    }
+    kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
+    usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
     double drop_rate = (n_ticks + n_dropped) > 0
@@ -386,6 +454,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--iface")   && i+1<argc) g_mcast_iface = argv[++i];
+        else if (!strcmp(argv[i],"--sender-ssh")  && i+1<argc) g_sender_ssh  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-bin")  && i+1<argc) g_sender_bin  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
     }
 
     /* Parse tier list */
