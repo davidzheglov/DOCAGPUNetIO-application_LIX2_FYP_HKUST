@@ -88,6 +88,8 @@ if [[ -t 1 ]]; then
 else
     C=""; OK=""; ERR=""; DIM=""; R=""
 fi
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
 log()    { printf "%s[bench]%s %s\n" "$C" "$R" "$*"; }
 log_ok() { printf "%s[bench]%s %s✓%s %s\n" "$C" "$R" "$OK" "$R" "$*"; }
 log_err(){ printf "%s[bench]%s %s✗%s %s\n" "$C" "$R" "$ERR" "$R" "$*" >&2; }
@@ -116,7 +118,7 @@ log_ok "All required binaries present for tiers: $TIERS"
 # ── Remote sender pre-flight (skip if --local-sender) ────────────────────────
 if [[ -n "$SENDER_SSH" ]]; then
     log "Verifying keyless SSH to $SENDER_SSH..."
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$SENDER_SSH" "true" 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" "true" 2>/dev/null; then
         log_err "SSH to $SENDER_SSH failed (BatchMode — no password prompts)"
         log_err "  Set up keyless auth once: ssh-copy-id $SENDER_SSH"
         exit 1
@@ -133,7 +135,8 @@ if [[ -n "$SENDER_SSH" ]]; then
     log_ok "Remote data_source: $EXPANDED_BIN"
 
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
-    if ! ssh "$SENDER_SSH" "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
         log_err "lxcpu2 host cannot SSH to its DPU ARM ($DPU_USER@$DPU_IP)"
         log_err "  On $SENDER_SSH: ssh-copy-id ${DPU_USER}@${DPU_IP}"
         exit 1
@@ -209,14 +212,18 @@ EOF
 # ── Start dpu_relay on lxcpu2 DPU ARM (via lxcpu2 host) ──────────────────────
 if [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
-    ssh "$SENDER_SSH" \
-        "ssh ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null; sleep 0.3; \
+    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -f dpu_relay 2>/dev/null || true; sleep 0.3; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
-              > /tmp/dpu_relay.log 2>&1 &'" 2>/dev/null
+              > /tmp/dpu_relay.log 2>&1 &'" ; then
+        log_err "relay launch command returned non-zero; checking DPU log and port anyway"
+    fi
     sleep 1
-    if ! ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
+    if ! ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
         log_err "dpu_relay failed to bind port $RELAY_PORT on DPU ARM"
-        ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
+        ssh "${SSH_OPTS[@]}" "$SENDER_SSH" \
+            "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
         exit 1
     fi
     log_ok "dpu_relay listening on $DPU_IP:$RELAY_PORT"
