@@ -90,6 +90,7 @@ static std::string g_gpu_pcie  = "00000000:AC:00.0"; /* T4: GPU 1 PCIe */
 static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
 static int         g_gpu_id    = 1;                   /* T4: CUDA device */
 static std::string g_mcast_iface;                     /* NIC IP for multicast output */
+static std::string g_receiver_iface;                  /* T1 CPU receiver iface name */
 
 /* ── Remote sender config (lxcpu2 host) ──────────────────────────────────── */
 /* When g_sender_ssh is non-empty, the harness drives the sender over SSH on
@@ -123,6 +124,11 @@ static std::vector<std::string> receiver_args(int tier)
 
     args.push_back("--tier");
     args.push_back(std::to_string(tier));
+
+    if (tier == 1 && !g_receiver_iface.empty()) {
+        args.push_back("--iface");
+        args.push_back(g_receiver_iface);
+    }
 
     if (tier == 4 || tier == 5) {
         args.push_back("--gpu");
@@ -454,6 +460,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--iface")   && i+1<argc) g_mcast_iface = argv[++i];
+        else if (!strcmp(argv[i],"--receiver-iface") && i+1<argc) g_receiver_iface = argv[++i];
         else if (!strcmp(argv[i],"--sender-ssh")  && i+1<argc) g_sender_ssh  = argv[++i];
         else if (!strcmp(argv[i],"--sender-bin")  && i+1<argc) g_sender_bin  = argv[++i];
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];

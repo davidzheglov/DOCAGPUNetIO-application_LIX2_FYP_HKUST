@@ -17,6 +17,7 @@
 #    ./scripts/run_benchmark.sh --tiers 1,4 --quick                # smoke test
 #    ./scripts/run_benchmark.sh --rates 100000,500000,1000000      # custom rates
 #    ./scripts/run_benchmark.sh --duration 60 --warmup 10
+#    ./scripts/run_benchmark.sh --receiver-iface ens21f0np0
 #    ./scripts/run_benchmark.sh --symbols 64 --csv-rows 2000000    # bigger stress
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -36,7 +37,8 @@ SYMBOLS=32
 CSV_PATH="data/ticks.csv"
 REGEN_CSV=0
 QUICK=0
-IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for T2/T4 mcast egress)
+IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for sender/DPU mcast egress)
+RECEIVER_IFACE_ARG=""  # forwarded as --receiver-iface to harness (T1 CPU receiver iface name)
 
 # ── Remote sender (lxcpu2 host) — set to empty to use local sender ──────────
 SENDER_SSH="${SENDER_SSH:-lix2@lxcpu2.cse.ust.hk}"
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --csv)          CSV_PATH="$2"; shift 2 ;;
         --regen-csv)    REGEN_CSV=1; shift ;;
         --iface)        IFACE_ARG="--iface $2"; shift 2 ;;
+        --receiver-iface) RECEIVER_IFACE_ARG="--receiver-iface $2"; shift 2 ;;
         --sender-ssh)   SENDER_SSH="$2"; shift 2 ;;
         --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
         --quick)        QUICK=1; shift ;;
@@ -272,6 +275,7 @@ fi
     --warmup   "$WARMUP" \
     --duration "$DURATION" \
     $IFACE_ARG \
+    $RECEIVER_IFACE_ARG \
     "${SENDER_ARGS[@]}" &
 HARNESS_PID=$!
 wait "$HARNESS_PID"
