@@ -292,6 +292,7 @@ __global__ void gpu_recv_process_kernel(
                 if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
+                    uint64_t t1 = clock64();
 
                     /* T2: tick is now in GPU memory */
                     uint64_t t2 = clock64();
@@ -347,7 +348,6 @@ __global__ void gpu_recv_process_kernel(
                      * 10 μs sleep giving the host-mapped writes time to
                      * drain. A proper 2-phase commit is tracked as a
                      * follow-up. */
-                    uint64_t t1 = clock64();
                     uint64_t ring_idx = atomicAdd(
                         reinterpret_cast<unsigned long long *>(
                             const_cast<uint64_t *>(ring_head)), 1ULL);
