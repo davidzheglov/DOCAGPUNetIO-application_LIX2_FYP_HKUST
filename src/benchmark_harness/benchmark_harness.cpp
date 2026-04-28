@@ -161,6 +161,39 @@ static pid_t launch(const char *binary,
     return pid;
 }
 
+static pid_t launch_receiver(int tier, const char *binary,
+                             const std::vector<std::string> &extra_args)
+{
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        std::vector<const char *> argv;
+
+        /* T2/T3/T4 need the same privilege model as their manual bring-up
+         * commands on lxcpu1. Preserve the caller's environment so CUDA/DOCA/
+         * DPDK library paths continue to work under sudo. */
+        bool need_sudo = (tier >= 2 && tier <= 5) && (geteuid() != 0);
+        if (need_sudo) {
+            argv.push_back("sudo");
+            argv.push_back("-E");
+        }
+
+        argv.push_back(binary);
+        for (const auto &a : extra_args) argv.push_back(a.c_str());
+        argv.push_back(nullptr);
+
+        if (need_sudo) {
+            execvp("sudo", const_cast<char *const *>(argv.data()));
+            perror("execvp sudo");
+        } else {
+            execv(binary, const_cast<char *const *>(argv.data()));
+            perror("execv");
+        }
+        _exit(1);
+    }
+    return pid;
+}
+
 /* ── Kill process tree ───────────────────────────────────────────────────── */
 static void kill_proc(pid_t pid)
 {
@@ -326,7 +359,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     /* Launch receiver */
     std::vector<std::string> rx_args = receiver_args(tier);
-    pid_t rx_pid = launch(receiver_binary(tier), rx_args);
+    pid_t rx_pid = launch_receiver(tier, receiver_binary(tier), rx_args);
     if (rx_pid < 0) {
         kill_proc(ds_pid);
         fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
