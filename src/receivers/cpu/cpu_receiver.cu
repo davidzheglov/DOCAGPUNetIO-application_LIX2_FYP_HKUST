@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -49,8 +50,12 @@ static volatile sig_atomic_t g_quit = 0;
 static void sig_handler(int) { g_quit = 1; }
 
 /* ── Configuration defaults ─────────────────────────────────────────────────── */
-#define DEFAULT_BATCH       256
-#define DEFAULT_TIER        1
+#define DEFAULT_BATCH                256
+#define DEFAULT_TIER                 1
+/* Maximum age of an in-progress batch before forced flush. Prevents low-rate
+ * runs from being dominated by batch-fill time (1ms == 1k ticks @ 1MHz, ~10
+ * ticks @ 10kHz). */
+#define DEFAULT_MAX_BATCH_LATENCY_NS 1000000ULL
 
 /* ── CUDA error check ───────────────────────────────────────────────────────── */
 #define CUDA_CHECK(call)                                                    \
@@ -193,6 +198,33 @@ static void gpu_free(GpuResources &r)
     cudaStreamDestroy(r.stream);
 }
 
+/* ── Batched UDP send (sendmmsg) ─────────────────────────────────────────────
+ * One syscall instead of N — at 1 MHz the per-tick sendto overhead would
+ * otherwise dominate the receiver's CPU budget. */
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
+{
+    if (n <= 0) return;
+    struct mmsghdr msgs[DEFAULT_BATCH];
+    struct iovec   iovs[DEFAULT_BATCH];
+    int sent = 0;
+    while (sent < n) {
+        int chunk = std::min(n - sent, DEFAULT_BATCH);
+        for (int i = 0; i < chunk; ++i) {
+            iovs[i].iov_base = const_cast<T *>(&items[sent + i]);
+            iovs[i].iov_len  = sizeof(T);
+            std::memset(&msgs[i], 0, sizeof(msgs[i]));
+            msgs[i].msg_hdr.msg_name    = &dest;
+            msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+            msgs[i].msg_hdr.msg_iov     = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen  = 1;
+        }
+        int rc = sendmmsg(fd, msgs, chunk, 0);
+        if (rc < 0) { perror("sendmmsg"); break; }
+        sent += rc;
+    }
+}
+
 /* ── Process a complete batch ────────────────────────────────────────────────── */
 static void process_batch(GpuResources &r, int n,
                            int harness_fd, sockaddr_in harness_dest,
@@ -237,33 +269,30 @@ static void process_batch(GpuResources &r, int n,
     /* T4: results readable on host */
     uint64_t t4 = now_ns();
 
-    /* Send BenchmarkResult + SignalResult for each tick */
+    /* Build send buffers in one pass, then sendmmsg both arrays — two
+     * syscalls total per batch instead of 2N. */
     nvtxRangePushA("batch_send");
+    BenchmarkResult brs[DEFAULT_BATCH];
+    SignalResult    sigs[DEFAULT_BATCH];
     for (int i = 0; i < n; ++i) {
         const TickMessage  &tick = r.h_ticks[i];
         const SignalResult &sig  = r.h_signals[i];
 
-        BenchmarkResult br{};
-        br.tick_id = tick.tick_id;
-        br.t1_ns   = tick.timestamp_ns;
-        br.t2_ns   = t2;
-        br.t3_ns   = t3;   /* host time after kernel sync — same for all ticks in batch */
-        br.t4_ns   = t4;   /* host time after D→H copy   — same for all ticks in batch */
-        br.tier    = tier;
-        br.dropped = 0;
+        brs[i] = BenchmarkResult{};
+        brs[i].tick_id = tick.tick_id;
+        brs[i].t1_ns   = tick.timestamp_ns;
+        brs[i].t2_ns   = t2;
+        brs[i].t3_ns   = t3;
+        brs[i].t4_ns   = t4;
+        brs[i].tier    = tier;
+        brs[i].dropped = 0;
 
-        sendto(harness_fd, &br, sizeof(br), 0,
-               reinterpret_cast<const sockaddr *>(&harness_dest),
-               sizeof(harness_dest));
-
-        /* Forward SignalResult to fill simulator */
-        SignalResult out = sig;
-        out.t3_ns = t3;
-        out.t4_ns = t4;
-        sendto(signal_fd, &out, sizeof(out), 0,
-               reinterpret_cast<const sockaddr *>(&signal_dest),
-               sizeof(signal_dest));
+        sigs[i] = sig;
+        sigs[i].t3_ns = t3;
+        sigs[i].t4_ns = t4;
     }
+    send_many(harness_fd, harness_dest, brs,  n);
+    send_many(signal_fd,  signal_dest,  sigs, n);
     nvtxRangePop();  /* batch_send */
 
     nvtxRangePop();  /* batch */
@@ -335,12 +364,15 @@ int main(int argc, char **argv)
     cudaProfilerStart();
     nvtxRangePushA("steady_state");
 
+    uint64_t batch_start_ns  = 0;        /* when first tick of current batch landed */
+    uint64_t last_report_ns  = 0;
     while (!g_quit) {
         ssize_t n = recvfrom(recv_fd,
                               &gpu.h_ticks[batch_n], sizeof(TickMessage),
                               0, nullptr, nullptr);
 
         if (n == sizeof(TickMessage)) {
+            if (batch_n == 0) batch_start_ns = now_ns();
             ++batch_n;
             ++total_recv;
 
@@ -349,23 +381,32 @@ int main(int argc, char **argv)
                         gpu.h_ticks[0].tick_id);
         }
 
-        /* Flush when batch is full OR timeout with partial batch */
-        bool batch_full = (batch_n >= batch_size);
-        bool timeout_flush = (n != sizeof(TickMessage) && batch_n > 0);
+        /* Flush conditions: full batch, partial after recv timeout, or
+         * batch has been accumulating too long (caps low-rate latency). */
+        bool batch_full   = (batch_n >= batch_size);
+        bool recv_timeout = (n != sizeof(TickMessage) && batch_n > 0);
+        bool age_flush    = (batch_n > 0 &&
+                             (now_ns() - batch_start_ns) >= DEFAULT_MAX_BATCH_LATENCY_NS);
 
-        if (batch_full || timeout_flush) {
+        if (batch_full || recv_timeout || age_flush) {
             process_batch(gpu, batch_n,
                           harness_fd, harness_dest,
                           signal_fd,  signal_dest,
                           tier);
             ++total_batches;
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - start_time).count();
-            fprintf(stderr, "[T1] batch %llu: processed %d ticks%s (total recv=%llu, %.0f ticks/s)\n",
+            uint64_t now_n = now_ns();
+            /* Rate-limit: log first 5 batches then once per second */
+            if (total_batches <= 5 || now_n - last_report_ns >= 1000000000ULL) {
+                double total_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start_time).count();
+                fprintf(stderr,
+                    "[T1] batch %llu: %d ticks%s (total=%llu, %.0f t/s)\n",
                     (unsigned long long)total_batches, batch_n,
-                    timeout_flush ? " (partial flush)" : "",
+                    recv_timeout ? " [timeout]" : age_flush ? " [age]" : "",
                     (unsigned long long)total_recv,
-                    total_recv / elapsed);
+                    total_recv / total_elapsed);
+                last_report_ns = now_n;
+            }
             batch_n = 0;
         }
     }
