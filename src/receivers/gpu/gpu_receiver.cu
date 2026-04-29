@@ -73,7 +73,8 @@
 #define MAX_PKT_NUM        2048
 #define MAX_PKT_SIZE       2048
 #define ETH_IP_UDP_HDR     42       /* 14 + 20 + 8 */
-#define RESULT_QUEUE_DEPTH 4096
+#define RESULT_QUEUE_DEPTH 65536
+#define SEND_BATCH         256
 #define MAX_RX_TIMEOUT_NS  10000000ULL  /* 10ms timeout */
 
 #define CUDA_CHECK(call) \
@@ -502,6 +503,7 @@ static uint64_t cyc_to_wall_ns(uint64_t cyc,
 static void cpu_forward_thread(ForwardCtx *ctx)
 {
     uint64_t fwd_count = 0;
+    uint64_t ring_overflow_drop = 0;
     uint64_t last_report = 0;
     auto start_time = std::chrono::steady_clock::now();
 
@@ -524,8 +526,20 @@ static void cpu_forward_thread(ForwardCtx *ctx)
         }
 
         if (ctx->ring->tail < head) {
+            if (head - ctx->ring->tail > ctx->ring->depth) {
+                uint64_t lost = (head - ctx->ring->tail) - ctx->ring->depth;
+                ring_overflow_drop += lost;
+                ctx->ring->tail = head - ctx->ring->depth;
+                fprintf(stderr,
+                        "[CPU-FWD] ring overflow: dropped %llu stale results "
+                        "(total=%llu)\n",
+                        (unsigned long long)lost,
+                        (unsigned long long)ring_overflow_drop);
+            }
             nvtxRangePushA("forward_batch");
-            uint64_t batch_n = head - ctx->ring->tail;
+            BenchmarkResult bench_batch[SEND_BATCH];
+            SignalResult sig_batch[SEND_BATCH];
+            int out_n = 0;
             while (ctx->ring->tail < head) {
                 uint64_t idx = ctx->ring->tail % ctx->ring->depth;
                 ResultSlot *rs = &ctx->ring->slots[idx];
@@ -553,33 +567,34 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                                            ctx->ns_per_cyc);
                 sig.t3_ns = br.t3_ns;
                 sig.t4_ns = br.t4_ns;
-
-                nvtxRangePushA("sendto_pair");
-                ssize_t s1 = sendto(ctx->harness_fd, &br, sizeof(br), 0,
-                       reinterpret_cast<const sockaddr *>(&ctx->harness_dest),
-                       sizeof(ctx->harness_dest));
-                ssize_t s2 = sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
-                       reinterpret_cast<const sockaddr *>(&ctx->signal_dest),
-                       sizeof(ctx->signal_dest));
-                nvtxRangePop();
-
+                bench_batch[out_n] = br;
+                sig_batch[out_n] = sig;
+                ++out_n;
                 fwd_count++;
                 if (fwd_count <= 5 || fwd_count % 500 == 0) {
-                    fprintf(stderr, "[CPU-FWD] #%llu: tick=%u sendto=%zd/%zd\n",
-                            (unsigned long long)fwd_count, br.tick_id, s1, s2);
+                    fprintf(stderr, "[CPU-FWD] #%llu: tick=%u queued_for_send\n",
+                            (unsigned long long)fwd_count, br.tick_id);
                 }
 
                 ++ctx->ring->tail;
+
+                if (out_n >= SEND_BATCH || ctx->ring->tail >= head) {
+                    nvtxRangePushA("sendto_pair");
+                    send_many(ctx->harness_fd, ctx->harness_dest, bench_batch, out_n);
+                    send_many(ctx->signal_fd,  ctx->signal_dest,  sig_batch,   out_n);
+                    nvtxRangePop();
+                    out_n = 0;
+                }
             }
             nvtxMarkA("batch_done");
-            (void)batch_n;
             nvtxRangePop();
         }
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
 
-    fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu\n",
-            (unsigned long long)fwd_count);
+    fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu ring_overflow_drops=%llu\n",
+            (unsigned long long)fwd_count,
+            (unsigned long long)ring_overflow_drop);
 }
 
 /* ── DOCA host-side initialisation (DOCA 3.x API) ─────────────────────── */
@@ -898,6 +913,30 @@ static int make_udp_send(const char *addr, int port, sockaddr_in &dest)
     dest.sin_port        = htons((uint16_t)port);
     dest.sin_addr.s_addr = inet_addr(addr);
     return fd;
+}
+
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
+{
+    if (n <= 0) return;
+    struct mmsghdr msgs[SEND_BATCH];
+    struct iovec   iovs[SEND_BATCH];
+    int sent = 0;
+    while (sent < n) {
+        int chunk = std::min(n - sent, SEND_BATCH);
+        for (int i = 0; i < chunk; ++i) {
+            iovs[i].iov_base = const_cast<T *>(&items[sent + i]);
+            iovs[i].iov_len  = sizeof(T);
+            std::memset(&msgs[i], 0, sizeof(msgs[i]));
+            msgs[i].msg_hdr.msg_name    = &dest;
+            msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+            msgs[i].msg_hdr.msg_iov     = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen  = 1;
+        }
+        int rc = sendmmsg(fd, msgs, chunk, 0);
+        if (rc < 0) { perror("sendmmsg"); break; }
+        sent += rc;
+    }
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
