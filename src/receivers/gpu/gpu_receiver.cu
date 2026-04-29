@@ -121,6 +121,50 @@ __device__ static double rsi_cas(double *slot, double sample, double alpha)
     return new_val;
 }
 
+/* ── Per-tick Monte Carlo VaR forecast ────────────────────────────────────
+ * Identical to process_kernel.cuh::compute_risk_mc — duplicated here because
+ * gpu_receiver.cu has its own inline ema_cas/rsi_cas that would collide with
+ * a #include of process_kernel.cuh. Keep this in sync if you change the math
+ * (or refactor both into a shared gpu_helpers.cuh). */
+__device__ static void compute_risk_mc(
+    double mid, double recent_vol_deviation, uint32_t seed,
+    double &var_95, double &cvar_95,
+    double &mc_mean, double &mc_std)
+{
+    const double sigma   = MC_BASE_VOL * (1.0 + recent_vol_deviation);
+    const double sqrt_dt = sqrt(MC_DT);
+    const double drift   = -0.5 * sigma * sigma * MC_DT;
+    const double diff    =  sigma * sqrt_dt;
+    const double TWO_PI  = 6.28318530717958647692;
+
+    double sum   = 0.0;
+    double sumsq = 0.0;
+
+    uint32_t rng = seed | 1u;
+
+    #pragma unroll 8
+    for (int p = 0; p < MC_N_PATHS; ++p) {
+        double S = mid;
+        for (int s = 0; s < MC_N_STEPS; ++s) {
+            rng = rng * 1664525u + 1013904223u;
+            double u1 = ((double)rng + 1.0) * (1.0 / 4294967297.0);
+            rng = rng * 1664525u + 1013904223u;
+            double u2 =  (double)rng        * (1.0 / 4294967296.0);
+            double z  = sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2);
+            S = S * exp(drift + diff * z);
+        }
+        sum   += S;
+        sumsq += S * S;
+    }
+
+    const double n  = (double)MC_N_PATHS;
+    mc_mean        = sum / n;
+    double var_pop = sumsq / n - mc_mean * mc_mean;
+    mc_std         = sqrt(fmax(var_pop, 0.0));
+    var_95         = mc_mean - 1.6448536270 * mc_std;
+    cvar_95        = mc_mean - 2.0627128443 * mc_std;
+}
+
 /* ── GPU result ring (GPU -> CPU readback) ────────────────────────────────── */
 struct ResultSlot {
     BenchmarkResult bench;
@@ -348,6 +392,16 @@ __global__ void gpu_recv_process_kernel(
                     int8_t combined = 0;
                     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
+                    /* Heavy work — Monte Carlo VaR forecast (same kernel as T1-T3). */
+                    double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
+                    double vol_dev    = fmin(rel_spread * 50.0, 4.0);
+                    uint32_t seed = (uint32_t)(tick->tick_id * 2654435761u
+                                              ^ ((uint32_t)inst * 0x9E3779B1u)
+                                              ^ (uint32_t)t2);
+                    double var_95, cvar_95, mc_mean, mc_std;
+                    compute_risk_mc(mid, vol_dev, seed,
+                                    var_95, cvar_95, mc_mean, mc_std);
+
                     /* T3: kernel done */
                     uint64_t t3 = clock64();
 
@@ -383,6 +437,10 @@ __global__ void gpu_recv_process_kernel(
                     rslot->signal.spread        = spread;
                     rslot->signal.fast_ema      = fast_ema;
                     rslot->signal.slow_ema      = slow_ema;
+                    rslot->signal.var_95        = var_95;
+                    rslot->signal.cvar_95       = cvar_95;
+                    rslot->signal.mc_mean       = mc_mean;
+                    rslot->signal.mc_std        = mc_std;
 
                     __threadfence_system();
                     uint64_t t4 = clock64();

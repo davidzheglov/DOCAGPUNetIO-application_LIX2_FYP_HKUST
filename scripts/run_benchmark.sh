@@ -82,7 +82,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $QUICK -eq 1 ]]; then
-    TIERS="1,4"
+    # All four tiers, two rates, single rep — covers the full receiver matrix
+    # in ~2 min so we catch tier-specific regressions before the long sweep.
+    TIERS="1,2,3,4"
     RATES="50000,500000"
     REPS=1
     DURATION=10
