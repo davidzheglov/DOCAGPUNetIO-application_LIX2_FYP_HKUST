@@ -48,6 +48,8 @@
 #include "signal_result.h"
 #include "process_kernel.cuh"
 
+static bool g_light_bench = false;
+
 /* ── Constants ───────────────────────────────────────────────────────────── */
 #define DEFAULT_BATCH                256
 #define MAX_RECV_WR                  512    /* pre-posted receive work requests */
@@ -330,7 +332,7 @@ static void process_rdma_batch(GpuRdmaResources &gpu,
                           gpu.d_signals,
                           gpu.d_fast_ema, gpu.d_slow_ema,
                           gpu.d_avg_gain, gpu.d_avg_loss, gpu.d_last_mid,
-                          t2, gpu.stream);
+                          t2, gpu.stream, g_light_bench);
     CUDA_CHECK(cudaStreamSynchronize(gpu.stream));
     uint64_t t3 = now_ns();
 
@@ -382,10 +384,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier        = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip  = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip  = argv[++i];
+        else if (!strcmp(argv[i],"--light-bench"))          g_light_bench = true;
     }
 
     fprintf(stderr, "[T3 rdma_receiver] ib_dev=%s port=%d batch=%d tier=%d\n",
             ib_dev_name, port_num, batch_size, tier);
+    if (g_light_bench)
+        fprintf(stderr, "[T3] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     GpuRdmaResources gpu{};
     gpu_init(gpu, batch_size);

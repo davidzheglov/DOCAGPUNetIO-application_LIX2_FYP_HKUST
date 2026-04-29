@@ -153,7 +153,8 @@ __global__ void process_ticks_kernel(
     double             * __restrict__ d_avg_gain,
     double             * __restrict__ d_avg_loss,
     double             * __restrict__ d_last_mid,
-    uint64_t                         t2_ns)      /* batch arrival time, T1-T3 */
+    uint64_t                         t2_ns,      /* batch arrival time, T1-T3 */
+    int                              light_mode)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_ticks) return;
@@ -220,19 +221,20 @@ __global__ void process_ticks_kernel(
     int8_t combined = 0;
     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
-    /* ── Heavy work: per-tick Monte Carlo VaR forecast ──────────────── */
-    /* Vol deviation input: relative spread (proxy for short-term volatility). */
-    double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
-    double vol_dev    = fmin(rel_spread * 50.0, 4.0);     /* clamp */
-    /* Per-tick deterministic seed — combines tick id and t2 so sequential
-     * benchmark runs are reproducible without accidentally aliasing across
-     * instruments. */
-    uint32_t seed = (uint32_t)(tick.tick_id * 2654435761u
-                              ^ ((uint32_t)inst * 0x9E3779B1u)
-                              ^ (uint32_t)t2_ns);
-    double var_95, cvar_95, mc_mean, mc_std;
-    compute_risk_mc(mid, vol_dev, seed,
-                    var_95, cvar_95, mc_mean, mc_std);
+    double var_95 = mid;
+    double cvar_95 = mid;
+    double mc_mean = mid;
+    double mc_std = 0.0;
+    if (!light_mode) {
+        /* ── Heavy work: per-tick Monte Carlo VaR forecast ──────────── */
+        double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
+        double vol_dev    = fmin(rel_spread * 50.0, 4.0);
+        uint32_t seed = (uint32_t)(tick.tick_id * 2654435761u
+                                  ^ ((uint32_t)inst * 0x9E3779B1u)
+                                  ^ (uint32_t)t2_ns);
+        compute_risk_mc(mid, vol_dev, seed,
+                        var_95, cvar_95, mc_mean, mc_std);
+    }
 
     /* ── Stamp T3 (GPU clock, converted to wall-clock ns by harness) ── */
     uint64_t t3 = clock64();
@@ -278,7 +280,8 @@ extern "C" void launch_process_ticks(
     double             *d_avg_loss,
     double             *d_last_mid,
     uint64_t            t2_ns,
-    cudaStream_t        stream)
+    cudaStream_t        stream,
+    bool                light_mode)
 {
     if (n_ticks <= 0) return;
     int threads = 256;
@@ -286,5 +289,5 @@ extern "C" void launch_process_ticks(
     process_ticks_kernel<<<blocks, threads, 0, stream>>>(
         d_ticks, n_ticks, d_signals,
         d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
-        t2_ns);
+        t2_ns, light_mode ? 1 : 0);
 }

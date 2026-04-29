@@ -227,7 +227,8 @@ __global__ void gpu_recv_process_kernel(
     volatile uint64_t       *ring_head,
     uint32_t                 ring_depth,
     uint8_t                  tier,
-    int                      use_nic_t1)
+    int                      use_nic_t1,
+    int                      light_mode)
 {
     const int tid = threadIdx.x;
 
@@ -388,15 +389,16 @@ __global__ void gpu_recv_process_kernel(
                     int8_t combined = 0;
                     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
-                    /* Heavy work — Monte Carlo VaR forecast (same kernel as T1-T3). */
-                    double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
-                    double vol_dev    = fmin(rel_spread * 50.0, 4.0);
-                    uint32_t seed = (uint32_t)(tick->tick_id * 2654435761u
-                                              ^ ((uint32_t)inst * 0x9E3779B1u)
-                                              ^ (uint32_t)t2);
-                    double var_95, cvar_95, mc_mean, mc_std;
-                    compute_risk_mc(mid, vol_dev, seed,
-                                    var_95, cvar_95, mc_mean, mc_std);
+                    double var_95 = mid, cvar_95 = mid, mc_mean = mid, mc_std = 0.0;
+                    if (!light_mode) {
+                        double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
+                        double vol_dev    = fmin(rel_spread * 50.0, 4.0);
+                        uint32_t seed = (uint32_t)(tick->tick_id * 2654435761u
+                                                  ^ ((uint32_t)inst * 0x9E3779B1u)
+                                                  ^ (uint32_t)t2);
+                        compute_risk_mc(mid, vol_dev, seed,
+                                        var_95, cvar_95, mc_mean, mc_std);
+                    }
 
                     /* T3: kernel done */
                     uint64_t t3 = clock64();
@@ -614,6 +616,7 @@ struct DocaContext {
 };
 
 static bool g_use_nic_t1 = false;
+static bool g_light_bench = false;
 
 static size_t get_page_size(void)
 {
@@ -963,10 +966,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip   = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
         else if (!strcmp(argv[i],"--nic-t1"))                     g_use_nic_t1 = true;
+        else if (!strcmp(argv[i],"--light-bench"))                g_light_bench = true;
     }
 
     fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
             tier, cuda_device, gpu_pcie, nic_pcie);
+    if (g_light_bench)
+        fprintf(stderr, "[T4/T5] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -1088,7 +1094,8 @@ int main(int argc, char **argv)
         d_ring_head,
         ring.depth,
         tier,
-        g_use_nic_t1 ? 1 : 0);
+        g_use_nic_t1 ? 1 : 0,
+        g_light_bench ? 1 : 0);
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;

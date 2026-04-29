@@ -113,6 +113,7 @@ static std::string g_sender_csv
     = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/data/ticks.csv";
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
 static std::string g_sender_control_path; /* optional shared SSH control socket */
+static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
@@ -137,6 +138,9 @@ static std::vector<std::string> receiver_args(int tier)
 
     args.push_back("--tier");
     args.push_back(std::to_string(tier));
+
+    if (g_light_bench)
+        args.push_back("--light-bench");
 
     if (tier == 1 && !g_receiver_iface.empty()) {
         args.push_back("--iface");
@@ -556,6 +560,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
         else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
         else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
+        else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 
     /* Parse tier list */

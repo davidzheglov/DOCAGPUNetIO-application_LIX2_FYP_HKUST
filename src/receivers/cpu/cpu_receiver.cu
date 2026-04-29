@@ -55,6 +55,7 @@
  * nsys capture before the process dies. */
 static volatile sig_atomic_t g_quit = 0;
 static void sig_handler(int) { g_quit = 1; }
+static bool g_light_bench = false;
 
 static inline uint64_t timespec_to_ns(const struct timespec &ts)
 {
@@ -350,7 +351,7 @@ static void process_batch(GpuResources &r, int n,
     launch_process_ticks(r.d_ticks, n, r.d_signals,
                           r.d_fast_ema, r.d_slow_ema,
                           r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
-                          t2, r.stream);
+                          t2, r.stream, g_light_bench);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
     nvtxRangePop();
 
@@ -416,11 +417,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--harness") && i+1<argc) harness_addr = argv[++i];
         else if (!strcmp(argv[i], "--fillsim") && i+1<argc) fillsim_addr = argv[++i];
         else if (!strcmp(argv[i], "--iface")   && i+1<argc) iface_name   = argv[++i];
+        else if (!strcmp(argv[i], "--light-bench"))         g_light_bench = true;
     }
 
     fprintf(stderr, "[T1 cpu_receiver] mcast=%s:%d batch=%d tier=%d iface=%s\n",
             mcast_addr, mcast_port, batch_size, tier,
             iface_name ? iface_name : "INADDR_ANY");
+    if (g_light_bench)
+        fprintf(stderr, "[T1] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     /* Clean shutdown: SIGINT/SIGTERM set g_quit so cudaProfilerStop() gets
      * called and the nsys capture-range is closed cleanly. Without this, Ctrl-C

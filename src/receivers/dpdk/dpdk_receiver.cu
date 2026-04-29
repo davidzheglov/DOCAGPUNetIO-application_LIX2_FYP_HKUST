@@ -48,6 +48,8 @@
 #include "signal_result.h"
 #include "process_kernel.cuh"
 
+static bool g_light_bench = false;
+
 /* ── Constants ───────────────────────────────────────────────────────────── */
 #define RX_RING_SIZE   1024
 #define NUM_MBUFS      8191
@@ -229,7 +231,7 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
     launch_process_ticks(r.d_ticks, n, r.d_signals,
                           r.d_fast_ema, r.d_slow_ema,
                           r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
-                          t2, r.stream);
+                          t2, r.stream, g_light_bench);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
     uint64_t t3 = now_ns();
 
@@ -282,9 +284,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier       = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip = argv[++i];
+        else if (!strcmp(argv[i],"--light-bench"))          g_light_bench = true;
     }
 
     fprintf(stderr, "[T2 dpdk_receiver] dpdk_port=%u batch=%d\n", dpdk_port, batch_size);
+    if (g_light_bench)
+        fprintf(stderr, "[T2] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     uint16_t nb_ports = rte_eth_dev_count_avail();
     fprintf(stderr, "[T2] DPDK ports available: %u\n", nb_ports);
