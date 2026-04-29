@@ -148,6 +148,7 @@ __global__ void process_ticks_kernel(
     const TickMessage * __restrict__ ticks,
     int                              n_ticks,
     SignalResult       * __restrict__ signals,
+    uint64_t           * __restrict__ compute_start_cycles,
     double             * __restrict__ d_fast_ema,
     double             * __restrict__ d_slow_ema,
     double             * __restrict__ d_avg_gain,
@@ -221,6 +222,9 @@ __global__ void process_ticks_kernel(
     int8_t combined = 0;
     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
+    uint64_t compute_start = clock64();
+    if (compute_start_cycles) compute_start_cycles[idx] = compute_start;
+
     double var_95 = mid;
     double cvar_95 = mid;
     double mc_mean = mid;
@@ -274,6 +278,7 @@ extern "C" void launch_process_ticks(
     const TickMessage *d_ticks,
     int                n_ticks,
     SignalResult       *d_signals,
+    uint64_t           *d_compute_start_cycles,
     double             *d_fast_ema,
     double             *d_slow_ema,
     double             *d_avg_gain,
@@ -287,7 +292,7 @@ extern "C" void launch_process_ticks(
     int threads = 256;
     int blocks  = (n_ticks + threads - 1) / threads;
     process_ticks_kernel<<<blocks, threads, 0, stream>>>(
-        d_ticks, n_ticks, d_signals,
+        d_ticks, n_ticks, d_signals, d_compute_start_cycles,
         d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
         t2_ns, light_mode ? 1 : 0);
 }

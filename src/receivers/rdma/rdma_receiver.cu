@@ -67,6 +67,7 @@ struct GpuRdmaResources {
     uint8_t          *d_pkt_bufs   = nullptr;    /* [MAX_RECV_WR * PKT_BUF_SIZE] */
     TickMessage      *d_ticks      = nullptr;
     SignalResult     *d_signals    = nullptr;
+    uint64_t         *d_compute_start = nullptr;
     double           *d_fast_ema   = nullptr;
     double           *d_slow_ema   = nullptr;
     double           *d_avg_gain   = nullptr;
@@ -75,10 +76,17 @@ struct GpuRdmaResources {
 
     SignalResult     *h_signals    = nullptr;
     TickMessage      *h_ticks_copy = nullptr;
+    uint64_t         *h_compute_start = nullptr;
 
     cudaStream_t      stream       = nullptr;
     int               batch_size   = DEFAULT_BATCH;
+    double            ns_per_cycle = 0.0;
 };
+
+static inline uint64_t gpu_cycles_to_ns(uint64_t cycles, double ns_per_cycle)
+{
+    return (uint64_t)((double)cycles * ns_per_cycle);
+}
 
 /* ── ibverbs state ───────────────────────────────────────────────────────── */
 struct IbvState {
@@ -242,6 +250,7 @@ static void gpu_init(GpuRdmaResources &r, int batch_size)
 
     CUDA_CHECK(cudaMalloc(&r.d_ticks,   batch_size * sizeof(TickMessage)));
     CUDA_CHECK(cudaMalloc(&r.d_signals, batch_size * sizeof(SignalResult)));
+    CUDA_CHECK(cudaMalloc(&r.d_compute_start, batch_size * sizeof(uint64_t)));
     size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
     CUDA_CHECK(cudaMalloc(&r.d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_fast_ema, 0, state_sz));
     CUDA_CHECK(cudaMalloc(&r.d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_slow_ema, 0, state_sz));
@@ -251,8 +260,12 @@ static void gpu_init(GpuRdmaResources &r, int batch_size)
 
     CUDA_CHECK(cudaMallocHost(&r.h_signals,    batch_size * sizeof(SignalResult)));
     CUDA_CHECK(cudaMallocHost(&r.h_ticks_copy, batch_size * sizeof(TickMessage)));
+    CUDA_CHECK(cudaMallocHost(&r.h_compute_start, batch_size * sizeof(uint64_t)));
 
     CUDA_CHECK(cudaStreamCreate(&r.stream));
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
+    r.ns_per_cycle = 1000000.0 / (double)clock_khz;
 }
 
 /* ── extract_ticks_kernel: parse raw Ethernet frames into TickMessage ────── */
@@ -329,7 +342,7 @@ static void process_rdma_batch(GpuRdmaResources &gpu,
     extract_ticks_kernel<<<blk, 256, 0, gpu.stream>>>(
         gpu.d_pkt_bufs, d_slots, batch_n, gpu.d_ticks);
     launch_process_ticks(gpu.d_ticks, batch_n,
-                          gpu.d_signals,
+                          gpu.d_signals, gpu.d_compute_start,
                           gpu.d_fast_ema, gpu.d_slow_ema,
                           gpu.d_avg_gain, gpu.d_avg_loss, gpu.d_last_mid,
                           t2, gpu.stream, g_light_bench);
@@ -338,6 +351,9 @@ static void process_rdma_batch(GpuRdmaResources &gpu,
 
     CUDA_CHECK(cudaMemcpyAsync(gpu.h_signals, gpu.d_signals,
                                 batch_n * sizeof(SignalResult),
+                                cudaMemcpyDeviceToHost, gpu.stream));
+    CUDA_CHECK(cudaMemcpyAsync(gpu.h_compute_start, gpu.d_compute_start,
+                                batch_n * sizeof(uint64_t),
                                 cudaMemcpyDeviceToHost, gpu.stream));
     CUDA_CHECK(cudaMemcpyAsync(gpu.h_ticks_copy, gpu.d_ticks,
                                 batch_n * sizeof(TickMessage),
@@ -357,6 +373,8 @@ static void process_rdma_batch(GpuRdmaResources &gpu,
         brs[i].t2_ns   = t2;
         brs[i].t3_ns   = t3;
         brs[i].t4_ns   = t4;
+        brs[i].compute_ns = gpu_cycles_to_ns(
+            sig.t3_ns - gpu.h_compute_start[i], gpu.ns_per_cycle);
         brs[i].tier    = tier;
 
         sigs[i] = sig;

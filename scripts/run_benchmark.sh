@@ -227,6 +227,24 @@ PER_RUN_S=$((WARMUP + DURATION + 2))   # +2 for spawn/teardown
 ETA_S=$((TOTAL_RUNS * PER_RUN_S))
 ETA_M=$((ETA_S / 60))
 
+# ── Local sudo pre-flight for privileged tiers ──────────────────────────────
+NEEDS_LOCAL_SUDO=0
+for tier in ${TIERS//,/ }; do
+    if [[ "$tier" == "2" || "$tier" == "3" || "$tier" == "4" || "$tier" == "5" ]]; then
+        NEEDS_LOCAL_SUDO=1
+        break
+    fi
+done
+
+if [[ $NEEDS_LOCAL_SUDO -eq 1 ]]; then
+    log "Refreshing local sudo credential for privileged receiver tiers..."
+    if ! sudo -v; then
+        log_err "sudo authentication failed"
+        exit 1
+    fi
+    log_ok "sudo credential ready"
+fi
+
 cat <<EOF
 
 ${C}══════════════════════════════════════════════════════════════════════${R}
