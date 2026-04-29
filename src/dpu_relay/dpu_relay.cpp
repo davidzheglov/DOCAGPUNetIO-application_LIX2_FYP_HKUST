@@ -139,46 +139,96 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[dpu_relay] forwarding to %s:%d  (Ctrl+C to stop)\n",
             mcast_addr, mcast_port);
 
-    /* ── Forward loop ─────────────────────────────────────────────────────── */
-    char buf[2048];
-    sockaddr_in src_addr{};
-    socklen_t src_len = sizeof(src_addr);
-    uint64_t pkt_count = 0;
-    uint64_t byte_count = 0;
+    /* ── Forward loop (batched: recvmmsg + sendmmsg) ─────────────────────────
+     * The previous one-syscall-per-packet loop maxed the ARM core at ~600 k
+     * syscalls/sec, throttling all four downstream receivers to that ceiling.
+     * Batching 64 packets per syscall pushes the effective ceiling above
+     * what 1 MHz benchmark rates need, so T4's actual throughput advantage
+     * can finally be observed. */
+    constexpr int    BATCH        = 64;
+    constexpr size_t PKT_BUF_SIZE = 2048;
+
+    /* Per-batch buffers: one mmsghdr/iovec/datagram-buffer triple per slot. */
+    static char         buffers[BATCH][PKT_BUF_SIZE];
+    static struct iovec iovs_rx[BATCH];
+    static struct iovec iovs_tx[BATCH];
+    static struct mmsghdr msgs_rx[BATCH];
+    static struct mmsghdr msgs_tx[BATCH];
+
+    for (int i = 0; i < BATCH; ++i) {
+        iovs_rx[i].iov_base = buffers[i];
+        iovs_rx[i].iov_len  = PKT_BUF_SIZE;
+        memset(&msgs_rx[i], 0, sizeof(msgs_rx[i]));
+        msgs_rx[i].msg_hdr.msg_iov    = &iovs_rx[i];
+        msgs_rx[i].msg_hdr.msg_iovlen = 1;
+        /* No msg_name on RX — we don't need the source address. */
+    }
+
+    /* Bounded-wait recvmmsg: returns up to BATCH packets or after the timeout.
+     * Keeps the loop responsive at low rates so partial batches still flush. */
+    struct timespec rx_timeout = { 0, 1000000 };  /* 1 ms */
+
+    uint64_t pkt_count   = 0;
+    uint64_t byte_count  = 0;
+    uint64_t batch_count = 0;
 
     while (g_running) {
-        ssize_t n = recvfrom(listen_fd, buf, sizeof(buf), 0,
-                             reinterpret_cast<sockaddr*>(&src_addr), &src_len);
-        if (n < 0) {
+        int n_recv = recvmmsg(listen_fd, msgs_rx, BATCH, MSG_WAITFORONE, &rx_timeout);
+        if (n_recv < 0) {
             if (errno == EINTR) continue;
-            perror("recvfrom");
+            perror("recvmmsg");
             break;
         }
+        if (n_recv == 0) continue;   /* timeout */
 
-        /* Re-stamp T1 (TickMessage.timestamp_ns at offset 0) at the moment of
-         * egress onto the measured wire. This excludes the host->DPU tmfifo
-         * hop from downstream T1->Tx latency math, which is what we want for
-         * the T1-T4 tier comparison. Skip with --no-restamp. */
-        if (restamp_t1 && n >= (ssize_t)sizeof(uint64_t)) {
+        /* Re-stamp T1 in every datagram at egress — single timespec read
+         * for the whole batch is fine; the within-batch ordering is sub-µs. */
+        if (restamp_t1) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-            memcpy(buf, &now_ns, sizeof(now_ns));
+            uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL
+                            + (uint64_t)ts.tv_nsec;
+            for (int i = 0; i < n_recv; ++i) {
+                if (msgs_rx[i].msg_len >= sizeof(uint64_t)) {
+                    memcpy(buffers[i], &now_ns, sizeof(now_ns));
+                }
+            }
         }
 
-        ssize_t sent = sendto(send_fd, buf, n, 0,
-                              reinterpret_cast<sockaddr*>(&mcast_dest),
-                              sizeof(mcast_dest));
-        if (sent < 0) {
-            perror("sendto");
-        } else {
-            pkt_count++;
-            byte_count += n;
-            if (pkt_count % 10000 == 0) {
-                fprintf(stderr,
-                        "[dpu_relay] forwarded %lu pkts (%lu MB)\r",
-                        pkt_count, byte_count / (1024 * 1024));
+        /* Build TX descriptors that fan out to the multicast destination.
+         * We can't reuse the RX iovecs directly because their iov_len is
+         * the buffer capacity, not the received payload size. */
+        for (int i = 0; i < n_recv; ++i) {
+            iovs_tx[i].iov_base = buffers[i];
+            iovs_tx[i].iov_len  = msgs_rx[i].msg_len;
+            memset(&msgs_tx[i], 0, sizeof(msgs_tx[i]));
+            msgs_tx[i].msg_hdr.msg_name    = &mcast_dest;
+            msgs_tx[i].msg_hdr.msg_namelen = sizeof(mcast_dest);
+            msgs_tx[i].msg_hdr.msg_iov     = &iovs_tx[i];
+            msgs_tx[i].msg_hdr.msg_iovlen  = 1;
+        }
+
+        int sent_total = 0;
+        while (sent_total < n_recv) {
+            int sent = sendmmsg(send_fd, msgs_tx + sent_total,
+                                n_recv - sent_total, 0);
+            if (sent < 0) {
+                if (errno == EINTR) continue;
+                perror("sendmmsg");
+                break;
             }
+            sent_total += sent;
+        }
+
+        for (int i = 0; i < sent_total; ++i) byte_count += msgs_rx[i].msg_len;
+        pkt_count   += sent_total;
+        batch_count += 1;
+
+        /* Lighter logging — once per ~10000 packets, batched, no \r flicker. */
+        if (pkt_count % 100000 == 0) {
+            fprintf(stderr,
+                    "[dpu_relay] %lu pkts in %lu batches (%lu MB)\n",
+                    pkt_count, batch_count, byte_count / (1024 * 1024));
         }
     }
 

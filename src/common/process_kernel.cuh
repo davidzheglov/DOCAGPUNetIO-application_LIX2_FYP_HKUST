@@ -163,6 +163,9 @@ __global__ void process_ticks_kernel(
     const TickMessage &tick = ticks[idx];
     SignalResult      &out  = signals[idx];
 
+    uint64_t compute_start = clock64();
+    if (compute_start_cycles) compute_start_cycles[idx] = compute_start;
+
     /* ── Mid-price and spread ─────────────────────────────────────────── */
     double mid    = (tick.bid + tick.ask) * 0.5;
     double spread =  tick.ask - tick.bid;
@@ -221,9 +224,6 @@ __global__ void process_ticks_kernel(
     /* ── Combined signal: both must agree ───────────────────────────── */
     int8_t combined = 0;
     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
-
-    uint64_t compute_start = clock64();
-    if (compute_start_cycles) compute_start_cycles[idx] = compute_start;
 
     double var_95 = mid;
     double cvar_95 = mid;

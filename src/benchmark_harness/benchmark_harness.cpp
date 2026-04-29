@@ -319,6 +319,8 @@ static int make_result_socket(int port)
 
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int rcvbuf = 64 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -463,8 +465,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         auto warmup_end = t_start + Sec(warmup_sec);
         fprintf(stderr, "[harness] warming up for %d s...\n", warmup_sec);
         while (Clock::now() < warmup_end) {
-            recv(result_fd, &br, sizeof(br), 0);  /* discard */
-            recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);  /* non-blocking drain */
+            while (recv(result_fd, &br, sizeof(br), MSG_DONTWAIT) == sizeof(br)) {}
+            while (recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT) == sizeof(sr)) {}
+            usleep(1000);
         }
     }
 
@@ -498,38 +501,40 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
         if (pfds[0].revents & POLLIN) {
             BenchmarkResult br{};
-            ssize_t n = recv(result_fd, &br, sizeof(br), 0);
-            if (n == sizeof(BenchmarkResult)) {
-                if (!br.dropped) {
-                    if (have_last_tick_id && br.tick_id > last_tick_id + 1) {
-                        n_inferred_missing_ticks +=
-                            (uint64_t)(br.tick_id - last_tick_id - 1);
+            ssize_t n;
+            while ((n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT)) == sizeof(BenchmarkResult)) {
+                if (n == sizeof(BenchmarkResult)) {
+                    if (!br.dropped) {
+                        if (have_last_tick_id && br.tick_id > last_tick_id + 1) {
+                            n_inferred_missing_ticks +=
+                                (uint64_t)(br.tick_id - last_tick_id - 1);
+                        }
+                        if (!have_last_tick_id || br.tick_id > last_tick_id) {
+                            last_tick_id = br.tick_id;
+                            have_last_tick_id = true;
+                        }
                     }
-                    if (!have_last_tick_id || br.tick_id > last_tick_id) {
-                        last_tick_id = br.tick_id;
-                        have_last_tick_id = true;
+                    if (br.dropped) { ++n_dropped; }
+                    else if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
+                        ++n_rejected_invalid_order;
                     }
-                }
-                if (br.dropped) { ++n_dropped; }
-                else if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
-                    ++n_rejected_invalid_order;
-                }
-                else if (br.t4_ns - br.t1_ns > 10000000000ULL) {
-                    ++n_rejected_too_old;
-                }
-                else {
-                    e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
-                    ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
-                    compute_ns.push_back(br.compute_ns != 0
-                        ? (double)br.compute_ns
-                        : (double)(br.t3_ns - br.t2_ns));
+                    else if (br.t4_ns - br.t1_ns > 10000000000ULL) {
+                        ++n_rejected_too_old;
+                    }
+                    else {
+                        e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
+                        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
+                        compute_ns.push_back(br.compute_ns != 0
+                            ? (double)br.compute_ns
+                            : (double)(br.t3_ns - br.t2_ns));
+                    }
                 }
             }
         }
         if (pfds[1].revents & POLLIN) {
             SignalResult sr{};
-            ssize_t n = recv(signal_fd, &sr, sizeof(sr), 0);
-            if (n == sizeof(SignalResult)) {
+            ssize_t n;
+            while ((n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT)) == sizeof(SignalResult)) {
                 ++n_signals_total;
                 if (sr.signal != 0) ++n_signals_actionable;
             }
