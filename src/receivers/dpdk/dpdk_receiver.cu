@@ -394,10 +394,8 @@ int main(int argc, char **argv)
 
             const TickMessage *tick =
                 reinterpret_cast<const TickMessage *>(data + ETH_IP_UDP_HDR);
-            uint64_t rx_ts_ns = now_ns();
             if (batch_n == 0) batch_start_ns = now_ns();
             memcpy(&gpu.h_ticks[batch_n], tick, sizeof(TickMessage));
-            gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
             ++batch_n;
 
             rte_pktmbuf_free(m);

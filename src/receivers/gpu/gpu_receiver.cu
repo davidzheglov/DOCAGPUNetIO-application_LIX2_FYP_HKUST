@@ -14,12 +14,10 @@
  *       -> SignalResult -> fill_simulator
  *
  * Benchmark definition for T4/T5:
- *   By default, t1 is stamped at the first GPU-visible receive point via
- *   clock64(), so all four timestamps share one conversion path into host
- *   wall-clock time. An experimental --nic-t1 mode instead uses the GPUNetIO
- *   RX CQE timestamp via doca_gpu_dev_eth_rxq_get_pkt_ts(), which is closer to
- *   true NIC ingress but only produces meaningful e2e/ingest numbers if
- *   CLOCK_REALTIME on lxcpu1 is aligned to the NIC PHC.
+ *   By default, t1 preserves TickMessage.timestamp_ns from the sender so the
+ *   harness can reconcile cross-host clock differences centrally for every
+ *   tier. An experimental --nic-t1 mode instead uses the GPUNetIO RX CQE
+ *   timestamp via doca_gpu_dev_eth_rxq_get_pkt_ts().
  *
  * DOCA SDK version: 3.x (uses doca_gpunetio_dev_eth_rxq.cuh)
  *
@@ -74,7 +72,7 @@
 #define MAX_PKT_SIZE       2048
 #define ETH_IP_UDP_HDR     42       /* 14 + 20 + 8 */
 #define RESULT_QUEUE_DEPTH 65536
-#define SEND_BATCH         256
+#define SEND_BATCH         1024
 #define MAX_RX_TIMEOUT_NS  10000000ULL  /* 10ms timeout */
 
 #define CUDA_CHECK(call) \
@@ -260,6 +258,7 @@ __global__ void gpu_recv_process_kernel(
     __shared__ uint64_t s_first_pkt_idx;
     __shared__ uint32_t s_n_pkts;
     __shared__ doca_error_t s_ret;
+    __shared__ uint64_t s_ring_base;
 
     while (!*quit_flag) {
         /* ── All 32 warp threads participate in the recv (WARP-scope) ──
@@ -282,14 +281,14 @@ __global__ void gpu_recv_process_kernel(
 
             s_poll_count++;
             if (s_ret != DOCA_SUCCESS && s_ret != (doca_error_t)14 /* DOCA_ERROR_EMPTY */) {
-                if (s_poll_count <= 5 || s_poll_count % 10000 == 0)
+                if (s_poll_count <= 5 || s_poll_count % 100000 == 0)
                     printf("[GPU] poll #%llu: recv returned error %d (n_pkts=%u)\n",
                            (unsigned long long)s_poll_count, (int)s_ret, s_n_pkts);
             }
             if (s_n_pkts > 0) {
                 s_recv_count++;
                 s_pkt_total += s_n_pkts;
-                if (s_recv_count <= 10 || s_recv_count % 100 == 0)
+                if (s_recv_count <= 10 || s_recv_count % 10000 == 0)
                     printf("[GPU] poll #%llu: GOT %u pkts (total bursts=%llu, total pkts=%llu)\n",
                            (unsigned long long)s_poll_count, s_n_pkts,
                            (unsigned long long)s_recv_count,
@@ -309,10 +308,14 @@ __global__ void gpu_recv_process_kernel(
         __syncthreads();  /* All threads now see s_n_pkts, s_first_pkt_idx, s_ret */
 
         /* ── Each thread processes one packet ── */
+        uintptr_t buf_addr = 0;
+        const uint8_t *pkt = nullptr;
+        uint16_t dst_port = 0;
+        bool active_pkt = false;
         if (s_ret == DOCA_SUCCESS && s_n_pkts > 0 && tid < (int)s_n_pkts) {
-            uintptr_t buf_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
+            buf_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
                 rxq, s_first_pkt_idx + tid);
-            const uint8_t *pkt = reinterpret_cast<const uint8_t *>(buf_addr);
+            pkt = reinterpret_cast<const uint8_t *>(buf_addr);
 
             /* Verify minimum length */
             if (buf_addr == 0) {
@@ -322,7 +325,7 @@ __global__ void gpu_recv_process_kernel(
             if (buf_addr != 0) {
                 /* Skip Ethernet + IP + UDP headers */
                 const uint8_t *udp_hdr = pkt + 14 + 20;
-                uint16_t dst_port = (uint16_t)((udp_hdr[2] << 8) | udp_hdr[3]);
+                dst_port = (uint16_t)((udp_hdr[2] << 8) | udp_hdr[3]);
 
                 /* Diagnostic: print first few packet headers */
                 if (s_recv_count <= 5 && tid == 0) {
@@ -343,14 +346,29 @@ __global__ void gpu_recv_process_kernel(
                 if (dst_port != TICK_MCAST_PORT) {
                     atomicAdd((unsigned long long *)&s_port_miss, 1ULL);
                 }
+                active_pkt = (dst_port == TICK_MCAST_PORT);
+            }
+        }
 
-                if (dst_port == TICK_MCAST_PORT) {
+        unsigned active_mask = __ballot_sync(0xffffffffu, active_pkt);
+        int active_count = __popc(active_mask);
+        if (tid == 0) {
+            s_ring_base = (active_count > 0)
+                ? atomicAdd(reinterpret_cast<unsigned long long *>(
+                                const_cast<uint64_t *>(ring_head)),
+                            (unsigned long long)active_count)
+                : 0ULL;
+        }
+        __syncwarp();
+
+        if (active_pkt) {
+                    int rank = __popc(active_mask & ((1u << tid) - 1u));
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
                     uint64_t t1 = use_nic_t1
                         ? doca_gpu_dev_eth_rxq_get_pkt_ts(
                               rxq, s_first_pkt_idx + tid)
-                        : clock64();
+                        : tick->timestamp_ns;
 
                     /* T2: tick is now in GPU memory */
                     uint64_t t2 = clock64();
@@ -413,9 +431,7 @@ __global__ void gpu_recv_process_kernel(
                     /* Reserve a unique absolute slot number, write the payload,
                      * then publish readiness via the per-slot sequence number.
                      * The CPU consumer must not trust ring_head alone. */
-                    uint64_t ring_idx = atomicAdd(
-                        reinterpret_cast<unsigned long long *>(
-                            const_cast<uint64_t *>(ring_head)), 1ULL);
+                    uint64_t ring_idx = s_ring_base + (uint64_t)rank;
                     ResultSlot *rslot = &result_ring[ring_idx % ring_depth];
 
                     rslot->bench.tick_id = tick->tick_id;
@@ -451,8 +467,6 @@ __global__ void gpu_recv_process_kernel(
                     rslot->seq = ring_idx + 1;
 
                     atomicAdd((unsigned long long *)&s_ring_writes, 1ULL);
-                }
-            }
         }
 
         /* Ensure all threads complete before next burst */
@@ -476,7 +490,7 @@ struct ForwardCtx {
     int                signal_fd   = -1;
     sockaddr_in        harness_dest{};
     sockaddr_in        signal_dest{};
-    bool               t1_is_nic_time = false;
+    bool               t1_bypass_gpu_cycle_conversion = false;
     std::atomic<bool>  stop{false};
 };
 
@@ -527,6 +541,7 @@ static void cpu_forward_thread(ForwardCtx *ctx)
 
     while (!ctx->stop.load()) {
         uint64_t head = *ctx->ring->head;
+        bool did_work = false;
 
         /* Periodic report even when idle */
         auto now = std::chrono::steady_clock::now();
@@ -566,7 +581,7 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
-                if (!(ctx->t1_is_nic_time && (br.tier == 4 || br.tier == 5))) {
+                if (!ctx->t1_bypass_gpu_cycle_conversion) {
                     br.t1_ns = cyc_to_wall_ns(br.t1_ns,
                                               ctx->gpu_cyc_anchor,
                                               ctx->host_wall_anchor_ns,
@@ -591,13 +606,14 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 sig_batch[out_n] = sig;
                 ++out_n;
                 fwd_count++;
-                if (fwd_count <= 5 || fwd_count % 500 == 0) {
+                if (fwd_count <= 5 || fwd_count % 100000 == 0) {
                     fprintf(stderr, "[CPU-FWD] #%llu: tick=%u queued_for_send\n",
                             (unsigned long long)fwd_count, br.tick_id);
                 }
 
                 rs->seq = ctx->ring->tail + ctx->ring->depth;
                 ++ctx->ring->tail;
+                did_work = true;
 
                 if (out_n >= SEND_BATCH || ctx->ring->tail >= head) {
                     nvtxRangePushA("sendto_pair");
@@ -610,7 +626,9 @@ static void cpu_forward_thread(ForwardCtx *ctx)
             nvtxMarkA("batch_done");
             nvtxRangePop();
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
+        if (!did_work) {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
     }
 
     fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu ring_overflow_drops=%llu\n",
@@ -1057,7 +1075,7 @@ int main(int argc, char **argv)
     fwd_ctx.signal_fd    = signal_fd;
     fwd_ctx.harness_dest = harness_dest;
     fwd_ctx.signal_dest  = signal_dest;
-    fwd_ctx.t1_is_nic_time = g_use_nic_t1;
+    fwd_ctx.t1_bypass_gpu_cycle_conversion = true;
 
     /* ── GPU-cycle ↔ host-wall-clock anchor ────────────────────────────────
      * t2/t3/t4 are stamped via clock64() inside the GPU kernel — that's a

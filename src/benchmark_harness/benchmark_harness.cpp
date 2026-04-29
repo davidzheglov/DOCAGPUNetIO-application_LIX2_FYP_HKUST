@@ -25,6 +25,7 @@
  */
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -114,6 +115,10 @@ static std::string g_sender_csv
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
+static std::string g_clock_cal_script
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/scripts/clock_cal_server.py";
+static std::string g_clock_cal_host;
+static int         g_clock_cal_port = 6006;
 
 static std::string sender_stats_path_for_run(int run_id)
 {
@@ -142,6 +147,145 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
     fscanf(p, "%llu", &v);
     pclose(p);
     return (uint64_t)v;
+}
+
+static uint64_t wall_time_ns()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string sender_ssh_host()
+{
+    if (!g_clock_cal_host.empty()) return g_clock_cal_host;
+    size_t at = g_sender_ssh.find('@');
+    return (at == std::string::npos) ? g_sender_ssh : g_sender_ssh.substr(at + 1);
+}
+
+static std::string ssh_base_cmd()
+{
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    if (!g_sender_control_path.empty()) {
+        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+    }
+    return cmd;
+}
+
+struct ClockSample {
+    bool     valid = false;
+    uint64_t remote_ref_ns = 0;
+    uint64_t local_ref_ns  = 0;
+    uint64_t rtt_ns        = 0;
+};
+
+static ClockSample sample_clock_pair()
+{
+    ClockSample best{};
+    if (g_sender_ssh.empty()) {
+        best.valid = true;
+        best.local_ref_ns = wall_time_ns();
+        best.remote_ref_ns = best.local_ref_ns;
+        return best;
+    }
+
+    std::string host = sender_ssh_host();
+    if (host.empty()) return best;
+
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    struct addrinfo *res = nullptr;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", g_clock_cal_port);
+    if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0 || !res) {
+        return best;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        return best;
+    }
+
+    timeval tv{.tv_sec = 0, .tv_usec = 200000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    for (int i = 0; i < 24; ++i) {
+        uint64_t t_a = wall_time_ns();
+        ssize_t sent = sendto(fd, &t_a, sizeof(t_a), 0, res->ai_addr, res->ai_addrlen);
+        if (sent != (ssize_t)sizeof(t_a)) continue;
+
+        uint64_t rep[3]{};
+        ssize_t nr = recv(fd, rep, sizeof(rep), 0);
+        uint64_t t_d = wall_time_ns();
+        if (nr != (ssize_t)sizeof(rep)) continue;
+
+        uint64_t t_b = rep[1];
+        uint64_t t_c = rep[2];
+        uint64_t remote_span = (t_c >= t_b) ? (t_c - t_b) : 0;
+        uint64_t round_trip = (t_d >= t_a) ? (t_d - t_a) : 0;
+        uint64_t rtt = (round_trip >= remote_span) ? (round_trip - remote_span) : round_trip;
+        uint64_t local_ref = t_a + (round_trip / 2);
+        uint64_t remote_ref = t_b + ((t_c >= t_b) ? ((t_c - t_b) / 2) : 0);
+
+        if (!best.valid || rtt < best.rtt_ns) {
+            best.valid = true;
+            best.rtt_ns = rtt;
+            best.local_ref_ns = local_ref;
+            best.remote_ref_ns = remote_ref;
+        }
+        usleep(5000);
+    }
+
+    close(fd);
+    freeaddrinfo(res);
+    return best;
+}
+
+static uint64_t sender_t1_to_local_ns(uint64_t sender_t1_ns,
+                                      const ClockSample &start,
+                                      const ClockSample &end)
+{
+    if (!start.valid) return sender_t1_ns;
+    if (!end.valid || end.remote_ref_ns <= start.remote_ref_ns) {
+        int64_t offset = (int64_t)start.local_ref_ns - (int64_t)start.remote_ref_ns;
+        return (uint64_t)((int64_t)sender_t1_ns + offset);
+    }
+
+    long double remote_span = (long double)(end.remote_ref_ns - start.remote_ref_ns);
+    long double local_span  = (long double)((int64_t)end.local_ref_ns - (int64_t)start.local_ref_ns);
+    long double alpha       = ((long double)sender_t1_ns - (long double)start.remote_ref_ns) / remote_span;
+    long double mapped      = (long double)start.local_ref_ns + alpha * local_span;
+    if (mapped < 0.0L) mapped = 0.0L;
+    return (uint64_t)(mapped + 0.5L);
+}
+
+static bool start_remote_clock_server()
+{
+    if (g_sender_ssh.empty()) return true;
+    std::string cmd = ssh_base_cmd() + g_sender_ssh
+        + " 'pkill -f clock_cal_server.py 2>/dev/null || true; "
+          "nohup python3 " + g_clock_cal_script
+        + " --ip 0.0.0.0 --port " + std::to_string(g_clock_cal_port)
+        + " >/tmp/clock_cal_server.log 2>&1 </dev/null &'";
+    if (system(cmd.c_str()) != 0) return false;
+
+    for (int i = 0; i < 20; ++i) {
+        ClockSample s = sample_clock_pair();
+        if (s.valid) return true;
+        usleep(100000);
+    }
+    return false;
+}
+
+static void stop_remote_clock_server()
+{
+    if (g_sender_ssh.empty()) return;
+    std::string cmd = ssh_base_cmd() + g_sender_ssh
+        + " 'pkill -f clock_cal_server.py 2>/dev/null || true'"
+          " >/dev/null 2>&1";
+    system(cmd.c_str());
 }
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
@@ -319,7 +463,7 @@ static int make_result_socket(int port)
 
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    int rcvbuf = 64 * 1024 * 1024;
+    int rcvbuf = 256 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     sockaddr_in addr{};
@@ -471,11 +615,10 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         }
     }
 
-    /* Collect during measurement window — poll both sockets */
+    /* Collect raw results during measurement. Sender-side t1 is reconciled
+     * into the local clock domain after the run using two clock samples. */
+    std::vector<BenchmarkResult> raw_results;
     std::vector<double> e2e_ns, ingest_ns, compute_ns;
-    e2e_ns.reserve(rate_hz * duration_sec);
-    ingest_ns.reserve(rate_hz * duration_sec);
-    compute_ns.reserve(rate_hz * duration_sec);
 
     uint64_t n_dropped = 0;
     uint64_t n_inferred_missing_ticks = 0;
@@ -485,6 +628,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t n_signals_actionable = 0;  /* signal != 0 only */
     bool have_last_tick_id = false;
     uint32_t last_tick_id = 0;
+    ClockSample cal_start = sample_clock_pair();
     uint64_t sent_ticks_start = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
@@ -513,21 +657,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                             last_tick_id = br.tick_id;
                             have_last_tick_id = true;
                         }
+                        raw_results.push_back(br);
                     }
                     if (br.dropped) { ++n_dropped; }
-                    else if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
-                        ++n_rejected_invalid_order;
-                    }
-                    else if (br.t4_ns - br.t1_ns > 10000000000ULL) {
-                        ++n_rejected_too_old;
-                    }
-                    else {
-                        e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
-                        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
-                        compute_ns.push_back(br.compute_ns != 0
-                            ? (double)br.compute_ns
-                            : (double)(br.t3_ns - br.t2_ns));
-                    }
                 }
             }
         }
@@ -544,8 +676,30 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t sent_ticks_end = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
+    ClockSample cal_end = sample_clock_pair();
     uint64_t sent_ticks_window = (sent_ticks_end >= sent_ticks_start)
         ? (sent_ticks_end - sent_ticks_start) : 0;
+
+    e2e_ns.reserve(raw_results.size());
+    ingest_ns.reserve(raw_results.size());
+    compute_ns.reserve(raw_results.size());
+    for (const BenchmarkResult &raw_br : raw_results) {
+        BenchmarkResult br = raw_br;
+        br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
+        if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
+            ++n_rejected_invalid_order;
+            continue;
+        }
+        if (br.t4_ns - br.t1_ns > 10000000000ULL) {
+            ++n_rejected_too_old;
+            continue;
+        }
+        e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
+        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
+        compute_ns.push_back(br.compute_ns != 0
+            ? (double)br.compute_ns
+            : (double)(br.t3_ns - br.t2_ns));
+    }
 
     /* Kill subprocesses */
     kill_proc(rx_pid);
@@ -643,6 +797,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
         else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
         else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
+        else if (!strcmp(argv[i],"--clock-cal-host") && i+1<argc) g_clock_cal_host = argv[++i];
+        else if (!strcmp(argv[i],"--clock-cal-port") && i+1<argc) g_clock_cal_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 
@@ -696,6 +852,11 @@ int main(int argc, char **argv)
     if (!csv_out) { fprintf(stderr, "Cannot write %s\n", results_path); return 1; }
     write_header(csv_out);
 
+    if (!start_remote_clock_server()) {
+        fprintf(stderr, "[harness] warning: clock calibration server unavailable; "
+                        "falling back to raw sender timestamps\n");
+    }
+
     int run_id = 0;
     for (int tier : tiers) {
         for (long rate : rates) {
@@ -711,6 +872,7 @@ int main(int argc, char **argv)
 
     close(result_fd);
     close(signal_fd);
+    stop_remote_clock_server();
 
     fprintf(stderr, "\n[harness] all %d runs complete. Results in %s\n",
             run_id, results_path);

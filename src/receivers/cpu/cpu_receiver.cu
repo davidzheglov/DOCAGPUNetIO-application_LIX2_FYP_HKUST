@@ -13,10 +13,9 @@
  * Without it, INADDR_ANY may pick lo and drop real-NIC traffic.
  *
  * Benchmark definition for T1:
- *   t1 = receiver-side ingress timestamp on lxcpu1, requested from the
- *        socket timestamping API with hardware RX preference and software
- *        fallback, so all benchmark timestamps stay in the receiver clock
- *        domain.
+ *   t1 = sender-side timestamp from TickMessage::timestamp_ns. Socket RX
+ *        timestamping is still enabled for diagnostics, but it no longer
+ *        overwrites the sender stamp used by the benchmark harness.
  *
  * Batches up to BATCH_SIZE ticks before launching the kernel. T2 is stamped
  * on the host immediately after cudaMemcpy H→D completes.
@@ -506,7 +505,6 @@ int main(int argc, char **argv)
         }
 
         if (n == sizeof(TickMessage)) {
-            gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
             if (batch_n == 0) batch_start_ns = now_ns();
             ++batch_n;
             ++total_recv;
