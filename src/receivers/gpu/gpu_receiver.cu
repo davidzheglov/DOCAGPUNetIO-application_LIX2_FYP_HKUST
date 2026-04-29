@@ -473,6 +473,9 @@ struct ForwardCtx {
     std::atomic<bool>  stop{false};
 };
 
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n);
+
 /* One-shot kernel: read clock64() once so the host can anchor the GPU
  * cycle counter to wall-clock time. Launched just before the persistent
  * receive kernel; see main(). */
