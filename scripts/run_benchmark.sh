@@ -19,6 +19,7 @@
 #    ./scripts/run_benchmark.sh --duration 60 --warmup 10
 #    ./scripts/run_benchmark.sh --sender-password                   # prompt once for lxcpu2 SSH password
 #    ./scripts/run_benchmark.sh --receiver-iface ens21f0np0
+#    ./scripts/run_benchmark.sh --light-bench
 #    ./scripts/run_benchmark.sh --symbols 64 --csv-rows 2000000    # bigger stress
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -38,6 +39,7 @@ SYMBOLS=32
 CSV_PATH="data/ticks.csv"
 REGEN_CSV=0
 QUICK=0
+LIGHT_BENCH=0
 IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for sender/DPU mcast egress)
 RECEIVER_IFACE_ARG=""  # forwarded as --receiver-iface to harness (T1 CPU receiver iface name)
 
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
         --sender-ssh)   SENDER_SSH="$2"; shift 2 ;;
         --sender-password) SENDER_PASSWORD=1; shift ;;
         --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
+        --light-bench)  LIGHT_BENCH=1; shift ;;
         --quick)        QUICK=1; shift ;;
         --help|-h)      sed -n '2,22p' "$0"; exit 0 ;;
         *)              echo "Unknown option: $1" >&2; exit 1 ;;
@@ -296,6 +299,9 @@ if [[ -n "$SENDER_SSH" ]]; then
     SENDER_ARGS+=(--sender-csv  "$SENDER_CSV")
     SENDER_ARGS+=(--sender-dest "$SENDER_DEST")
     [[ -n "$SSH_CONTROL_PATH" ]] && SENDER_ARGS+=(--sender-control-path "$SSH_CONTROL_PATH")
+fi
+if [[ $LIGHT_BENCH -eq 1 ]]; then
+    SENDER_ARGS+=(--light-bench)
 fi
 
 "$HARNESS" \
