@@ -21,6 +21,7 @@ This document specifies the hardware, software, data formats, algorithms, and co
 11. [Build System](#11-build-system)
 12. [Benchmark Methodology](#12-benchmark-methodology)
 13. [Configuration Reference](#13-configuration-reference)
+14. [Frontend Integration Plan](#14-frontend-integration-plan)
 
 ---
 
@@ -1131,6 +1132,51 @@ For the FYP report, the **trustworthy** metrics (compute latency, egress latency
 ---
 
 ## 13. Configuration Reference
+
+## 14. Frontend Integration Plan
+
+This project is expected to gain a frontend for the live demo in a separate
+`frontend` branch. The frontend is expected to orchestrate the existing backend
+pipeline rather than replace it.
+
+### 14.1 Intended frontend responsibility
+
+The frontend should act as an operator console for the system. It should:
+
+- start and stop the live demo pipeline
+- select a tier (`T1`–`T4` for the host demo path)
+- select one or more symbols for live mode
+- display recent signals, throughput, health, and logs
+
+### 14.2 Backend remains the source of truth
+
+The backend pipeline described in this document remains authoritative:
+
+- host `data_source_live`
+- DPU ARM `dpu_relay`
+- host receiver tier (`T1`, `T2`, `T3`, or `T4`)
+- local `fill_simulator`
+- optional benchmark / plotting tools
+
+The frontend branch should call a thin control layer that wraps these existing
+processes.
+
+### 14.3 First frontend milestone
+
+The recommended first frontend milestone is the live demo path, not the full
+benchmark harness:
+
+1. choose a tier
+2. start relay + receiver + live data source
+3. show logs and live signal activity
+4. stop everything cleanly
+
+### 14.4 Handoff note
+
+The implementation-oriented handoff note for the frontend branch is maintained
+in:
+
+`docs/FRONTEND_INTEGRATION.md`
 
 ### 13.1 Required System Configuration
 

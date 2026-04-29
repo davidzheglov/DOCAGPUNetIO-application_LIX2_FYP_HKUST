@@ -134,6 +134,39 @@ make data_source_live dpu_relay_dpu t1
 ./scripts/run_live_pipeline.sh --tier 1 --symbols BTCUSDT,ETHUSDT
 ```
 
+## Frontend Demo Plan
+
+We plan to add a frontend for the live demo in a separate `frontend` branch.
+The intended frontend scope is to control and visualise the **existing backend
+pipeline**, not to replace it.
+
+The frontend should be able to:
+
+- start and stop the live demo pipeline
+- choose a receiver tier (`T1`–`T4`)
+- choose demo symbols
+- show pipeline health, logs, throughput, and recent signals
+
+For the first milestone, the recommended target is the live-demo path:
+
+```text
+data_source_live (host)
+  -> dpu_relay (DPU ARM)
+  -> selected receiver tier on lxcpu1
+  -> fill_simulator / local metrics display
+```
+
+The detailed handoff note for the teammate working on the frontend branch is:
+
+[docs/FRONTEND_INTEGRATION.md](/home/timmy/DOCAGPUNetIO-application_LIX2_FYP_HKUST/docs/FRONTEND_INTEGRATION.md)
+
+That document describes:
+
+- which binaries/scripts already form the backend
+- the recommended control model for the frontend
+- the exact commands currently used to run each tier
+- the suggested first frontend deliverable
+
 ## Timestamps
 
 For the current T1-T4 benchmark path, latency decomposition uses a single
