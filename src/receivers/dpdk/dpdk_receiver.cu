@@ -185,8 +185,10 @@ static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
 struct GpuResources {
     TickMessage  *d_ticks     = nullptr;
     SignalResult *d_signals   = nullptr;
+    uint64_t     *d_compute_start = nullptr;
     TickMessage  *h_ticks     = nullptr;
     SignalResult *h_signals   = nullptr;
+    uint64_t     *h_compute_start = nullptr;
     double       *d_fast_ema  = nullptr;
     double       *d_slow_ema  = nullptr;
     double       *d_avg_gain  = nullptr;
@@ -194,15 +196,23 @@ struct GpuResources {
     double       *d_last_mid  = nullptr;
     cudaStream_t  stream      = nullptr;
     int           cap         = DEFAULT_BATCH;
+    double        ns_per_cycle = 0.0;
 };
+
+static inline uint64_t gpu_cycles_to_ns(uint64_t cycles, double ns_per_cycle)
+{
+    return (uint64_t)((double)cycles * ns_per_cycle);
+}
 
 static void gpu_init(GpuResources &r, int cap)
 {
     r.cap = cap;
     CUDA_CHECK(cudaMallocHost(&r.h_ticks,   cap * sizeof(TickMessage)));
     CUDA_CHECK(cudaMallocHost(&r.h_signals, cap * sizeof(SignalResult)));
+    CUDA_CHECK(cudaMallocHost(&r.h_compute_start, cap * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&r.d_ticks,   cap * sizeof(TickMessage)));
     CUDA_CHECK(cudaMalloc(&r.d_signals, cap * sizeof(SignalResult)));
+    CUDA_CHECK(cudaMalloc(&r.d_compute_start, cap * sizeof(uint64_t)));
     size_t state_sz = MAX_INSTRUMENTS * sizeof(double);
     CUDA_CHECK(cudaMalloc(&r.d_fast_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_fast_ema, 0, state_sz));
     CUDA_CHECK(cudaMalloc(&r.d_slow_ema, state_sz)); CUDA_CHECK(cudaMemset(r.d_slow_ema, 0, state_sz));
@@ -210,6 +220,10 @@ static void gpu_init(GpuResources &r, int cap)
     CUDA_CHECK(cudaMalloc(&r.d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_loss, 0, state_sz));
     CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
     CUDA_CHECK(cudaStreamCreate(&r.stream));
+
+    int clock_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0));
+    r.ns_per_cycle = 1000000.0 / (double)clock_khz;
 }
 
 /* ── Process batch ──────────────────────────────────────────────────────────
@@ -229,6 +243,7 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
     uint64_t t2 = now_ns();
 
     launch_process_ticks(r.d_ticks, n, r.d_signals,
+                          r.d_compute_start,
                           r.d_fast_ema, r.d_slow_ema,
                           r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
                           t2, r.stream, g_light_bench);
@@ -237,6 +252,9 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
 
     CUDA_CHECK(cudaMemcpyAsync(r.h_signals, r.d_signals,
                                 n * sizeof(SignalResult),
+                                cudaMemcpyDeviceToHost, r.stream));
+    CUDA_CHECK(cudaMemcpyAsync(r.h_compute_start, r.d_compute_start,
+                                n * sizeof(uint64_t),
                                 cudaMemcpyDeviceToHost, r.stream));
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
     uint64_t t4 = now_ns();
@@ -253,6 +271,8 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
         brs[i].t2_ns   = t2;
         brs[i].t3_ns   = t3;
         brs[i].t4_ns   = t4;
+        brs[i].compute_ns = gpu_cycles_to_ns(
+            sig.t3_ns - r.h_compute_start[i], r.ns_per_cycle);
         brs[i].tier    = tier;
 
         sigs[i] = sig;

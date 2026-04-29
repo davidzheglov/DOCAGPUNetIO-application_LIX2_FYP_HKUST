@@ -20,9 +20,9 @@ import struct
 import sys
 import time
 
-# BenchmarkResult: 48 bytes (tick_id, t1_ns, t2_ns, t3_ns, t4_ns, tier, dropped, pad[6])
-BENCH_FMT  = "=QQQQQBBxxxxxx"
-BENCH_SIZE = 48
+# BenchmarkResult: 56 bytes
+BENCH_FMT  = "=QQQQQQBBxxxxxx"
+BENCH_SIZE = 56
 BENCH_PORT = 5010
 
 # SignalResult: 64 bytes
@@ -49,8 +49,9 @@ def decode_bench(data: bytes) -> dict:
         "t2_ns":   fields[2],
         "t3_ns":   fields[3],
         "t4_ns":   fields[4],
-        "tier":    fields[5],
-        "dropped": fields[6],
+        "compute_ns": fields[5],
+        "tier":    fields[6],
+        "dropped": fields[7],
     }
 
 
@@ -117,6 +118,7 @@ def main():
                               f"t2={r.get('t2_ns',0)} "
                               f"t3={r.get('t3_ns',0)} "
                               f"t4={r.get('t4_ns',0)} "
+                              f"compute={r.get('compute_ns',0)} "
                               f"drop={r.get('dropped',0)}")
 
                 elif port == SIGNAL_PORT:

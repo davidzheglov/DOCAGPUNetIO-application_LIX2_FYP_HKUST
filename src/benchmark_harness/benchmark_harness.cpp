@@ -309,6 +309,7 @@ struct RunResult {
     size_t n_ticks;
     double drop_rate;
     size_t receiver_reported_drops;
+    size_t inferred_missing_ticks;
     size_t rejected_invalid_order;
     size_t rejected_too_old;
     double e2e_p50, e2e_p95, e2e_p99, e2e_mean;
@@ -323,7 +324,8 @@ struct RunResult {
 static void write_header(std::ofstream &f)
 {
     f << "run_id,tier,rate_hz,repetition,n_ticks,drop_rate,"
-      << "receiver_reported_drops,rejected_invalid_order,rejected_too_old,"
+      << "receiver_reported_drops,inferred_missing_ticks,"
+      << "rejected_invalid_order,rejected_too_old,"
       << "e2e_p50_us,e2e_p95_us,e2e_p99_us,e2e_mean_us,"
       << "ingest_p50_us,ingest_p95_us,ingest_p99_us,ingest_mean_us,"
       << "compute_p50_us,compute_p95_us,compute_p99_us,compute_mean_us,"
@@ -341,6 +343,7 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << r.n_ticks      << ','
       << r.drop_rate    << ','
       << r.receiver_reported_drops << ','
+      << r.inferred_missing_ticks << ','
       << r.rejected_invalid_order << ','
       << r.rejected_too_old << ','
       << ns_to_us(r.e2e_p50)  << ',' << ns_to_us(r.e2e_p95)  << ','
@@ -429,10 +432,13 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     compute_ns.reserve(rate_hz * duration_sec);
 
     uint64_t n_dropped = 0;
+    uint64_t n_inferred_missing_ticks = 0;
     uint64_t n_rejected_invalid_order = 0;
     uint64_t n_rejected_too_old = 0;
     uint64_t n_signals_total = 0;       /* every SignalResult received */
     uint64_t n_signals_actionable = 0;  /* signal != 0 only */
+    bool have_last_tick_id = false;
+    uint32_t last_tick_id = 0;
     auto measure_end = Clock::now() + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
@@ -448,6 +454,16 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             BenchmarkResult br{};
             ssize_t n = recv(result_fd, &br, sizeof(br), 0);
             if (n == sizeof(BenchmarkResult)) {
+                if (!br.dropped) {
+                    if (have_last_tick_id && br.tick_id > last_tick_id + 1) {
+                        n_inferred_missing_ticks +=
+                            (uint64_t)(br.tick_id - last_tick_id - 1);
+                    }
+                    if (!have_last_tick_id || br.tick_id > last_tick_id) {
+                        last_tick_id = br.tick_id;
+                        have_last_tick_id = true;
+                    }
+                }
                 if (br.dropped) { ++n_dropped; }
                 else if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
                     ++n_rejected_invalid_order;
@@ -458,7 +474,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 else {
                     e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
                     ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
-                    compute_ns.push_back((double)(br.t3_ns - br.t2_ns));
+                    compute_ns.push_back(br.compute_ns != 0
+                        ? (double)br.compute_ns
+                        : (double)(br.t3_ns - br.t2_ns));
                 }
             }
         }
@@ -481,7 +499,8 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
-    uint64_t n_discarded = n_dropped + n_rejected_invalid_order + n_rejected_too_old;
+    uint64_t n_discarded = n_dropped + n_inferred_missing_ticks
+                         + n_rejected_invalid_order + n_rejected_too_old;
     double drop_rate = (n_ticks + n_discarded) > 0
         ? (double)n_discarded / (double)(n_ticks + n_discarded) : 0.0;
 
@@ -493,6 +512,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.n_ticks    = n_ticks;
     r.drop_rate  = drop_rate;
     r.receiver_reported_drops = n_dropped;
+    r.inferred_missing_ticks = n_inferred_missing_ticks;
     r.rejected_invalid_order = n_rejected_invalid_order;
     r.rejected_too_old = n_rejected_too_old;
     r.e2e_p50    = percentile(e2e_ns, 0.50);
@@ -516,11 +536,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     fprintf(stderr,
         "[harness] T%d @%ld: n=%zu drop=%.2f%% "
-        "(rx_drop=%llu invalid=%llu too_old=%llu) "
+        "(rx_drop=%llu gap_drop=%llu invalid=%llu too_old=%llu) "
         "e2e_p50=%.1fus e2e_p99=%.1fus "
         "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
         (unsigned long long)n_dropped,
+        (unsigned long long)n_inferred_missing_ticks,
         (unsigned long long)n_rejected_invalid_order,
         (unsigned long long)n_rejected_too_old,
         r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput,
