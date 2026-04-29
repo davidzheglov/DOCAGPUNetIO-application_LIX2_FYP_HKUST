@@ -25,7 +25,6 @@
  */
 
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -115,10 +114,6 @@ static std::string g_sender_csv
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
-static std::string g_clock_cal_script
-    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/scripts/clock_cal_server.py";
-static std::string g_clock_cal_host;
-static int         g_clock_cal_port = 6006;
 
 static std::string sender_stats_path_for_run(int run_id)
 {
@@ -155,13 +150,6 @@ static uint64_t wall_time_ns()
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-static std::string sender_ssh_host()
-{
-    if (!g_clock_cal_host.empty()) return g_clock_cal_host;
-    size_t at = g_sender_ssh.find('@');
-    return (at == std::string::npos) ? g_sender_ssh : g_sender_ssh.substr(at + 1);
-}
-
 static std::string ssh_base_cmd()
 {
     std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
@@ -188,41 +176,20 @@ static ClockSample sample_clock_pair()
         return best;
     }
 
-    std::string host = sender_ssh_host();
-    if (host.empty()) return best;
+    std::string cmd = ssh_base_cmd() + g_sender_ssh
+        + " \"python3 -c 'import time; a=time.time_ns(); b=time.time_ns(); "
+          "print(str(a)+\\\" \\\"+str(b))'\"";
 
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    struct addrinfo *res = nullptr;
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", g_clock_cal_port);
-    if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0 || !res) {
-        return best;
-    }
-
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        freeaddrinfo(res);
-        return best;
-    }
-
-    timeval tv{.tv_sec = 0, .tv_usec = 200000};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    for (int i = 0; i < 24; ++i) {
+    for (int i = 0; i < 12; ++i) {
         uint64_t t_a = wall_time_ns();
-        ssize_t sent = sendto(fd, &t_a, sizeof(t_a), 0, res->ai_addr, res->ai_addrlen);
-        if (sent != (ssize_t)sizeof(t_a)) continue;
-
-        uint64_t rep[3]{};
-        ssize_t nr = recv(fd, rep, sizeof(rep), 0);
+        FILE *p = popen(cmd.c_str(), "r");
+        if (!p) continue;
+        unsigned long long t_b = 0, t_c = 0;
+        int matched = fscanf(p, "%llu %llu", &t_b, &t_c);
+        pclose(p);
         uint64_t t_d = wall_time_ns();
-        if (nr != (ssize_t)sizeof(rep)) continue;
+        if (matched != 2) continue;
 
-        uint64_t t_b = rep[1];
-        uint64_t t_c = rep[2];
         uint64_t remote_span = (t_c >= t_b) ? (t_c - t_b) : 0;
         uint64_t round_trip = (t_d >= t_a) ? (t_d - t_a) : 0;
         uint64_t rtt = (round_trip >= remote_span) ? (round_trip - remote_span) : round_trip;
@@ -235,11 +202,8 @@ static ClockSample sample_clock_pair()
             best.local_ref_ns = local_ref;
             best.remote_ref_ns = remote_ref;
         }
-        usleep(5000);
+        usleep(10000);
     }
-
-    close(fd);
-    freeaddrinfo(res);
     return best;
 }
 
@@ -263,29 +227,11 @@ static uint64_t sender_t1_to_local_ns(uint64_t sender_t1_ns,
 
 static bool start_remote_clock_server()
 {
-    if (g_sender_ssh.empty()) return true;
-    std::string cmd = ssh_base_cmd() + g_sender_ssh
-        + " 'pkill -f clock_cal_server.py 2>/dev/null || true; "
-          "nohup python3 " + g_clock_cal_script
-        + " --ip 0.0.0.0 --port " + std::to_string(g_clock_cal_port)
-        + " >/tmp/clock_cal_server.log 2>&1 </dev/null &'";
-    if (system(cmd.c_str()) != 0) return false;
-
-    for (int i = 0; i < 20; ++i) {
-        ClockSample s = sample_clock_pair();
-        if (s.valid) return true;
-        usleep(100000);
-    }
-    return false;
+    return sample_clock_pair().valid;
 }
 
 static void stop_remote_clock_server()
 {
-    if (g_sender_ssh.empty()) return;
-    std::string cmd = ssh_base_cmd() + g_sender_ssh
-        + " 'pkill -f clock_cal_server.py 2>/dev/null || true'"
-          " >/dev/null 2>&1";
-    system(cmd.c_str());
 }
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
@@ -797,8 +743,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
         else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
         else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
-        else if (!strcmp(argv[i],"--clock-cal-host") && i+1<argc) g_clock_cal_host = argv[++i];
-        else if (!strcmp(argv[i],"--clock-cal-port") && i+1<argc) g_clock_cal_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 
