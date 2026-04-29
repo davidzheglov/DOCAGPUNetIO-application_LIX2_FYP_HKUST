@@ -97,7 +97,7 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port,
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     /* Enlarge receive buffer to avoid drops during GPU batch processing */
-    int rcvbuf = 16 * 1024 * 1024;  /* 16 MB — holds ~330k TickMessages */
+    int rcvbuf = 64 * 1024 * 1024;  /* 64 MB — more headroom for high-rate runs */
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     sockaddr_in addr{};
@@ -138,6 +138,16 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port,
     struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };  /* 100ms */
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+#ifdef SO_RXQ_OVFL
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof(one));
+#endif
+
+    socklen_t optlen = sizeof(rcvbuf);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &optlen) == 0) {
+        fprintf(stderr, "[cpu_receiver] socket rcvbuf=%d bytes\n", rcvbuf);
+    }
+
     int ts_flags = SOF_TIMESTAMPING_RX_HARDWARE
                  | SOF_TIMESTAMPING_RX_SOFTWARE
                  | SOF_TIMESTAMPING_SOFTWARE
@@ -160,7 +170,8 @@ static int make_mcast_recv_socket(const char *mcast_addr, int port,
 }
 
 static ssize_t recv_tick_with_timestamp(int fd, TickMessage *tick,
-                                        uint64_t *rx_ts_ns)
+                                        uint64_t *rx_ts_ns,
+                                        uint32_t *overflow_delta)
 {
     alignas(struct cmsghdr) char control[256];
     iovec iov{};
@@ -177,6 +188,8 @@ static ssize_t recv_tick_with_timestamp(int fd, TickMessage *tick,
     if (n < 0) return n;
 
     uint64_t best_ts = 0;
+    uint32_t overflow = 0;
+    static uint32_t last_overflow = 0;
     for (cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
          cmsg != nullptr;
          cmsg = CMSG_NXTHDR(&msg, cmsg)) {
@@ -201,11 +214,17 @@ static ssize_t recv_tick_with_timestamp(int fd, TickMessage *tick,
                 best_ts = timespec_to_ns(*ts);
                 break;
             }
+#ifdef SO_RXQ_OVFL
+        } else if (cmsg->cmsg_type == SO_RXQ_OVFL) {
+            overflow = *reinterpret_cast<uint32_t *>(CMSG_DATA(cmsg));
+#endif
         }
     }
 
     if (best_ts == 0) best_ts = now_ns();
     *rx_ts_ns = best_ts;
+    *overflow_delta = (overflow >= last_overflow) ? (overflow - last_overflow) : 0;
+    last_overflow = overflow;
     return n;
 }
 
@@ -431,6 +450,7 @@ int main(int argc, char **argv)
     int batch_n = 0;
     uint64_t total_recv = 0;
     uint64_t total_batches = 0;
+    uint64_t total_kernel_drops = 0;
     auto start_time = std::chrono::steady_clock::now();
 
     /* Banner detected by scripts/benchmark.py::start_receiver() */
@@ -448,8 +468,19 @@ int main(int argc, char **argv)
     uint64_t last_report_ns  = 0;
     while (!g_quit) {
         uint64_t rx_ts_ns = 0;
+        uint32_t overflow_delta = 0;
         ssize_t n = recv_tick_with_timestamp(recv_fd, &gpu.h_ticks[batch_n],
-                                             &rx_ts_ns);
+                                             &rx_ts_ns, &overflow_delta);
+
+        if (overflow_delta > 0) {
+            total_kernel_drops += overflow_delta;
+            if (total_kernel_drops <= 10 || overflow_delta >= 1024) {
+                fprintf(stderr,
+                        "[T1] kernel socket overflow: +%u dropped (total=%llu)\n",
+                        overflow_delta,
+                        (unsigned long long)total_kernel_drops);
+            }
+        }
 
         if (n == sizeof(TickMessage)) {
             gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
@@ -497,9 +528,12 @@ int main(int argc, char **argv)
     nvtxRangePop();          /* steady_state */
     cudaProfilerStop();
 
-    fprintf(stderr, "[T1 cpu_receiver] shutting down: total_recv=%llu batches=%llu\n",
+    fprintf(stderr,
+            "[T1 cpu_receiver] shutting down: total_recv=%llu batches=%llu "
+            "kernel_drops=%llu\n",
             (unsigned long long)total_recv,
-            (unsigned long long)total_batches);
+            (unsigned long long)total_batches,
+            (unsigned long long)total_kernel_drops);
 
     gpu_free(gpu);
     close(recv_fd);

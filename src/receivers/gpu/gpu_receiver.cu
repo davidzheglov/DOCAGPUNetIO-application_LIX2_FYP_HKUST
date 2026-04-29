@@ -14,17 +14,12 @@
  *       -> SignalResult -> fill_simulator
  *
  * Benchmark definition for T4/T5:
- *   t1 = receiver-side ingress timestamp on lxcpu1, taken from the GPUNetIO
- *        RX Completion Queue Entry (CQE) via doca_gpu_dev_eth_rxq_get_pkt_ts().
- *        This is closer to true NIC ingress than our previous "first GPU touch"
- *        clock64() stamp. t2/t3/t4 remain GPU clock64() values converted to the
- *        host wall-clock domain by the CPU forwarding thread.
- *
- * Important note:
- *   The CQE timestamp is NIC-domain time, not GPU clock64(). For clean
- *   comparison against t2/t3/t4, CLOCK_REALTIME on lxcpu1 should be aligned to
- *   the NIC PHC (for example via phc2sys). The CPU forwarding thread therefore
- *   leaves t1_ns unchanged for T4/T5 and converts only t2/t3/t4.
+ *   By default, t1 is stamped at the first GPU-visible receive point via
+ *   clock64(), so all four timestamps share one conversion path into host
+ *   wall-clock time. An experimental --nic-t1 mode instead uses the GPUNetIO
+ *   RX CQE timestamp via doca_gpu_dev_eth_rxq_get_pkt_ts(), which is closer to
+ *   true NIC ingress but only produces meaningful e2e/ingest numbers if
+ *   CLOCK_REALTIME on lxcpu1 is aligned to the NIC PHC.
  *
  * DOCA SDK version: 3.x (uses doca_gpunetio_dev_eth_rxq.cuh)
  *
@@ -230,7 +225,8 @@ __global__ void gpu_recv_process_kernel(
     ResultSlot              *result_ring,
     volatile uint64_t       *ring_head,
     uint32_t                 ring_depth,
-    uint8_t                  tier)
+    uint8_t                  tier,
+    int                      use_nic_t1)
 {
     const int tid = threadIdx.x;
 
@@ -342,11 +338,10 @@ __global__ void gpu_recv_process_kernel(
                 if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
-                    /* T1: NIC-side CQE timestamp for this packet.
-                     * This is a closer proxy for receiver NIC ingress than
-                     * the previous "first GPU touch" clock64() stamp. */
-                    uint64_t t1 = doca_gpu_dev_eth_rxq_get_pkt_ts(
-                        rxq, s_first_pkt_idx + tid);
+                    uint64_t t1 = use_nic_t1
+                        ? doca_gpu_dev_eth_rxq_get_pkt_ts(
+                              rxq, s_first_pkt_idx + tid)
+                        : clock64();
 
                     /* T2: tick is now in GPU memory */
                     uint64_t t2 = clock64();
@@ -473,6 +468,7 @@ struct ForwardCtx {
     int                signal_fd   = -1;
     sockaddr_in        harness_dest{};
     sockaddr_in        signal_dest{};
+    bool               t1_is_nic_time = false;
     std::atomic<bool>  stop{false};
 };
 
@@ -537,7 +533,7 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
-                if (br.tier != 4 && br.tier != 5) {
+                if (!(ctx->t1_is_nic_time && (br.tier == 4 || br.tier == 5))) {
                     br.t1_ns = cyc_to_wall_ns(br.t1_ns,
                                               ctx->gpu_cyc_anchor,
                                               ctx->host_wall_anchor_ns,
@@ -598,6 +594,8 @@ struct DocaContext {
     void                         *gpu_pkt_buf = nullptr;
     struct doca_flow_pipe_entry  *flow_entry = nullptr;  /* for counter query */
 };
+
+static bool g_use_nic_t1 = false;
 
 static size_t get_page_size(void)
 {
@@ -922,6 +920,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip   = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
+        else if (!strcmp(argv[i],"--nic-t1"))                     g_use_nic_t1 = true;
     }
 
     fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
@@ -990,6 +989,7 @@ int main(int argc, char **argv)
     fwd_ctx.signal_fd    = signal_fd;
     fwd_ctx.harness_dest = harness_dest;
     fwd_ctx.signal_dest  = signal_dest;
+    fwd_ctx.t1_is_nic_time = g_use_nic_t1;
 
     /* ── GPU-cycle ↔ host-wall-clock anchor ────────────────────────────────
      * t2/t3/t4 are stamped via clock64() inside the GPU kernel — that's a
@@ -1045,7 +1045,8 @@ int main(int argc, char **argv)
         d_ring_slots,
         d_ring_head,
         ring.depth,
-        tier);
+        tier,
+        g_use_nic_t1 ? 1 : 0);
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;
