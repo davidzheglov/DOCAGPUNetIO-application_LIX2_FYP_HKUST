@@ -14,11 +14,17 @@
  *       -> SignalResult -> fill_simulator
  *
  * Benchmark definition for T4/T5:
- *   t1 = receiver-side ingress timestamp on lxcpu1, taken inside the
- *        persistent GPU receive kernel when the packet becomes visible in the
- *        GPUNetIO RX queue. The raw GPU clock64() value is translated into the
- *        host wall-clock domain by the CPU forwarding thread using the same
- *        anchor pair already used for t2/t3/t4.
+ *   t1 = receiver-side ingress timestamp on lxcpu1, taken from the GPUNetIO
+ *        RX Completion Queue Entry (CQE) via doca_gpu_dev_eth_rxq_get_pkt_ts().
+ *        This is closer to true NIC ingress than our previous "first GPU touch"
+ *        clock64() stamp. t2/t3/t4 remain GPU clock64() values converted to the
+ *        host wall-clock domain by the CPU forwarding thread.
+ *
+ * Important note:
+ *   The CQE timestamp is NIC-domain time, not GPU clock64(). For clean
+ *   comparison against t2/t3/t4, CLOCK_REALTIME on lxcpu1 should be aligned to
+ *   the NIC PHC (for example via phc2sys). The CPU forwarding thread therefore
+ *   leaves t1_ns unchanged for T4/T5 and converts only t2/t3/t4.
  *
  * DOCA SDK version: 3.x (uses doca_gpunetio_dev_eth_rxq.cuh)
  *
@@ -292,7 +298,11 @@ __global__ void gpu_recv_process_kernel(
                 if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
-                    uint64_t t1 = clock64();
+                    /* T1: NIC-side CQE timestamp for this packet.
+                     * This is a closer proxy for receiver NIC ingress than
+                     * the previous "first GPU touch" clock64() stamp. */
+                    uint64_t t1 = doca_gpu_dev_eth_rxq_get_pkt_ts(
+                        rxq, s_first_pkt_idx + tid);
 
                     /* T2: tick is now in GPU memory */
                     uint64_t t2 = clock64();
@@ -469,10 +479,12 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
-                br.t1_ns  = cyc_to_wall_ns(br.t1_ns,
-                                           ctx->gpu_cyc_anchor,
-                                           ctx->host_wall_anchor_ns,
-                                           ctx->ns_per_cyc);
+                if (br.tier != 4 && br.tier != 5) {
+                    br.t1_ns = cyc_to_wall_ns(br.t1_ns,
+                                              ctx->gpu_cyc_anchor,
+                                              ctx->host_wall_anchor_ns,
+                                              ctx->ns_per_cyc);
+                }
                 br.t2_ns  = cyc_to_wall_ns(br.t2_ns,
                                            ctx->gpu_cyc_anchor,
                                            ctx->host_wall_anchor_ns,
