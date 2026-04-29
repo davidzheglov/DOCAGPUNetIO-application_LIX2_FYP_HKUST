@@ -41,6 +41,7 @@ backtest.log
 # Editors
 .vscode/
 .claude/
+.codex
 .idea/
 *.swp
 *~

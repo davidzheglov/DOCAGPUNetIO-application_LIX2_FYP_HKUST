@@ -13,6 +13,14 @@
  *       -> BenchmarkResult -> harness (via host UDP thread)
  *       -> SignalResult -> fill_simulator
  *
+ * Benchmark definition for T4/T5:
+ *   By default, t1 is stamped at the first GPU-visible receive point via
+ *   clock64(), so all four timestamps share one conversion path into host
+ *   wall-clock time. An experimental --nic-t1 mode instead uses the GPUNetIO
+ *   RX CQE timestamp via doca_gpu_dev_eth_rxq_get_pkt_ts(), which is closer to
+ *   true NIC ingress but only produces meaningful e2e/ingest numbers if
+ *   CLOCK_REALTIME on lxcpu1 is aligned to the NIC PHC.
+ *
  * DOCA SDK version: 3.x (uses doca_gpunetio_dev_eth_rxq.cuh)
  *
  * Usage:
@@ -65,7 +73,8 @@
 #define MAX_PKT_NUM        2048
 #define MAX_PKT_SIZE       2048
 #define ETH_IP_UDP_HDR     42       /* 14 + 20 + 8 */
-#define RESULT_QUEUE_DEPTH 4096
+#define RESULT_QUEUE_DEPTH 65536
+#define SEND_BATCH         256
 #define MAX_RX_TIMEOUT_NS  10000000ULL  /* 10ms timeout */
 
 #define CUDA_CHECK(call) \
@@ -106,6 +115,50 @@ __device__ static double rsi_cas(double *slot, double sample, double alpha)
         desired  = (unsigned long long)__double_as_longlong(new_val);
     } while (atomicCAS(addr, expected, desired) != expected);
     return new_val;
+}
+
+/* ── Per-tick Monte Carlo VaR forecast ────────────────────────────────────
+ * Identical to process_kernel.cuh::compute_risk_mc — duplicated here because
+ * gpu_receiver.cu has its own inline ema_cas/rsi_cas that would collide with
+ * a #include of process_kernel.cuh. Keep this in sync if you change the math
+ * (or refactor both into a shared gpu_helpers.cuh). */
+__device__ static void compute_risk_mc(
+    double mid, double recent_vol_deviation, uint32_t seed,
+    double &var_95, double &cvar_95,
+    double &mc_mean, double &mc_std)
+{
+    const double sigma   = MC_BASE_VOL * (1.0 + recent_vol_deviation);
+    const double sqrt_dt = sqrt(MC_DT);
+    const double drift   = -0.5 * sigma * sigma * MC_DT;
+    const double diff    =  sigma * sqrt_dt;
+    const double TWO_PI  = 6.28318530717958647692;
+
+    double sum   = 0.0;
+    double sumsq = 0.0;
+
+    uint32_t rng = seed | 1u;
+
+    #pragma unroll 8
+    for (int p = 0; p < MC_N_PATHS; ++p) {
+        double S = mid;
+        for (int s = 0; s < MC_N_STEPS; ++s) {
+            rng = rng * 1664525u + 1013904223u;
+            double u1 = ((double)rng + 1.0) * (1.0 / 4294967297.0);
+            rng = rng * 1664525u + 1013904223u;
+            double u2 =  (double)rng        * (1.0 / 4294967296.0);
+            double z  = sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2);
+            S = S * exp(drift + diff * z);
+        }
+        sum   += S;
+        sumsq += S * S;
+    }
+
+    const double n  = (double)MC_N_PATHS;
+    mc_mean        = sum / n;
+    double var_pop = sumsq / n - mc_mean * mc_mean;
+    mc_std         = sqrt(fmax(var_pop, 0.0));
+    var_95         = mc_mean - 1.6448536270 * mc_std;
+    cvar_95        = mc_mean - 2.0627128443 * mc_std;
 }
 
 /* ── GPU result ring (GPU -> CPU readback) ────────────────────────────────── */
@@ -173,7 +226,9 @@ __global__ void gpu_recv_process_kernel(
     ResultSlot              *result_ring,
     volatile uint64_t       *ring_head,
     uint32_t                 ring_depth,
-    uint8_t                  tier)
+    uint8_t                  tier,
+    int                      use_nic_t1,
+    int                      light_mode)
 {
     const int tid = threadIdx.x;
 
@@ -285,6 +340,10 @@ __global__ void gpu_recv_process_kernel(
                 if (dst_port == TICK_MCAST_PORT) {
                     const TickMessage *tick =
                         reinterpret_cast<const TickMessage *>(pkt + ETH_IP_UDP_HDR);
+                    uint64_t t1 = use_nic_t1
+                        ? doca_gpu_dev_eth_rxq_get_pkt_ts(
+                              rxq, s_first_pkt_idx + tid)
+                        : clock64();
 
                     /* T2: tick is now in GPU memory */
                     uint64_t t2 = clock64();
@@ -330,6 +389,17 @@ __global__ void gpu_recv_process_kernel(
                     int8_t combined = 0;
                     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
+                    double var_95 = mid, cvar_95 = mid, mc_mean = mid, mc_std = 0.0;
+                    if (!light_mode) {
+                        double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
+                        double vol_dev    = fmin(rel_spread * 50.0, 4.0);
+                        uint32_t seed = (uint32_t)(tick->tick_id * 2654435761u
+                                                  ^ ((uint32_t)inst * 0x9E3779B1u)
+                                                  ^ (uint32_t)t2);
+                        compute_risk_mc(mid, vol_dev, seed,
+                                        var_95, cvar_95, mc_mean, mc_std);
+                    }
+
                     /* T3: kernel done */
                     uint64_t t3 = clock64();
 
@@ -346,7 +416,7 @@ __global__ void gpu_recv_process_kernel(
                     ResultSlot *rslot = &result_ring[ring_idx % ring_depth];
 
                     rslot->bench.tick_id = tick->tick_id;
-                    rslot->bench.t1_ns   = tick->timestamp_ns;
+                    rslot->bench.t1_ns   = t1;
                     rslot->bench.t2_ns   = t2;
                     rslot->bench.t3_ns   = t3;
                     rslot->bench.t4_ns   = 0;   /* 0 = "in flight" sentinel */
@@ -365,6 +435,10 @@ __global__ void gpu_recv_process_kernel(
                     rslot->signal.spread        = spread;
                     rslot->signal.fast_ema      = fast_ema;
                     rslot->signal.slow_ema      = slow_ema;
+                    rslot->signal.var_95        = var_95;
+                    rslot->signal.cvar_95       = cvar_95;
+                    rslot->signal.mc_mean       = mc_mean;
+                    rslot->signal.mc_std        = mc_std;
 
                     __threadfence_system();
                     uint64_t t4 = clock64();
@@ -387,18 +461,22 @@ struct ForwardCtx {
     double             ns_per_cyc  = 1.0;
     /* GPU clock64() <-> host wall-clock anchor captured just before
      * the persistent kernel starts. Lets cpu_forward_thread translate
-     * every (t2, t3, t4) from "cycles since SM reset" into "nanoseconds
-     * since Unix epoch" — the same frame as t1 (set by the sender via
-     * gettimeofday). Without this anchor, e2e/ingest latencies are
-     * nonsense because the two clocks don't even share a zero. */
+     * every (t1, t2, t3, t4) from "cycles since SM reset" into
+     * "nanoseconds since Unix epoch" in the receiver host clock domain.
+     * Without this anchor, ingress/e2e latencies are nonsense because the
+     * GPU clock and host wall clock don't even share a zero. */
     uint64_t           gpu_cyc_anchor        = 0;
     uint64_t           host_wall_anchor_ns   = 0;
     int                harness_fd  = -1;
     int                signal_fd   = -1;
     sockaddr_in        harness_dest{};
     sockaddr_in        signal_dest{};
+    bool               t1_is_nic_time = false;
     std::atomic<bool>  stop{false};
 };
+
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n);
 
 /* One-shot kernel: read clock64() once so the host can anchor the GPU
  * cycle counter to wall-clock time. Launched just before the persistent
@@ -430,6 +508,7 @@ static uint64_t cyc_to_wall_ns(uint64_t cyc,
 static void cpu_forward_thread(ForwardCtx *ctx)
 {
     uint64_t fwd_count = 0;
+    uint64_t ring_overflow_drop = 0;
     uint64_t last_report = 0;
     auto start_time = std::chrono::steady_clock::now();
 
@@ -452,8 +531,20 @@ static void cpu_forward_thread(ForwardCtx *ctx)
         }
 
         if (ctx->ring->tail < head) {
+            if (head - ctx->ring->tail > ctx->ring->depth) {
+                uint64_t lost = (head - ctx->ring->tail) - ctx->ring->depth;
+                ring_overflow_drop += lost;
+                ctx->ring->tail = head - ctx->ring->depth;
+                fprintf(stderr,
+                        "[CPU-FWD] ring overflow: dropped %llu stale results "
+                        "(total=%llu)\n",
+                        (unsigned long long)lost,
+                        (unsigned long long)ring_overflow_drop);
+            }
             nvtxRangePushA("forward_batch");
-            uint64_t batch_n = head - ctx->ring->tail;
+            BenchmarkResult bench_batch[SEND_BATCH];
+            SignalResult sig_batch[SEND_BATCH];
+            int out_n = 0;
             while (ctx->ring->tail < head) {
                 uint64_t idx = ctx->ring->tail % ctx->ring->depth;
                 ResultSlot *rs = &ctx->ring->slots[idx];
@@ -461,6 +552,12 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
 
+                if (!(ctx->t1_is_nic_time && (br.tier == 4 || br.tier == 5))) {
+                    br.t1_ns = cyc_to_wall_ns(br.t1_ns,
+                                              ctx->gpu_cyc_anchor,
+                                              ctx->host_wall_anchor_ns,
+                                              ctx->ns_per_cyc);
+                }
                 br.t2_ns  = cyc_to_wall_ns(br.t2_ns,
                                            ctx->gpu_cyc_anchor,
                                            ctx->host_wall_anchor_ns,
@@ -475,33 +572,34 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                                            ctx->ns_per_cyc);
                 sig.t3_ns = br.t3_ns;
                 sig.t4_ns = br.t4_ns;
-
-                nvtxRangePushA("sendto_pair");
-                ssize_t s1 = sendto(ctx->harness_fd, &br, sizeof(br), 0,
-                       reinterpret_cast<const sockaddr *>(&ctx->harness_dest),
-                       sizeof(ctx->harness_dest));
-                ssize_t s2 = sendto(ctx->signal_fd, &sig, sizeof(sig), 0,
-                       reinterpret_cast<const sockaddr *>(&ctx->signal_dest),
-                       sizeof(ctx->signal_dest));
-                nvtxRangePop();
-
+                bench_batch[out_n] = br;
+                sig_batch[out_n] = sig;
+                ++out_n;
                 fwd_count++;
                 if (fwd_count <= 5 || fwd_count % 500 == 0) {
-                    fprintf(stderr, "[CPU-FWD] #%llu: tick=%u sendto=%zd/%zd\n",
-                            (unsigned long long)fwd_count, br.tick_id, s1, s2);
+                    fprintf(stderr, "[CPU-FWD] #%llu: tick=%u queued_for_send\n",
+                            (unsigned long long)fwd_count, br.tick_id);
                 }
 
                 ++ctx->ring->tail;
+
+                if (out_n >= SEND_BATCH || ctx->ring->tail >= head) {
+                    nvtxRangePushA("sendto_pair");
+                    send_many(ctx->harness_fd, ctx->harness_dest, bench_batch, out_n);
+                    send_many(ctx->signal_fd,  ctx->signal_dest,  sig_batch,   out_n);
+                    nvtxRangePop();
+                    out_n = 0;
+                }
             }
             nvtxMarkA("batch_done");
-            (void)batch_n;
             nvtxRangePop();
         }
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
 
-    fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu\n",
-            (unsigned long long)fwd_count);
+    fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu ring_overflow_drops=%llu\n",
+            (unsigned long long)fwd_count,
+            (unsigned long long)ring_overflow_drop);
 }
 
 /* ── DOCA host-side initialisation (DOCA 3.x API) ─────────────────────── */
@@ -516,6 +614,9 @@ struct DocaContext {
     void                         *gpu_pkt_buf = nullptr;
     struct doca_flow_pipe_entry  *flow_entry = nullptr;  /* for counter query */
 };
+
+static bool g_use_nic_t1 = false;
+static bool g_light_bench = false;
 
 static size_t get_page_size(void)
 {
@@ -820,6 +921,30 @@ static int make_udp_send(const char *addr, int port, sockaddr_in &dest)
     return fd;
 }
 
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
+{
+    if (n <= 0) return;
+    struct mmsghdr msgs[SEND_BATCH];
+    struct iovec   iovs[SEND_BATCH];
+    int sent = 0;
+    while (sent < n) {
+        int chunk = std::min(n - sent, SEND_BATCH);
+        for (int i = 0; i < chunk; ++i) {
+            iovs[i].iov_base = const_cast<T *>(&items[sent + i]);
+            iovs[i].iov_len  = sizeof(T);
+            std::memset(&msgs[i], 0, sizeof(msgs[i]));
+            msgs[i].msg_hdr.msg_name    = &dest;
+            msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+            msgs[i].msg_hdr.msg_iov     = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen  = 1;
+        }
+        int rc = sendmmsg(fd, msgs, chunk, 0);
+        if (rc < 0) { perror("sendmmsg"); break; }
+        sent += rc;
+    }
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 static volatile uint32_t g_quit = 0;
 static void sig_handler(int) { g_quit = 1; }
@@ -840,10 +965,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier         = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip   = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
+        else if (!strcmp(argv[i],"--nic-t1"))                     g_use_nic_t1 = true;
+        else if (!strcmp(argv[i],"--light-bench"))                g_light_bench = true;
     }
 
     fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
             tier, cuda_device, gpu_pcie, nic_pcie);
+    if (g_light_bench)
+        fprintf(stderr, "[T4/T5] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -908,6 +1037,7 @@ int main(int argc, char **argv)
     fwd_ctx.signal_fd    = signal_fd;
     fwd_ctx.harness_dest = harness_dest;
     fwd_ctx.signal_dest  = signal_dest;
+    fwd_ctx.t1_is_nic_time = g_use_nic_t1;
 
     /* ── GPU-cycle ↔ host-wall-clock anchor ────────────────────────────────
      * t2/t3/t4 are stamped via clock64() inside the GPU kernel — that's a
@@ -963,7 +1093,9 @@ int main(int argc, char **argv)
         d_ring_slots,
         d_ring_head,
         ring.depth,
-        tier);
+        tier,
+        g_use_nic_t1 ? 1 : 0,
+        g_light_bench ? 1 : 0);
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;

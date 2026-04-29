@@ -134,10 +134,47 @@ make data_source_live dpu_relay_dpu t1
 ./scripts/run_live_pipeline.sh --tier 1 --symbols BTCUSDT,ETHUSDT
 ```
 
+## Frontend Demo Plan
+
+We plan to add a frontend for the live demo in a separate `frontend` branch.
+The intended frontend scope is to control and visualise the **existing backend
+pipeline**, not to replace it.
+
+The frontend should be able to:
+
+- start and stop the live demo pipeline
+- choose a receiver tier (`T1`–`T4`)
+- choose demo symbols
+- show pipeline health, logs, throughput, and recent signals
+
+For the first milestone, the recommended target is the live-demo path:
+
+```text
+data_source_live (host)
+  -> dpu_relay (DPU ARM)
+  -> selected receiver tier on lxcpu1
+  -> fill_simulator / local metrics display
+```
+
+The detailed handoff note for the teammate working on the frontend branch is:
+
+[docs/FRONTEND_INTEGRATION.md](/home/timmy/DOCAGPUNetIO-application_LIX2_FYP_HKUST/docs/FRONTEND_INTEGRATION.md)
+
+That document describes:
+
+- which binaries/scripts already form the backend
+- the recommended control model for the frontend
+- the exact commands currently used to run each tier
+- the suggested first frontend deliverable
+
 ## Timestamps
 
-Each tick carries four timestamps for latency decomposition:
-- **T1** — stamped by data source at `sendto()`
-- **T2** — stamped when tick arrives in GPU memory
-- **T3** — stamped by CUDA kernel on completion
-- **T4** — stamped when signal written to output buffer
+For the current T1-T4 benchmark path, latency decomposition uses a single
+receiver-side clock domain on `lxcpu1`:
+- **T1** — receiver-side ingress timestamp on `lxcpu1`
+- **T2** — stamped when the tick reaches the tier's ingest point / GPU memory
+- **T3** — stamped when compute completes
+- **T4** — stamped when the result is available to send back to the harness
+
+This means the reported benchmark latencies are receiver-ingress-to-output
+measurements rather than cross-machine sender-to-receiver wall-clock times.

@@ -59,6 +59,9 @@ using NS    = std::chrono::nanoseconds;
  *  Multicast socket helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
+/* Global stop flag — set by SIGINT/SIGTERM, polled by worker loops. */
+static std::atomic<bool> g_stop{false};
+
 /* Global: if set via --iface, forces multicast out a specific NIC */
 static const char *g_mcast_iface = nullptr;
 
@@ -267,19 +270,27 @@ static LiveContext *g_live_ctx = nullptr;
 static char        g_frag_buf[MAX_MSG_LEN];
 static size_t      g_frag_len = 0;
 
+/* Per-instrument book state — replaces the previous single static pair, which
+ * collided across symbols (e.g. an ETH bookTicker overwriting BTC's bid/ask). */
+static double g_last_bid[MAX_INSTRUMENTS] = {0};
+static double g_last_ask[MAX_INSTRUMENTS] = {0};
+
+static bool json_has_event(const char *json, const char *event_value)
+{
+    /* Matches "e":"<event_value>" — true only for streams that publish "e",
+     * i.e. aggTrade. bookTicker has no "e" field. */
+    const char *p = strstr(json, "\"e\":\"");
+    if (!p) return false;
+    p += 5;  /* past `"e":"` */
+    return strncmp(p, event_value, strlen(event_value)) == 0;
+}
+
 static void process_binance_message(const char *msg, LiveContext *ctx)
 {
     /* bookTicker: {"u":...,"s":"BTCUSDT","b":"42000","B":"1","a":"42001","A":"1"} */
     /* aggTrade:   {"e":"aggTrade","s":"BTCUSDT","p":"42000","q":"0.1",...} */
-    fprintf(stderr, "[live] Received: %.200s\n", msg);
+    /* Combined-stream envelope: {"stream":"btcusdt@aggTrade","data":{...}} */
 
-    static int msg_count = 0;
-    static double current_bid = 0;
-    static double current_ask = 0;
-
-    if (++msg_count % 100 == 0) {
-        fprintf(stderr, "[live] Sample msg: %.200s\n", msg);
-    }
     char symbol[16] = {};
     if (!json_get_string(msg, "\"s\"", symbol, sizeof(symbol))) return;
 
@@ -288,25 +299,27 @@ static void process_binance_message(const char *msg, LiveContext *ctx)
     tick.instrument_id = symbol_to_id(symbol);
     tick.source        = TICK_SOURCE_LIVE;
 
-    double bid = 0, ask = 0, price = 0, qty = 0;
-    bool is_book = json_get_double(msg, "\"b\"", bid) &&
-                   json_get_double(msg, "\"a\"", ask);
-    bool is_trade = json_get_double(msg, "\"p\"", price) &&
-                    json_get_double(msg, "\"q\"", qty);
+    const bool is_trade = json_has_event(msg, "aggTrade");
 
-    if (is_book) {
-        current_bid = bid;
-        current_ask = ask;
+    if (is_trade) {
+        double price = 0, qty = 0;
+        if (!json_get_double(msg, "\"p\"", price)) return;
+        json_get_double(msg, "\"q\"", qty);
+        tick.bid        = g_last_bid[tick.instrument_id];
+        tick.ask        = g_last_ask[tick.instrument_id];
+        tick.last_price = price;
+        tick.volume     = qty;
+    } else {
+        /* Treat as bookTicker. */
+        double bid = 0, ask = 0;
+        if (!json_get_double(msg, "\"b\"", bid)) return;
+        if (!json_get_double(msg, "\"a\"", ask)) return;
+        g_last_bid[tick.instrument_id] = bid;
+        g_last_ask[tick.instrument_id] = ask;
         tick.bid        = bid;
         tick.ask        = ask;
         tick.last_price = (bid + ask) * 0.5;
         tick.volume     = 0;
-        
-    } else if (is_trade) {
-        tick.bid        = current_bid;
-        tick.ask        = current_ask;
-        tick.last_price = price;
-        tick.volume     = qty;
     }
     send_tick(ctx->fd, ctx->dest, tick);
 }
@@ -486,11 +499,11 @@ int main(int argc, char **argv)
             if (!tok.empty()) symbols.push_back(tok);
     }
 
-    std::atomic<bool> stop{false};
+    std::atomic<bool> &stop = g_stop;
 
-    /* Install SIGINT/SIGTERM handler */
-    signal(SIGINT,  [](int) { /* will check stop via flag */ });
-    signal(SIGTERM, [](int) { });
+    /* Install SIGINT/SIGTERM handler — sets g_stop so worker loops exit promptly */
+    signal(SIGINT,  [](int) { g_stop.store(true, std::memory_order_relaxed); });
+    signal(SIGTERM, [](int) { g_stop.store(true, std::memory_order_relaxed); });
 
     if (mode == "replay") {
         fprintf(stderr, "[data_source] mode=replay rate=%ld\n", rate_hz);

@@ -6,7 +6,12 @@
  *       → cudaMemcpy H→D → process_ticks_kernel → BenchmarkResult → harness
  *
  * Key difference from T1: no OS socket overhead, DPDK bypasses the kernel
- * entirely.  The cudaMemcpy step is identical to T1.
+ * entirely. The cudaMemcpy step is identical to T1.
+ *
+ * Benchmark definition for T2:
+ *   t1 = receiver-side ingress timestamp on lxcpu1, taken at the earliest
+ *        host-visible point in the DPDK RX path after the packet is accepted
+ *        by the NIC/PMD and passes the UDP dst-port filter.
  *
  * Build requires DPDK installed (pkg-config libdpdk).
  *
@@ -31,6 +36,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,13 +48,16 @@
 #include "signal_result.h"
 #include "process_kernel.cuh"
 
+static bool g_light_bench = false;
+
 /* ── Constants ───────────────────────────────────────────────────────────── */
 #define RX_RING_SIZE   1024
 #define NUM_MBUFS      8191
 #define MBUF_CACHE_SZ  250
-#define BURST_SIZE     32
-#define DEFAULT_BATCH  256
-#define ETH_IP_UDP_HDR 42   /* 14 + 20 + 8 */
+#define BURST_SIZE                   32
+#define DEFAULT_BATCH                256
+#define ETH_IP_UDP_HDR               42   /* 14 + 20 + 8 */
+#define DEFAULT_MAX_BATCH_LATENCY_NS 1000000ULL
 
 #define CUDA_CHECK(call) \
     do { cudaError_t _e=(call); if(_e!=cudaSuccess){ \
@@ -148,6 +157,30 @@ static int make_udp_send(const char *addr, int port, sockaddr_in &dest)
     return fd;
 }
 
+template<typename T>
+static inline void send_many(int fd, sockaddr_in &dest, const T *items, int n)
+{
+    if (n <= 0) return;
+    struct mmsghdr msgs[DEFAULT_BATCH];
+    struct iovec   iovs[DEFAULT_BATCH];
+    int sent = 0;
+    while (sent < n) {
+        int chunk = std::min(n - sent, DEFAULT_BATCH);
+        for (int i = 0; i < chunk; ++i) {
+            iovs[i].iov_base = const_cast<T *>(&items[sent + i]);
+            iovs[i].iov_len  = sizeof(T);
+            std::memset(&msgs[i], 0, sizeof(msgs[i]));
+            msgs[i].msg_hdr.msg_name    = &dest;
+            msgs[i].msg_hdr.msg_namelen = sizeof(dest);
+            msgs[i].msg_hdr.msg_iov     = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen  = 1;
+        }
+        int rc = sendmmsg(fd, msgs, chunk, 0);
+        if (rc < 0) { perror("sendmmsg"); break; }
+        sent += rc;
+    }
+}
+
 /* ── GPU resource bundle (same as T1) ───────────────────────────────────── */
 struct GpuResources {
     TickMessage  *d_ticks     = nullptr;
@@ -163,8 +196,6 @@ struct GpuResources {
     int           cap         = DEFAULT_BATCH;
 };
 
-static double gpu_clock_khz = 0;
-
 static void gpu_init(GpuResources &r, int cap)
 {
     r.cap = cap;
@@ -179,13 +210,14 @@ static void gpu_init(GpuResources &r, int cap)
     CUDA_CHECK(cudaMalloc(&r.d_avg_loss, state_sz)); CUDA_CHECK(cudaMemset(r.d_avg_loss, 0, state_sz));
     CUDA_CHECK(cudaMalloc(&r.d_last_mid, state_sz)); CUDA_CHECK(cudaMemset(r.d_last_mid, 0, state_sz));
     CUDA_CHECK(cudaStreamCreate(&r.stream));
-    int dev; CUDA_CHECK(cudaGetDevice(&dev));
-    int clock_khz = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev));
-    gpu_clock_khz = clock_khz;
 }
 
-/* ── Process batch ──────────────────────────────────────────────────────── */
+/* ── Process batch ──────────────────────────────────────────────────────────
+ * Uses host wall-clock for t2/t3/t4 (after each cudaStreamSynchronize).
+ * The kernel still writes clock64() into sig.t3_ns/t4_ns, but those fields
+ * are absolute SM cycles (not deltas), so the previous "t2 + sig.t3_ns *
+ * ns_per_cycle" math produced ~minutes of fake compute latency. Fixed by
+ * mirroring T1's host-stamping pattern. */
 static void process_batch(GpuResources &r, int n, uint8_t tier,
                            int harness_fd, sockaddr_in harness_dest,
                            int signal_fd,  sockaddr_in signal_dest)
@@ -199,38 +231,36 @@ static void process_batch(GpuResources &r, int n, uint8_t tier,
     launch_process_ticks(r.d_ticks, n, r.d_signals,
                           r.d_fast_ema, r.d_slow_ema,
                           r.d_avg_gain, r.d_avg_loss, r.d_last_mid,
-                          t2, r.stream);
+                          t2, r.stream, g_light_bench);
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    uint64_t t3 = now_ns();
 
     CUDA_CHECK(cudaMemcpyAsync(r.h_signals, r.d_signals,
                                 n * sizeof(SignalResult),
                                 cudaMemcpyDeviceToHost, r.stream));
     CUDA_CHECK(cudaStreamSynchronize(r.stream));
+    uint64_t t4 = now_ns();
 
+    BenchmarkResult brs[DEFAULT_BATCH];
+    SignalResult    sigs[DEFAULT_BATCH];
     for (int i = 0; i < n; ++i) {
         const TickMessage  &tick = r.h_ticks[i];
         const SignalResult &sig  = r.h_signals[i];
 
-        double ns_per_cycle = (gpu_clock_khz > 0) ? 1e6 / gpu_clock_khz : 1.0;
-        uint64_t t3 = t2 + (uint64_t)(sig.t3_ns * ns_per_cycle);
-        uint64_t t4 = t2 + (uint64_t)(sig.t4_ns * ns_per_cycle);
+        brs[i] = BenchmarkResult{};
+        brs[i].tick_id = tick.tick_id;
+        brs[i].t1_ns   = tick.timestamp_ns;
+        brs[i].t2_ns   = t2;
+        brs[i].t3_ns   = t3;
+        brs[i].t4_ns   = t4;
+        brs[i].tier    = tier;
 
-        BenchmarkResult br{};
-        br.tick_id = tick.tick_id;
-        br.t1_ns   = tick.timestamp_ns;
-        br.t2_ns   = t2;
-        br.t3_ns   = t3;
-        br.t4_ns   = t4;
-        br.tier    = tier;
-
-        sendto(harness_fd, &br, sizeof(br), 0,
-               reinterpret_cast<const sockaddr *>(&harness_dest), sizeof(harness_dest));
-
-        SignalResult out = sig;
-        out.t3_ns = t3; out.t4_ns = t4;
-        sendto(signal_fd, &out, sizeof(out), 0,
-               reinterpret_cast<const sockaddr *>(&signal_dest), sizeof(signal_dest));
+        sigs[i] = sig;
+        sigs[i].t3_ns = t3;
+        sigs[i].t4_ns = t4;
     }
+    send_many(harness_fd, harness_dest, brs,  n);
+    send_many(signal_fd,  signal_dest,  sigs, n);
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
@@ -254,9 +284,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tier")      && i+1<argc) tier       = (uint8_t)atoi(argv[++i]);
         else if (!strcmp(argv[i],"--harness")   && i+1<argc) harness_ip = argv[++i];
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip = argv[++i];
+        else if (!strcmp(argv[i],"--light-bench"))          g_light_bench = true;
     }
 
     fprintf(stderr, "[T2 dpdk_receiver] dpdk_port=%u batch=%d\n", dpdk_port, batch_size);
+    if (g_light_bench)
+        fprintf(stderr, "[T2] light benchmark mode enabled (Monte Carlo skipped)\n");
 
     uint16_t nb_ports = rte_eth_dev_count_avail();
     fprintf(stderr, "[T2] DPDK ports available: %u\n", nb_ports);
@@ -299,6 +332,9 @@ int main(int argc, char **argv)
     uint64_t total_filtered = 0;
     uint64_t total_short = 0;
     uint64_t idle_polls = 0;
+    uint64_t batch_start_ns = 0;
+    uint64_t total_batches  = 0;
+    uint64_t last_report_ns = 0;
 
     while (true) {
         uint16_t nb_rx = rte_eth_rx_burst(dpdk_port, 0, burst, BURST_SIZE);
@@ -338,7 +374,10 @@ int main(int argc, char **argv)
 
             const TickMessage *tick =
                 reinterpret_cast<const TickMessage *>(data + ETH_IP_UDP_HDR);
+            uint64_t rx_ts_ns = now_ns();
+            if (batch_n == 0) batch_start_ns = now_ns();
             memcpy(&gpu.h_ticks[batch_n], tick, sizeof(TickMessage));
+            gpu.h_ticks[batch_n].timestamp_ns = rx_ts_ns;
             ++batch_n;
 
             rte_pktmbuf_free(m);
@@ -346,25 +385,36 @@ int main(int argc, char **argv)
             if (batch_n >= batch_size) {
                 process_batch(gpu, batch_n, tier,
                                harness_fd, harness_dest, signal_fd, signal_dest);
-                fprintf(stderr, "[T2] batch: processed %d ticks (total_rx=%lu)\n",
-                        batch_n, total_rx);
+                ++total_batches;
+                uint64_t now_n = now_ns();
+                if (total_batches <= 5 || now_n - last_report_ns >= 1000000000ULL) {
+                    fprintf(stderr, "[T2] batch %lu: %d ticks (total_rx=%lu)\n",
+                            total_batches, batch_n, total_rx);
+                    last_report_ns = now_n;
+                }
                 batch_n = 0;
             }
         }
 
-        if (nb_rx == 0 && batch_n > 0) {
-            idle_polls++;
-            if (idle_polls >= 100000) {
-                process_batch(gpu, batch_n, tier,
-                               harness_fd, harness_dest, signal_fd, signal_dest);
-                fprintf(stderr, "[T2] batch: processed %d ticks (partial flush, total_rx=%lu)\n",
-                        batch_n, total_rx);
-                batch_n = 0;
-                idle_polls = 0;
+        /* Time-based flush: cap how long any tick sits in batch waiting for a
+         * full set. Without this, low-rate runs measure batch-fill time, not
+         * data-path latency. */
+        if (batch_n > 0 &&
+            (now_ns() - batch_start_ns) >= DEFAULT_MAX_BATCH_LATENCY_NS) {
+            process_batch(gpu, batch_n, tier,
+                          harness_fd, harness_dest, signal_fd, signal_dest);
+            ++total_batches;
+            uint64_t now_n = now_ns();
+            if (total_batches <= 5 || now_n - last_report_ns >= 1000000000ULL) {
+                fprintf(stderr, "[T2] batch %lu: %d ticks [age] (total_rx=%lu)\n",
+                        total_batches, batch_n, total_rx);
+                last_report_ns = now_n;
             }
-        } else if (nb_rx > 0) {
+            batch_n = 0;
             idle_polls = 0;
         }
+
+        if (nb_rx == 0) idle_polls++; else idle_polls = 0;
     }
 
     rte_eal_cleanup();

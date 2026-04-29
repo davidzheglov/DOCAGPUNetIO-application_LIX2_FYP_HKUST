@@ -74,6 +74,66 @@ __device__ static double rsi_cas(double *slot, double sample, double alpha)
     return new_val;
 }
 
+/* ── Monte Carlo risk forecast ────────────────────────────────────────────
+ * Per-tick Geometric Brownian Motion simulation. Each call:
+ *   - Runs MC_N_PATHS independent paths of MC_N_STEPS each
+ *   - Uses an LCG + Box-Muller for normal samples (cheap, deterministic seed)
+ *   - Returns the final-price distribution's mean / std and 95% VaR / CVaR
+ *     under the standard Gaussian-tail approximation
+ *
+ * Volatility input: recent_vol_deviation lets us modulate σ by activity
+ * (e.g. wider bid-ask → higher implied vol). Pass 0 to use base vol only.
+ *
+ * Designed to be the heaviest thing each thread does — purpose is to load the
+ * GPU enough that "compute" latency is meaningful and that the live demo has
+ * something visibly useful (real risk numbers per tick) to display.
+ * ────────────────────────────────────────────────────────────────────────── */
+__device__ static void compute_risk_mc(
+    double mid,
+    double recent_vol_deviation,    /* 0 = use base vol; positive = scale up */
+    uint32_t seed,
+    double &var_95, double &cvar_95,
+    double &mc_mean, double &mc_std)
+{
+    const double sigma   = MC_BASE_VOL * (1.0 + recent_vol_deviation);
+    const double sqrt_dt = sqrt(MC_DT);
+    const double drift   = -0.5 * sigma * sigma * MC_DT;
+    const double diff    =  sigma * sqrt_dt;
+    const double TWO_PI  = 6.28318530717958647692;
+
+    double sum   = 0.0;
+    double sumsq = 0.0;
+
+    uint32_t rng = seed | 1u;        /* avoid all-zero state */
+
+    #pragma unroll 8
+    for (int p = 0; p < MC_N_PATHS; ++p) {
+        double S = mid;
+        for (int s = 0; s < MC_N_STEPS; ++s) {
+            /* Two LCG draws → one Box-Muller normal sample */
+            rng = rng * 1664525u + 1013904223u;
+            double u1 = ((double)rng + 1.0) * (1.0 / 4294967297.0);
+            rng = rng * 1664525u + 1013904223u;
+            double u2 =  (double)rng        * (1.0 / 4294967296.0);
+            double z  = sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2);
+            S = S * exp(drift + diff * z);
+        }
+        sum   += S;
+        sumsq += S * S;
+    }
+
+    const double n  = (double)MC_N_PATHS;
+    mc_mean        = sum / n;
+    double var_pop = sumsq / n - mc_mean * mc_mean;
+    mc_std         = sqrt(fmax(var_pop, 0.0));
+
+    /* Gaussian-tail approximation. For log-normal final price the true VaR
+     * is asymmetric, but mid * exp(N(drift, σ²·dt·H)) is well-approximated
+     * by Normal for small σ²·dt·H — accurate enough for a demo. */
+    var_95         = mc_mean - 1.6448536270 * mc_std;          /* z_0.95   */
+    cvar_95        = mc_mean - 2.0627128443 * mc_std;          /* φ/Φ at z */
+}
+
 /* ── Main processing kernel ─────────────────────────────────────────────────── */
 
 /*
@@ -93,7 +153,8 @@ __global__ void process_ticks_kernel(
     double             * __restrict__ d_avg_gain,
     double             * __restrict__ d_avg_loss,
     double             * __restrict__ d_last_mid,
-    uint64_t                         t2_ns)      /* batch arrival time, T1-T3 */
+    uint64_t                         t2_ns,      /* batch arrival time, T1-T3 */
+    int                              light_mode)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_ticks) return;
@@ -160,6 +221,21 @@ __global__ void process_ticks_kernel(
     int8_t combined = 0;
     if (ema_sig != 0 && ema_sig == rsi_sig) combined = ema_sig;
 
+    double var_95 = mid;
+    double cvar_95 = mid;
+    double mc_mean = mid;
+    double mc_std = 0.0;
+    if (!light_mode) {
+        /* ── Heavy work: per-tick Monte Carlo VaR forecast ──────────── */
+        double rel_spread = (mid > 0.0) ? (spread / mid) : 0.0;
+        double vol_dev    = fmin(rel_spread * 50.0, 4.0);
+        uint32_t seed = (uint32_t)(tick.tick_id * 2654435761u
+                                  ^ ((uint32_t)inst * 0x9E3779B1u)
+                                  ^ (uint32_t)t2_ns);
+        compute_risk_mc(mid, vol_dev, seed,
+                        var_95, cvar_95, mc_mean, mc_std);
+    }
+
     /* ── Stamp T3 (GPU clock, converted to wall-clock ns by harness) ── */
     uint64_t t3 = clock64();
 
@@ -175,6 +251,10 @@ __global__ void process_ticks_kernel(
     out.spread        = spread;
     out.fast_ema      = fast_ema;
     out.slow_ema      = slow_ema;
+    out.var_95        = var_95;
+    out.cvar_95       = cvar_95;
+    out.mc_mean       = mc_mean;
+    out.mc_std        = mc_std;
 
     /* T4: signal is now visible in output buffer */
     __threadfence();
@@ -200,7 +280,8 @@ extern "C" void launch_process_ticks(
     double             *d_avg_loss,
     double             *d_last_mid,
     uint64_t            t2_ns,
-    cudaStream_t        stream)
+    cudaStream_t        stream,
+    bool                light_mode)
 {
     if (n_ticks <= 0) return;
     int threads = 256;
@@ -208,5 +289,5 @@ extern "C" void launch_process_ticks(
     process_ticks_kernel<<<blocks, threads, 0, stream>>>(
         d_ticks, n_ticks, d_signals,
         d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
-        t2_ns);
+        t2_ns, light_mode ? 1 : 0);
 }

@@ -26,6 +26,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -43,6 +44,7 @@
 #include <vector>
 
 #include "benchmark_result.h"
+#include "signal_result.h"
 
 using Clock = std::chrono::steady_clock;
 using Sec   = std::chrono::seconds;
@@ -82,12 +84,36 @@ static const char *receiver_binary(int tier)
     }
 }
 
+static std::string make_env_assignment(const char *name)
+{
+    const char *val = getenv(name);
+    return std::string(name) + "=" + (val ? val : "");
+}
+
 /* ── Hardware config for tier-specific args ──────────────────────────────── */
 static std::string g_dpdk_pci  = "0000:bd:00.0";   /* T2: ConnectX-7 NIC PCIe */
-static std::string g_gpu_pcie  = "00000000:AC:00.0"; /* T4: GPU 1 PCIe */
+static std::string g_rdma_dev  = "mlx5_0";         /* T3: RDMA device */
+static std::string g_gpu_pcie  = "0000:ac:00.0";   /* T4: GPU 1 PCIe */
 static std::string g_nic_pcie  = "0000:bd:00.0";     /* T4: NIC PCIe for DOCA */
 static int         g_gpu_id    = 1;                   /* T4: CUDA device */
 static std::string g_mcast_iface;                     /* NIC IP for multicast output */
+static std::string g_receiver_iface;                  /* T1 CPU receiver iface name */
+
+/* ── Remote sender config (lxcpu2 host) ──────────────────────────────────── */
+/* When g_sender_ssh is non-empty, the harness drives the sender over SSH on
+ * the remote host (e.g. lxcpu2), unicasting to g_sender_dest (the DPU relay
+ * on tmfifo). The DPU relay is expected to be already running.
+ *
+ * When g_sender_ssh is empty, the harness falls back to spawning data_source
+ * locally (legacy same-host T1 loopback mode). */
+static std::string g_sender_ssh;          /* user@host for ssh; empty = local */
+static std::string g_sender_bin
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/bin/data_source";
+static std::string g_sender_csv
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/data/ticks.csv";
+static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
+static std::string g_sender_control_path; /* optional shared SSH control socket */
+static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
@@ -105,8 +131,21 @@ static std::vector<std::string> receiver_args(int tier)
         args.push_back("--");
     }
 
+    if (tier == 3) {
+        args.push_back("--dev");
+        args.push_back(g_rdma_dev);
+    }
+
     args.push_back("--tier");
     args.push_back(std::to_string(tier));
+
+    if (g_light_bench)
+        args.push_back("--light-bench");
+
+    if (tier == 1 && !g_receiver_iface.empty()) {
+        args.push_back("--iface");
+        args.push_back(g_receiver_iface);
+    }
 
     if (tier == 4 || tier == 5) {
         args.push_back("--gpu");
@@ -139,6 +178,45 @@ static pid_t launch(const char *binary,
     return pid;
 }
 
+static pid_t launch_receiver(int tier, const char *binary,
+                             const std::vector<std::string> &extra_args)
+{
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        std::vector<std::string> owned_args;
+        std::vector<const char *> argv;
+
+        /* T2/T3/T4 need the same privilege model as their manual bring-up
+         * commands on lxcpu1. Preserve the caller's environment so CUDA/DOCA/
+         * DPDK library paths continue to work under sudo. */
+        bool need_sudo = (tier >= 2 && tier <= 5) && (geteuid() != 0);
+        if (need_sudo) {
+            argv.push_back("sudo");
+            argv.push_back("-E");
+            argv.push_back("env");
+            owned_args.push_back(make_env_assignment("PATH"));
+            owned_args.push_back(make_env_assignment("LD_LIBRARY_PATH"));
+            argv.push_back(owned_args[0].c_str());
+            argv.push_back(owned_args[1].c_str());
+        }
+
+        argv.push_back(binary);
+        for (const auto &a : extra_args) argv.push_back(a.c_str());
+        argv.push_back(nullptr);
+
+        if (need_sudo) {
+            execvp("sudo", const_cast<char *const *>(argv.data()));
+            perror("execvp sudo");
+        } else {
+            execv(binary, const_cast<char *const *>(argv.data()));
+            perror("execv");
+        }
+        _exit(1);
+    }
+    return pid;
+}
+
 /* ── Kill process tree ───────────────────────────────────────────────────── */
 static void kill_proc(pid_t pid)
 {
@@ -146,6 +224,61 @@ static void kill_proc(pid_t pid)
     kill(pid, SIGTERM);
     int status;
     waitpid(pid, &status, 0);
+}
+
+/* ── Launch the sender on lxcpu2 over SSH ────────────────────────────────────
+ * Runs data_source in replay mode on the remote host, unicasting to the DPU
+ * relay (which fans it out as multicast onto the wire). Returns the local
+ * ssh-client pid; the actual remote process must also be killed via SSH on
+ * teardown (kill_remote_sender). */
+static pid_t launch_sender_ssh(long rate_hz)
+{
+    std::string remote_cmd =
+        "pkill -x data_source 2>/dev/null || true; sleep 0.2; "
+        + g_sender_bin
+        + " --mode replay"
+        + " --csv "  + g_sender_csv
+        + " --rate " + std::to_string(rate_hz)
+        + " --dest " + g_sender_dest;
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        std::vector<std::string> owned_args;
+        std::vector<const char *> argv = {
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ServerAliveInterval=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+        };
+        if (!g_sender_control_path.empty()) {
+            owned_args.push_back("ControlPath=" + g_sender_control_path);
+            argv.push_back("-o");
+            argv.push_back("ControlMaster=no");
+            argv.push_back("-o");
+            argv.push_back(owned_args.back().c_str());
+        }
+        argv.push_back(g_sender_ssh.c_str());
+        argv.push_back(remote_cmd.c_str());
+        argv.push_back(nullptr);
+        execvp("ssh", const_cast<char *const *>(argv.data()));
+        perror("execlp ssh");
+        _exit(127);
+    }
+    return pid;
+}
+
+static void kill_remote_sender(void)
+{
+    if (g_sender_ssh.empty()) return;
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    if (!g_sender_control_path.empty()) {
+        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+    }
+    cmd += g_sender_ssh
+        + " 'pkill -x data_source 2>/dev/null || true'"
+          " >/dev/null 2>&1";
+    (void)system(cmd.c_str());
 }
 
 /* ── UDP receiver socket for BenchmarkResult ─────────────────────────────── */
@@ -175,19 +308,27 @@ struct RunResult {
     long   rate_hz;
     size_t n_ticks;
     double drop_rate;
+    size_t receiver_reported_drops;
+    size_t rejected_invalid_order;
+    size_t rejected_too_old;
     double e2e_p50, e2e_p95, e2e_p99, e2e_mean;
     double ingest_p50, ingest_p95, ingest_p99, ingest_mean;
     double compute_p50, compute_p95, compute_p99, compute_mean;
     double throughput;
+    /* Signal-rate metrics (post-kernel SignalResult emissions on port 5006) */
+    double signals_total_per_sec;       /* every processed tick → throughput proxy */
+    double signals_actionable_per_sec;  /* only signal != 0 (real buy/sell decisions) */
 };
 
 static void write_header(std::ofstream &f)
 {
     f << "run_id,tier,rate_hz,repetition,n_ticks,drop_rate,"
+      << "receiver_reported_drops,rejected_invalid_order,rejected_too_old,"
       << "e2e_p50_us,e2e_p95_us,e2e_p99_us,e2e_mean_us,"
       << "ingest_p50_us,ingest_p95_us,ingest_p99_us,ingest_mean_us,"
       << "compute_p50_us,compute_p95_us,compute_p99_us,compute_mean_us,"
-      << "throughput_per_sec\n";
+      << "throughput_per_sec,"
+      << "signals_total_per_sec,signals_actionable_per_sec\n";
 }
 
 static void write_row(std::ofstream &f, const RunResult &r)
@@ -199,103 +340,150 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << r.repetition   << ','
       << r.n_ticks      << ','
       << r.drop_rate    << ','
+      << r.receiver_reported_drops << ','
+      << r.rejected_invalid_order << ','
+      << r.rejected_too_old << ','
       << ns_to_us(r.e2e_p50)  << ',' << ns_to_us(r.e2e_p95)  << ','
       << ns_to_us(r.e2e_p99)  << ',' << ns_to_us(r.e2e_mean) << ','
       << ns_to_us(r.ingest_p50)  << ',' << ns_to_us(r.ingest_p95)  << ','
       << ns_to_us(r.ingest_p99)  << ',' << ns_to_us(r.ingest_mean) << ','
       << ns_to_us(r.compute_p50)  << ',' << ns_to_us(r.compute_p95)  << ','
       << ns_to_us(r.compute_p99)  << ',' << ns_to_us(r.compute_mean) << ','
-      << r.throughput   << '\n';
+      << r.throughput   << ','
+      << r.signals_total_per_sec << ','
+      << r.signals_actionable_per_sec << '\n';
     f.flush();
 }
 
 /* ── Single benchmark run ────────────────────────────────────────────────── */
 static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
-                          const char *csv_path, int result_fd,
+                          const char *csv_path, int result_fd, int signal_fd,
                           int warmup_sec, int duration_sec)
 {
     fprintf(stderr,
         "\n[harness] RUN %d | tier=T%d | rate=%ld | rep=%d\n",
         run_id, tier, rate_hz, repetition);
 
-    /* Build data_source args */
-    std::vector<std::string> ds_args = {
-        "--mode", "replay",
-        "--csv",  csv_path,
-        "--rate", std::to_string(rate_hz)
-    };
-    /* For T2/T4: route multicast through the physical NIC */
-    if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
-        ds_args.push_back("--iface");
-        ds_args.push_back(g_mcast_iface);
-    }
-
-    /* Kill any leftover receivers/sources from a previous run */
+    /* Kill any leftover receivers locally; on remote host the SSH launcher
+     * will pkill data_source itself before starting the new one. */
     system("pkill -f bin/cpu_receiver  2>/dev/null; "
            "pkill -f bin/dpdk_receiver 2>/dev/null; "
            "pkill -f bin/rdma_receiver 2>/dev/null; "
            "pkill -f bin/gpu_receiver  2>/dev/null; "
-           "pkill -f bin/data_source   2>/dev/null; true");
-    usleep(300000);   /* wait for ports to be released */
+           "true");
+    if (g_sender_ssh.empty()) {
+        system("pkill -f bin/data_source 2>/dev/null; true");
+    } else {
+        kill_remote_sender();
+    }
+    usleep(300000);
 
-    /* Launch data_source */
-    pid_t ds_pid = launch("./bin/data_source", ds_args);
+    /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
+    pid_t ds_pid = -1;
+    if (!g_sender_ssh.empty()) {
+        fprintf(stderr, "[harness] launching remote sender on %s\n",
+                g_sender_ssh.c_str());
+        ds_pid = launch_sender_ssh(rate_hz);
+    } else {
+        std::vector<std::string> ds_args = {
+            "--mode", "replay",
+            "--csv",  csv_path,
+            "--rate", std::to_string(rate_hz)
+        };
+        if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
+            ds_args.push_back("--iface");
+            ds_args.push_back(g_mcast_iface);
+        }
+        ds_pid = launch("./bin/data_source", ds_args);
+    }
     if (ds_pid < 0) { fprintf(stderr, "Failed to launch data_source\n"); }
 
-    /* Brief pause for data_source to start */
-    usleep(200000);
+    /* Brief pause for data_source to start (longer for remote — SSH + pkill) */
+    usleep(g_sender_ssh.empty() ? 200000 : 800000);
 
     /* Launch receiver */
     std::vector<std::string> rx_args = receiver_args(tier);
-    pid_t rx_pid = launch(receiver_binary(tier), rx_args);
+    pid_t rx_pid = launch_receiver(tier, receiver_binary(tier), rx_args);
     if (rx_pid < 0) {
         kill_proc(ds_pid);
         fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
     }
 
-    /* Drain socket during warmup */
+    /* Drain both sockets during warmup */
     auto t_start = Clock::now();
     {
         BenchmarkResult br{};
+        SignalResult    sr{};
         auto warmup_end = t_start + Sec(warmup_sec);
         fprintf(stderr, "[harness] warming up for %d s...\n", warmup_sec);
         while (Clock::now() < warmup_end) {
             recv(result_fd, &br, sizeof(br), 0);  /* discard */
+            recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);  /* non-blocking drain */
         }
     }
 
-    /* Collect during measurement window */
+    /* Collect during measurement window — poll both sockets */
     std::vector<double> e2e_ns, ingest_ns, compute_ns;
     e2e_ns.reserve(rate_hz * duration_sec);
     ingest_ns.reserve(rate_hz * duration_sec);
     compute_ns.reserve(rate_hz * duration_sec);
 
     uint64_t n_dropped = 0;
+    uint64_t n_rejected_invalid_order = 0;
+    uint64_t n_rejected_too_old = 0;
+    uint64_t n_signals_total = 0;       /* every SignalResult received */
+    uint64_t n_signals_actionable = 0;  /* signal != 0 only */
     auto measure_end = Clock::now() + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
+    pollfd pfds[2];
+    pfds[0].fd = result_fd; pfds[0].events = POLLIN;
+    pfds[1].fd = signal_fd; pfds[1].events = POLLIN;
+
     while (Clock::now() < measure_end) {
-        BenchmarkResult br{};
-        ssize_t n = recv(result_fd, &br, sizeof(br), 0);
-        if (n != sizeof(BenchmarkResult)) continue;
+        int pr = poll(pfds, 2, 50);  /* 50 ms tick */
+        if (pr <= 0) continue;
 
-        if (br.dropped) { ++n_dropped; continue; }
-        if (br.t4_ns <= br.t1_ns) continue;            /* clock glitch */
-        if (br.t4_ns - br.t1_ns > 10000000000ULL) continue;  /* > 10 s: stale */
-
-        e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
-        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
-        compute_ns.push_back((double)(br.t3_ns - br.t2_ns));
+        if (pfds[0].revents & POLLIN) {
+            BenchmarkResult br{};
+            ssize_t n = recv(result_fd, &br, sizeof(br), 0);
+            if (n == sizeof(BenchmarkResult)) {
+                if (br.dropped) { ++n_dropped; }
+                else if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
+                    ++n_rejected_invalid_order;
+                }
+                else if (br.t4_ns - br.t1_ns > 10000000000ULL) {
+                    ++n_rejected_too_old;
+                }
+                else {
+                    e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
+                    ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
+                    compute_ns.push_back((double)(br.t3_ns - br.t2_ns));
+                }
+            }
+        }
+        if (pfds[1].revents & POLLIN) {
+            SignalResult sr{};
+            ssize_t n = recv(signal_fd, &sr, sizeof(sr), 0);
+            if (n == sizeof(SignalResult)) {
+                ++n_signals_total;
+                if (sr.signal != 0) ++n_signals_actionable;
+            }
+        }
     }
 
     /* Kill subprocesses */
     kill_proc(rx_pid);
-    kill_proc(ds_pid);
-    usleep(100000);   /* allow ports to be released */
+    if (!g_sender_ssh.empty()) {
+        kill_remote_sender();   /* tells the remote machine to stop sending */
+    }
+    kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
+    usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
-    double drop_rate = (n_ticks + n_dropped) > 0
-        ? (double)n_dropped / (double)(n_ticks + n_dropped) : 0.0;
+    uint64_t n_discarded = n_dropped + n_rejected_invalid_order + n_rejected_too_old;
+    double drop_rate = (n_ticks + n_discarded) > 0
+        ? (double)n_discarded / (double)(n_ticks + n_discarded) : 0.0;
 
     RunResult r{};
     r.run_id     = run_id;
@@ -304,6 +492,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.repetition = repetition;
     r.n_ticks    = n_ticks;
     r.drop_rate  = drop_rate;
+    r.receiver_reported_drops = n_dropped;
+    r.rejected_invalid_order = n_rejected_invalid_order;
+    r.rejected_too_old = n_rejected_too_old;
     r.e2e_p50    = percentile(e2e_ns, 0.50);
     r.e2e_p95    = percentile(e2e_ns, 0.95);
     r.e2e_p99    = percentile(e2e_ns, 0.99);
@@ -318,11 +509,22 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.compute_mean = mean_of(compute_ns);
     r.throughput   = duration_sec > 0
         ? (double)n_ticks / (double)duration_sec : 0.0;
+    r.signals_total_per_sec      = duration_sec > 0
+        ? (double)n_signals_total / (double)duration_sec : 0.0;
+    r.signals_actionable_per_sec = duration_sec > 0
+        ? (double)n_signals_actionable / (double)duration_sec : 0.0;
 
     fprintf(stderr,
-        "[harness] T%d @%ld: n=%zu drop=%.2f%% e2e_p50=%.1fus e2e_p99=%.1fus tput=%.0f/s\n",
+        "[harness] T%d @%ld: n=%zu drop=%.2f%% "
+        "(rx_drop=%llu invalid=%llu too_old=%llu) "
+        "e2e_p50=%.1fus e2e_p99=%.1fus "
+        "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
-        r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput);
+        (unsigned long long)n_dropped,
+        (unsigned long long)n_rejected_invalid_order,
+        (unsigned long long)n_rejected_too_old,
+        r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput,
+        r.signals_total_per_sec, r.signals_actionable_per_sec);
 
     return r;
 }
@@ -347,10 +549,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--tiers")    && i+1<argc) tiers_str    = argv[++i];
         else if (!strcmp(argv[i],"--rates")    && i+1<argc) rates_str    = argv[++i];
         else if (!strcmp(argv[i],"--dpdk-pci") && i+1<argc) g_dpdk_pci   = argv[++i];
+        else if (!strcmp(argv[i],"--rdma-dev") && i+1<argc) g_rdma_dev   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-pcie") && i+1<argc) g_gpu_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--nic-pcie") && i+1<argc) g_nic_pcie   = argv[++i];
         else if (!strcmp(argv[i],"--gpu-id")   && i+1<argc) g_gpu_id     = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--iface")   && i+1<argc) g_mcast_iface = argv[++i];
+        else if (!strcmp(argv[i],"--receiver-iface") && i+1<argc) g_receiver_iface = argv[++i];
+        else if (!strcmp(argv[i],"--sender-ssh")  && i+1<argc) g_sender_ssh  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-bin")  && i+1<argc) g_sender_bin  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
+        else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
+        else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
+        else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 
     /* Parse tier list */
@@ -393,6 +603,11 @@ int main(int argc, char **argv)
     int result_fd = make_result_socket(BENCH_RESULT_PORT);
     if (result_fd < 0) return 1;
 
+    /* Also intercept SignalResult on port 5006 — we count signals here so the
+     * fill_simulator does not need to be running during benchmarks. */
+    int signal_fd = make_result_socket(SIGNAL_PORT);
+    if (signal_fd < 0) { close(result_fd); return 1; }
+
     /* Open CSV */
     std::ofstream csv_out(results_path);
     if (!csv_out) { fprintf(stderr, "Cannot write %s\n", results_path); return 1; }
@@ -404,7 +619,7 @@ int main(int argc, char **argv)
             for (int rep = 0; rep < reps; ++rep) {
                 ++run_id;
                 RunResult r = run_one(run_id, tier, rate, rep + 1,
-                                       csv_path.c_str(), result_fd,
+                                       csv_path.c_str(), result_fd, signal_fd,
                                        warmup_sec, duration_sec);
                 write_row(csv_out, r);
             }
@@ -412,6 +627,7 @@ int main(int argc, char **argv)
     }
 
     close(result_fd);
+    close(signal_fd);
 
     fprintf(stderr, "\n[harness] all %d runs complete. Results in %s\n",
             run_id, results_path);

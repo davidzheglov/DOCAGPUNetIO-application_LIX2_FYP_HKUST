@@ -14,15 +14,25 @@ import os
 import random
 import time
 
-INSTRUMENTS = [
-    (0, 42000.0),   # instrument_id=0, starting mid
-    (1, 2500.0),    # instrument_id=1
-    (2, 300.0),     # instrument_id=2
-]
+MAX_INSTRUMENTS = 256  # matches MAX_INSTRUMENTS in tick_message.h
+
+
+def _starting_prices(n: int):
+    """Generate plausible starting mid prices across n instruments.
+    First three are calibrated to BTC/ETH/SOL-ish; the rest are spread
+    log-uniformly across [1, 100_000] so the per-instrument EMA tables
+    in the receivers see a realistic distribution of magnitudes."""
+    seeds = [42000.0, 2500.0, 300.0]
+    if n <= len(seeds):
+        return [(i, seeds[i]) for i in range(n)]
+    rng = random.Random(0xBEEF)
+    extras = [10 ** rng.uniform(0, 5) for _ in range(n - len(seeds))]
+    return [(i, p) for i, p in enumerate(seeds + extras)]
 
 
 def generate(rows: int, n_instruments: int, output: str) -> None:
-    instruments = INSTRUMENTS[:n_instruments]
+    n_instruments = max(1, min(MAX_INSTRUMENTS, n_instruments))
+    instruments = _starting_prices(n_instruments)
     mids = {iid: mid for iid, mid in instruments}
 
     print(f"Generating {rows:,} ticks for {n_instruments} instrument(s) -> {output}")
@@ -65,10 +75,9 @@ def generate(rows: int, n_instruments: int, output: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows",        type=int, default=1_000_000)
-    parser.add_argument("--symbols",     type=int, default=2,
-                        help="Number of instruments (1-3)")
+    parser.add_argument("--symbols",     type=int, default=32,
+                        help=f"Number of instruments (1-{MAX_INSTRUMENTS})")
     parser.add_argument("--output",      default="data/ticks.csv")
     args = parser.parse_args()
 
-    args.symbols = max(1, min(3, args.symbols))
     generate(args.rows, args.symbols, args.output)
