@@ -5,8 +5,8 @@ plot_benchmark.py — produce FYP-presentation plots from a benchmark CSV.
 Reads the CSV emitted by bin/benchmark_harness (one row per tier/rate/rep)
 and writes 6 PNGs to results/plots_<timestamp>/:
 
-  01_compute_latency.png    — per-tier compute (T3-T2) p50/p99 vs rate
-  02_drop_curve.png         — drop_rate vs offered rate, all tiers (saturation)
+  01_compute_latency.png    — per-tier per-tick GPU compute p50/p99 vs rate
+  02_drop_curve.png         — sender-vs-processed drop rate vs offered rate
   03_throughput.png         — achieved tick throughput vs offered rate
   04_signal_rate.png        — total + actionable signal rate vs offered rate
   05_stage_breakdown.png    — stacked p50 ingress/compute/egress per tier @ 100k Hz
@@ -130,7 +130,7 @@ def save(fig, outdir: Path, name: str):
 # ─── Plot functions ───────────────────────────────────────────────────────────
 
 def plot_compute_latency(agg, outdir):
-    """Single-clock latency comparison."""
+    """Per-tick GPU compute comparison."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "compute_p50")
@@ -140,22 +140,22 @@ def plot_compute_latency(agg, outdir):
                 label=f"{TIER_LABEL[tier]}  p50")
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
                 alpha=0.6, label=f"{TIER_LABEL[tier]}  p99")
-    setup_axes(ax, "GPU compute latency (receiver-side single clock)",
-               "Offered tick rate (Hz)", "Compute latency T3−T2 (µs)")
+    setup_axes(ax, "Per-tick GPU compute latency",
+               "Offered tick rate (Hz)", "Per-tick compute latency (µs)")
     ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
     save(fig, outdir, "01_compute_latency.png")
 
 
 def plot_drop_curve(agg, outdir):
-    """Where each tier saturates."""
+    """Sender-vs-processed completion loss."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, drop = tier_series(agg, tier, "drop")
         ax.plot(rates, [d * 100 for d in drop],
                 color=TIER_COLOR[tier], marker=TIER_MARKER[tier],
                 linewidth=2, label=TIER_LABEL[tier])
-    setup_axes(ax, "Saturation: drop rate vs offered rate",
-               "Offered tick rate (Hz)", "Drop rate (%)")
+    setup_axes(ax, "Completion loss vs offered rate",
+               "Offered tick rate (Hz)", "Unprocessed ticks / sent ticks (%)")
     ax.set_ylim(bottom=-0.5)
     ax.legend(fontsize=9, loc="upper left", framealpha=0.95)
     save(fig, outdir, "02_drop_curve.png")

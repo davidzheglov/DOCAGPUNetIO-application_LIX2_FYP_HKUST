@@ -115,6 +115,35 @@ static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-po
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
 
+static std::string sender_stats_path_for_run(int run_id)
+{
+    return "/tmp/doca_bench_sender_stats_" + std::to_string(run_id) + ".txt";
+}
+
+static uint64_t read_counter_from_file(const std::string &path)
+{
+    std::ifstream f(path);
+    uint64_t v = 0;
+    if (f) f >> v;
+    return v;
+}
+
+static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
+{
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    if (!g_sender_control_path.empty()) {
+        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+    }
+    cmd += g_sender_ssh + " 'cat " + remote_path + " 2>/dev/null || echo 0'";
+
+    FILE *p = popen(cmd.c_str(), "r");
+    if (!p) return 0;
+    unsigned long long v = 0;
+    fscanf(p, "%llu", &v);
+    pclose(p);
+    return (uint64_t)v;
+}
+
 /* ── Build receiver args ─────────────────────────────────────────────────── */
 static std::vector<std::string> receiver_args(int tier)
 {
@@ -231,7 +260,7 @@ static void kill_proc(pid_t pid)
  * relay (which fans it out as multicast onto the wire). Returns the local
  * ssh-client pid; the actual remote process must also be killed via SSH on
  * teardown (kill_remote_sender). */
-static pid_t launch_sender_ssh(long rate_hz)
+static pid_t launch_sender_ssh(long rate_hz, const std::string &stats_path)
 {
     std::string remote_cmd =
         "pkill -x data_source 2>/dev/null || true; sleep 0.2; "
@@ -239,6 +268,7 @@ static pid_t launch_sender_ssh(long rate_hz)
         + " --mode replay"
         + " --csv "  + g_sender_csv
         + " --rate " + std::to_string(rate_hz)
+        + " --stats-file " + stats_path
         + " --dest " + g_sender_dest;
 
     pid_t pid = fork();
@@ -306,6 +336,8 @@ static int make_result_socket(int port)
 struct RunResult {
     int    run_id, tier, repetition;
     long   rate_hz;
+    size_t sent_ticks;
+    size_t processed_ticks;
     size_t n_ticks;
     double drop_rate;
     size_t receiver_reported_drops;
@@ -323,7 +355,7 @@ struct RunResult {
 
 static void write_header(std::ofstream &f)
 {
-    f << "run_id,tier,rate_hz,repetition,n_ticks,drop_rate,"
+    f << "run_id,tier,rate_hz,repetition,sent_ticks,processed_ticks,n_ticks,drop_rate,"
       << "receiver_reported_drops,inferred_missing_ticks,"
       << "rejected_invalid_order,rejected_too_old,"
       << "e2e_p50_us,e2e_p95_us,e2e_p99_us,e2e_mean_us,"
@@ -340,6 +372,8 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << r.tier         << ','
       << r.rate_hz      << ','
       << r.repetition   << ','
+      << r.sent_ticks   << ','
+      << r.processed_ticks << ','
       << r.n_ticks      << ','
       << r.drop_rate    << ','
       << r.receiver_reported_drops << ','
@@ -366,6 +400,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     fprintf(stderr,
         "\n[harness] RUN %d | tier=T%d | rate=%ld | rep=%d\n",
         run_id, tier, rate_hz, repetition);
+    std::string sender_stats_path = sender_stats_path_for_run(run_id);
 
     /* Kill any leftover receivers locally; on remote host the SSH launcher
      * will pkill data_source itself before starting the new one. */
@@ -376,8 +411,15 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
            "true");
     if (g_sender_ssh.empty()) {
         system("pkill -f bin/data_source 2>/dev/null; true");
+        unlink(sender_stats_path.c_str());
     } else {
         kill_remote_sender();
+        std::string rm_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+        if (!g_sender_control_path.empty()) {
+            rm_cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+        }
+        rm_cmd += g_sender_ssh + " 'rm -f " + sender_stats_path + "'";
+        system(rm_cmd.c_str());
     }
     usleep(300000);
 
@@ -386,12 +428,13 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     if (!g_sender_ssh.empty()) {
         fprintf(stderr, "[harness] launching remote sender on %s\n",
                 g_sender_ssh.c_str());
-        ds_pid = launch_sender_ssh(rate_hz);
+        ds_pid = launch_sender_ssh(rate_hz, sender_stats_path);
     } else {
         std::vector<std::string> ds_args = {
             "--mode", "replay",
             "--csv",  csv_path,
-            "--rate", std::to_string(rate_hz)
+            "--rate", std::to_string(rate_hz),
+            "--stats-file", sender_stats_path
         };
         if (!g_mcast_iface.empty() && (tier == 2 || tier == 4 || tier == 5)) {
             ds_args.push_back("--iface");
@@ -439,6 +482,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t n_signals_actionable = 0;  /* signal != 0 only */
     bool have_last_tick_id = false;
     uint32_t last_tick_id = 0;
+    uint64_t sent_ticks_start = g_sender_ssh.empty()
+        ? read_counter_from_file(sender_stats_path)
+        : read_remote_counter_via_ssh(sender_stats_path);
     auto measure_end = Clock::now() + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
@@ -490,6 +536,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         }
     }
 
+    uint64_t sent_ticks_end = g_sender_ssh.empty()
+        ? read_counter_from_file(sender_stats_path)
+        : read_remote_counter_via_ssh(sender_stats_path);
+    uint64_t sent_ticks_window = (sent_ticks_end >= sent_ticks_start)
+        ? (sent_ticks_end - sent_ticks_start) : 0;
+
     /* Kill subprocesses */
     kill_proc(rx_pid);
     if (!g_sender_ssh.empty()) {
@@ -499,16 +551,19 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
-    uint64_t n_discarded = n_dropped + n_inferred_missing_ticks
-                         + n_rejected_invalid_order + n_rejected_too_old;
-    double drop_rate = (n_ticks + n_discarded) > 0
-        ? (double)n_discarded / (double)(n_ticks + n_discarded) : 0.0;
+    uint64_t processed_ticks = n_signals_total;
+    double drop_rate = sent_ticks_window > 0
+        ? (double)(sent_ticks_window > processed_ticks
+              ? (sent_ticks_window - processed_ticks) : 0ULL) / (double)sent_ticks_window
+        : 0.0;
 
     RunResult r{};
     r.run_id     = run_id;
     r.tier       = tier;
     r.rate_hz    = rate_hz;
     r.repetition = repetition;
+    r.sent_ticks = sent_ticks_window;
+    r.processed_ticks = processed_ticks;
     r.n_ticks    = n_ticks;
     r.drop_rate  = drop_rate;
     r.receiver_reported_drops = n_dropped;
@@ -536,10 +591,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     fprintf(stderr,
         "[harness] T%d @%ld: n=%zu drop=%.2f%% "
-        "(rx_drop=%llu gap_drop=%llu invalid=%llu too_old=%llu) "
+        "(sent=%llu processed=%llu rx_drop=%llu gap_drop=%llu invalid=%llu too_old=%llu) "
         "e2e_p50=%.1fus e2e_p99=%.1fus "
         "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
+        (unsigned long long)sent_ticks_window,
+        (unsigned long long)processed_ticks,
         (unsigned long long)n_dropped,
         (unsigned long long)n_inferred_missing_ticks,
         (unsigned long long)n_rejected_invalid_order,

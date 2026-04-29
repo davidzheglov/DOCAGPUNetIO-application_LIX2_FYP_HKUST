@@ -75,6 +75,16 @@ static const char *g_mcast_iface = nullptr;
  * multicast from looping back to host PF1 RX / DOCA Flow.
  */
 static const char *g_dest_override = nullptr;
+static const char *g_stats_file = nullptr;
+
+static void write_stats_file(uint32_t sent_ticks)
+{
+    if (!g_stats_file) return;
+    FILE *f = fopen(g_stats_file, "w");
+    if (!f) return;
+    fprintf(f, "%u\n", sent_ticks);
+    fclose(f);
+}
 
 static int make_send_socket(sockaddr_in &dest)
 {
@@ -212,12 +222,14 @@ static void run_replay(const char *csv_path, long rate_hz, uint8_t source_flag,
             /* Busy-wait until next send slot */
             while (Clock::now() < next_send) CPU_PAUSE();
             send_tick(fd, dest, msg);
+            if ((tick_id & 0x3FFu) == 0) write_stats_file(tick_id + 1);
             next_send += NS(ns_per_tick);
         }
         /* loop dataset */
     }
 
     close(fd);
+    write_stats_file(tick_id);
     fprintf(stderr, "[replay] stopped after %u ticks\n", tick_id);
 }
 
@@ -483,6 +495,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--symbols") && i + 1 < argc) symbols_str = argv[++i];
         else if (!strcmp(argv[i], "--iface")   && i + 1 < argc) g_mcast_iface   = argv[++i];
         else if (!strcmp(argv[i], "--dest")    && i + 1 < argc) g_dest_override = argv[++i];
+        else if (!strcmp(argv[i], "--stats-file") && i + 1 < argc) g_stats_file = argv[++i];
         else if (!strcmp(argv[i], "--help"))  { usage(argv[0]); return 0; }
     }
 
