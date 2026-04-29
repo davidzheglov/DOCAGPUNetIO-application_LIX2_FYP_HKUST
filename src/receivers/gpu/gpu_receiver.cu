@@ -163,6 +163,7 @@ __device__ static void compute_risk_mc(
 
 /* ── GPU result ring (GPU -> CPU readback) ────────────────────────────────── */
 struct ResultSlot {
+    volatile uint64_t seq;
     BenchmarkResult bench;
     SignalResult    signal;
 };
@@ -403,13 +404,9 @@ __global__ void gpu_recv_process_kernel(
                     /* T3: kernel done */
                     uint64_t t3 = clock64();
 
-                    /* Write to result ring. See kernel-header comment for
-                     * the known latent race — atomicAdd here publishes
-                     * ring_head BEFORE the slot writes, and the only
-                     * mitigation in this patch is the CPU forwarder's
-                     * 10 μs sleep giving the host-mapped writes time to
-                     * drain. A proper 2-phase commit is tracked as a
-                     * follow-up. */
+                    /* Reserve a unique absolute slot number, write the payload,
+                     * then publish readiness via the per-slot sequence number.
+                     * The CPU consumer must not trust ring_head alone. */
                     uint64_t ring_idx = atomicAdd(
                         reinterpret_cast<unsigned long long *>(
                             const_cast<uint64_t *>(ring_head)), 1ULL);
@@ -441,10 +438,11 @@ __global__ void gpu_recv_process_kernel(
                     rslot->signal.mc_mean       = mc_mean;
                     rslot->signal.mc_std        = mc_std;
 
-                    __threadfence_system();
                     uint64_t t4 = clock64();
                     rslot->bench.t4_ns  = t4;
                     rslot->signal.t4_ns = t4;
+                    __threadfence_system();
+                    rslot->seq = ring_idx + 1;
 
                     atomicAdd((unsigned long long *)&s_ring_writes, 1ULL);
                 }
@@ -554,6 +552,10 @@ static void cpu_forward_thread(ForwardCtx *ctx)
             while (ctx->ring->tail < head) {
                 uint64_t idx = ctx->ring->tail % ctx->ring->depth;
                 ResultSlot *rs = &ctx->ring->slots[idx];
+                uint64_t expected_seq = ctx->ring->tail + 1;
+                if (rs->seq != expected_seq) {
+                    break;
+                }
 
                 BenchmarkResult br  = rs->bench;
                 SignalResult    sig = rs->signal;
@@ -588,6 +590,7 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                             (unsigned long long)fwd_count, br.tick_id);
                 }
 
+                rs->seq = ctx->ring->tail + ctx->ring->depth;
                 ++ctx->ring->tail;
 
                 if (out_n >= SEND_BATCH || ctx->ring->tail >= head) {
@@ -1015,6 +1018,10 @@ int main(int argc, char **argv)
                               cudaHostAllocMapped));
     *ring.head = 0;
     ring.tail  = 0;
+    std::memset(ring.slots, 0, ring.depth * sizeof(ResultSlot));
+    for (uint32_t i = 0; i < ring.depth; ++i) {
+        ring.slots[i].seq = i;
+    }
 
     /* GPU-visible pointers for host-mapped result ring */
     ResultSlot *d_ring_slots = nullptr;
