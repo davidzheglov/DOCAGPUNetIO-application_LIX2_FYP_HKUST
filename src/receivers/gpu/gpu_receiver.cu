@@ -127,38 +127,44 @@ __device__ static void compute_risk_mc(
     double &var_95, double &cvar_95,
     double &mc_mean, double &mc_std)
 {
-    const double sigma   = MC_BASE_VOL * (1.0 + recent_vol_deviation);
-    const double sqrt_dt = sqrt(MC_DT);
-    const double drift   = -0.5 * sigma * sigma * MC_DT;
-    const double diff    =  sigma * sqrt_dt;
-    const double TWO_PI  = 6.28318530717958647692;
+    /* FP32 inner sim — see commentary in process_kernel.cuh. Inputs/outputs
+     * stay double for ABI compatibility with SignalResult. */
+    const float sigma   = (float)(MC_BASE_VOL * (1.0 + recent_vol_deviation));
+    const float dt      = (float)MC_DT;
+    const float sqrt_dt = sqrtf(dt);
+    const float drift   = -0.5f * sigma * sigma * dt;
+    const float diff    =  sigma * sqrt_dt;
+    const float TWO_PI  = 6.28318530f;
+    const float mid_f   = (float)mid;
 
-    double sum   = 0.0;
-    double sumsq = 0.0;
+    float sum   = 0.0f;
+    float sumsq = 0.0f;
 
     uint32_t rng = seed | 1u;
 
-    #pragma unroll 8
     for (int p = 0; p < MC_N_PATHS; ++p) {
-        double S = mid;
+        float S = mid_f;
         for (int s = 0; s < MC_N_STEPS; ++s) {
             rng = rng * 1664525u + 1013904223u;
-            double u1 = ((double)rng + 1.0) * (1.0 / 4294967297.0);
+            float u1 = ((float)rng + 1.0f) * (1.0f / 4294967297.0f);
             rng = rng * 1664525u + 1013904223u;
-            double u2 =  (double)rng        * (1.0 / 4294967296.0);
-            double z  = sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2);
-            S = S * exp(drift + diff * z);
+            float u2 =  (float)rng         * (1.0f / 4294967296.0f);
+            float z  = sqrtf(-2.0f * logf(u1)) * cosf(TWO_PI * u2);
+            S = S * expf(drift + diff * z);
         }
         sum   += S;
         sumsq += S * S;
     }
 
-    const double n  = (double)MC_N_PATHS;
-    mc_mean        = sum / n;
-    double var_pop = sumsq / n - mc_mean * mc_mean;
-    mc_std         = sqrt(fmax(var_pop, 0.0));
-    var_95         = mc_mean - 1.6448536270 * mc_std;
-    cvar_95        = mc_mean - 2.0627128443 * mc_std;
+    const float n      = (float)MC_N_PATHS;
+    const float mean_f = sum / n;
+    const float var_f  = sumsq / n - mean_f * mean_f;
+    const float std_f  = sqrtf(fmaxf(var_f, 0.0f));
+
+    mc_mean = (double)mean_f;
+    mc_std  = (double)std_f;
+    var_95  = mc_mean - 1.6448536270 * mc_std;
+    cvar_95 = mc_mean - 2.0627128443 * mc_std;
 }
 
 /* ── GPU result ring (GPU -> CPU readback) ────────────────────────────────── */

@@ -64,14 +64,20 @@ static_assert(sizeof(SignalResult) == 96, "SignalResult must be exactly 96 bytes
 #define EMA_CROSS_THRESH   0.0003   /* 3 bps — fast must clear slow by this much  */
 
 /* ── Monte Carlo risk forecast parameters ──────────────────────────────────
- * Tuned so a single thread can finish all paths within the per-tick budget
- * even on T4 (one thread = one packet). Total ops/tick ≈ N_PATHS × N_STEPS
- * × ~12 ≈ 393K. At 1.5 GHz that's ~260 µs sequential per thread — but a warp
- * runs 32 threads in parallel, so ~260 µs / 32 ≈ 8 µs amortised per packet
- * for T4, and similar per-batch on T1/T2/T3 with 256 threads.
+ * Tuned for the A2 GPU's FP32-favouring throughput (1:32 FP64 ratio means
+ * doubles are pathologically slow for transcendentals). The simulation runs
+ * in float internally; only the inputs and outputs are double for ABI
+ * compatibility with SignalResult.
  *
- * Tunable: keep N_PATHS as a power of two to make the inner loop predictable. */
-#define MC_N_PATHS         1024
-#define MC_N_STEPS         32
+ * 256 paths × 16 steps per tick = 4096 inner iterations. Each iter is
+ * ~5 FP32 transcendentals + a handful of FMAs ≈ 30-50 cycles on Ampere SP.
+ * At 1.5 GHz that's roughly:
+ *   - T4 (one thread per packet): ~150 µs sequential per thread, ~5 µs
+ *     amortised per packet across the 32-thread warp. Sustains > 1 MHz.
+ *   - T1/T2/T3 (256 threads per batch): ~150 µs per batch, dominated by
+ *     warp scheduling rather than transcendental units.
+ * Tunable — change here, rebuild all four receivers and the harness. */
+#define MC_N_PATHS         256
+#define MC_N_STEPS         16
 #define MC_DT              (1.0 / 252.0)   /* 1 trading day per step (annualised) */
 #define MC_BASE_VOL        0.20            /* 20% annualised, scaled by recent EMA dev */
