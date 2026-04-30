@@ -333,7 +333,7 @@ static bool start_remote_clock_server()
     if (g_clock_cal_host.empty()) return sample_clock_pair_ssh().valid;
 
     std::string cmd = ssh_base_cmd() + g_sender_ssh
-        + " 'pkill -f clock_cal_server.py 2>/dev/null || true; "
+        + " 'pkill -f '\\''[c]lock_cal_server.py'\\'' 2>/dev/null || true; "
           "nohup python3 " + g_clock_cal_script
         + " --ip " + g_clock_cal_bind
         + " --port " + std::to_string(g_clock_cal_port)
@@ -352,7 +352,7 @@ static void stop_remote_clock_server()
 {
     if (g_sender_ssh.empty()) return;
     std::string cmd = ssh_base_cmd() + g_sender_ssh
-        + " 'pkill -f clock_cal_server.py 2>/dev/null || true'"
+        + " 'pkill -f '\\''[c]lock_cal_server.py'\\'' 2>/dev/null || true'"
           " >/dev/null 2>&1";
     system(cmd.c_str());
 }
