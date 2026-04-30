@@ -56,6 +56,7 @@ DPU_IP="${DPU_IP:-192.168.100.2}"
 DPU_RELAY_PATH="${DPU_RELAY_PATH:-/home/ubuntu/dpu_relay}"
 DPU_MCAST_IFACE="${DPU_MCAST_IFACE:-10.10.10.3}"
 RELAY_PORT="${RELAY_PORT:-6005}"
+RELAY_STATS_PATH="${RELAY_STATS_PATH:-/tmp/doca_bench_relay_stats.txt}"
 
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
 SENDER_PASSWORD=0
@@ -266,7 +267,9 @@ if [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
+         rm -f $RELAY_STATS_PATH; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
+              --stats-file $RELAY_STATS_PATH \
               --no-restamp \
               > /tmp/dpu_relay.log 2>&1 &'" ; then
         log_err "relay launch command returned non-zero; checking DPU log and port anyway"
@@ -317,6 +320,9 @@ if [[ -n "$SENDER_SSH" ]]; then
     SENDER_ARGS+=(--sender-bin  "$SENDER_BIN")
     SENDER_ARGS+=(--sender-csv  "$SENDER_CSV")
     SENDER_ARGS+=(--sender-dest "$SENDER_DEST")
+    SENDER_ARGS+=(--dpu-user "$DPU_USER")
+    SENDER_ARGS+=(--dpu-ip "$DPU_IP")
+    SENDER_ARGS+=(--relay-stats-path "$RELAY_STATS_PATH")
     [[ -n "$SSH_CONTROL_PATH" ]] && SENDER_ARGS+=(--sender-control-path "$SSH_CONTROL_PATH")
 fi
 if [[ $LIGHT_BENCH -eq 1 ]]; then

@@ -41,6 +41,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "benchmark_result.h"
@@ -114,6 +115,9 @@ static std::string g_sender_csv
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
+static std::string g_dpu_user = "ubuntu";
+static std::string g_dpu_ip = "192.168.100.2";
+static std::string g_relay_stats_path;
 
 static std::string sender_stats_path_for_run(int run_id)
 {
@@ -135,6 +139,25 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
     cmd += g_sender_ssh + " 'cat " + remote_path + " 2>/dev/null || echo 0'";
+
+    FILE *p = popen(cmd.c_str(), "r");
+    if (!p) return 0;
+    unsigned long long v = 0;
+    fscanf(p, "%llu", &v);
+    pclose(p);
+    return (uint64_t)v;
+}
+
+static uint64_t read_relay_counter_via_ssh()
+{
+    if (g_sender_ssh.empty() || g_relay_stats_path.empty()) return 0;
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    if (!g_sender_control_path.empty()) {
+        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
+    }
+    cmd += g_sender_ssh + " \"ssh -o BatchMode=yes -o ConnectTimeout=3 "
+        + g_dpu_user + "@" + g_dpu_ip + " 'cat " + g_relay_stats_path
+        + " 2>/dev/null || echo 0'\"";
 
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
@@ -583,26 +606,18 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t n_inferred_missing_ticks = 0;
     uint64_t n_rejected_invalid_order = 0;
     uint64_t n_rejected_too_old = 0;
-    uint64_t n_signals_total = 0;       /* every SignalResult received */
-    uint64_t n_signals_actionable = 0;  /* signal != 0 only */
-    bool have_last_tick_id = false;
-    uint32_t last_tick_id = 0;
+    std::vector<SignalResult> raw_signals;
     ClockSample cal_start = sample_clock_pair();
     uint64_t sent_ticks_start = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
+    uint64_t relay_ticks_start = read_relay_counter_via_ssh();
     auto measure_end = Clock::now() + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
     pollfd pfds[2];
     pfds[0].fd = result_fd; pfds[0].events = POLLIN;
     pfds[1].fd = signal_fd; pfds[1].events = POLLIN;
-
-    /* Track tick_id range observed in this run so drop_rate can be computed
-     * from tick_id gaps (internally consistent) rather than from sender vs
-     * receiver counts (window-misaligned by pipeline lag). */
-    uint32_t first_tick_id = 0;
-    bool     have_first_tick_id = false;
 
     while (Clock::now() < measure_end) {
         int pr = poll(pfds, 2, 50);  /* 50 ms tick */
@@ -614,18 +629,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             while ((n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT)) == sizeof(BenchmarkResult)) {
                 if (n == sizeof(BenchmarkResult)) {
                     if (!br.dropped) {
-                        if (!have_first_tick_id) {
-                            first_tick_id = br.tick_id;
-                            have_first_tick_id = true;
-                        }
-                        if (have_last_tick_id && br.tick_id > last_tick_id + 1) {
-                            n_inferred_missing_ticks +=
-                                (uint64_t)(br.tick_id - last_tick_id - 1);
-                        }
-                        if (!have_last_tick_id || br.tick_id > last_tick_id) {
-                            last_tick_id = br.tick_id;
-                            have_last_tick_id = true;
-                        }
                         raw_results.push_back(br);
                     }
                     if (br.dropped) { ++n_dropped; }
@@ -636,8 +639,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             SignalResult sr{};
             ssize_t n;
             while ((n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT)) == sizeof(SignalResult)) {
-                ++n_signals_total;
-                if (sr.signal != 0) ++n_signals_actionable;
+                raw_signals.push_back(sr);
             }
         }
     }
@@ -645,6 +647,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t sent_ticks_end = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
+    uint64_t relay_ticks_end = read_relay_counter_via_ssh();
     ClockSample cal_end = sample_clock_pair();
     if (g_sender_ssh.empty()) {
         fprintf(stderr, "[harness] clock-cal: local sender (no offset needed)\n");
@@ -666,11 +669,20 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
     uint64_t sent_ticks_window = (sent_ticks_end >= sent_ticks_start)
         ? (sent_ticks_end - sent_ticks_start) : 0;
+    uint64_t relay_ticks_window = (relay_ticks_end >= relay_ticks_start)
+        ? (relay_ticks_end - relay_ticks_start) : 0;
+
+    auto in_sender_window = [&](uint64_t tick_id) {
+        if (sent_ticks_end <= sent_ticks_start) return true;
+        return tick_id >= sent_ticks_start && tick_id < sent_ticks_end;
+    };
 
     e2e_ns.reserve(raw_results.size());
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
+    std::unordered_set<uint64_t> latency_tick_ids;
     for (const BenchmarkResult &raw_br : raw_results) {
+        if (!in_sender_window(raw_br.tick_id)) continue;
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
         if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
@@ -686,6 +698,15 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         compute_ns.push_back(br.compute_ns != 0
             ? (double)br.compute_ns
             : (double)(br.t3_ns - br.t2_ns));
+        latency_tick_ids.insert(raw_br.tick_id);
+    }
+
+    std::unordered_set<uint64_t> processed_tick_ids;
+    uint64_t n_signals_actionable = 0;
+    for (const SignalResult &sr : raw_signals) {
+        if (!in_sender_window(sr.tick_id)) continue;
+        processed_tick_ids.insert(sr.tick_id);
+        if (sr.signal != 0) ++n_signals_actionable;
     }
 
     /* Kill subprocesses */
@@ -697,7 +718,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
-    uint64_t processed_ticks = n_signals_total;
+    uint64_t processed_ticks = processed_tick_ids.size();
 
     /* Drop-rate computation:
      *
@@ -715,10 +736,15 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
      * losses where the sender produced a tick that *never* reached the
      * receiver (whole tail of a saturating run). For that, sent_ticks_window
      * vs the observed range gives a sanity check (still in CSV). */
-    uint64_t observed_range = (have_first_tick_id && have_last_tick_id)
-        ? (uint64_t)(last_tick_id - first_tick_id) + 1ULL : 0ULL;
-    double drop_rate = observed_range > 0
-        ? (double)n_inferred_missing_ticks / (double)observed_range
+    uint64_t sent_denominator = relay_ticks_window > 0 ? relay_ticks_window : sent_ticks_window;
+    if (sent_ticks_window > 0) {
+        uint64_t seen_latency = latency_tick_ids.size();
+        n_inferred_missing_ticks = sent_ticks_window > seen_latency
+            ? sent_ticks_window - seen_latency : 0;
+    }
+    double drop_rate = sent_denominator > 0
+        ? (double)(sent_denominator > processed_ticks
+              ? (sent_denominator - processed_ticks) : 0ULL) / (double)sent_denominator
         : 0.0;
 
     RunResult r{};
@@ -726,7 +752,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.tier       = tier;
     r.rate_hz    = rate_hz;
     r.repetition = repetition;
-    r.sent_ticks = sent_ticks_window;
+    r.sent_ticks = sent_denominator;
     r.processed_ticks = processed_ticks;
     r.n_ticks    = n_ticks;
     r.drop_rate  = drop_rate;
@@ -749,7 +775,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.throughput   = duration_sec > 0
         ? (double)n_ticks / (double)duration_sec : 0.0;
     r.signals_total_per_sec      = duration_sec > 0
-        ? (double)n_signals_total / (double)duration_sec : 0.0;
+        ? (double)processed_ticks / (double)duration_sec : 0.0;
     r.signals_actionable_per_sec = duration_sec > 0
         ? (double)n_signals_actionable / (double)duration_sec : 0.0;
 
@@ -823,6 +849,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--sender-csv")  && i+1<argc) g_sender_csv  = argv[++i];
         else if (!strcmp(argv[i],"--sender-dest") && i+1<argc) g_sender_dest = argv[++i];
         else if (!strcmp(argv[i],"--sender-control-path") && i+1<argc) g_sender_control_path = argv[++i];
+        else if (!strcmp(argv[i],"--dpu-user") && i+1<argc) g_dpu_user = argv[++i];
+        else if (!strcmp(argv[i],"--dpu-ip") && i+1<argc) g_dpu_ip = argv[++i];
+        else if (!strcmp(argv[i],"--relay-stats-path") && i+1<argc) g_relay_stats_path = argv[++i];
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 

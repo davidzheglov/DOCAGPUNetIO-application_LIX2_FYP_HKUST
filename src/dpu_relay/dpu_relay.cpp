@@ -27,6 +27,7 @@
 #include <ctime>
 
 static volatile bool g_running = true;
+static const char *g_stats_file = nullptr;
 
 static void sigint_handler(int) {
     g_running = false;
@@ -41,12 +42,21 @@ static void usage(const char *prog) {
         "  --mcast-addr <ip>      Multicast destination address (default: 239.0.0.1)\n"
         "  --mcast-port <port>    Multicast destination port (default: 5005)\n"
         "  --iface <ip>           Interface IP for multicast output (default: 10.10.10.3)\n"
+        "  --stats-file <path>    Write cumulative forwarded packet count here\n"
         "  --no-restamp           Forward bytes verbatim (default: re-stamp first 8\n"
         "                         bytes with egress wall-clock ns — TickMessage T1)\n"
         "\n"
         "Forwards UDP packets received on listen-port to multicast group.\n"
         "Run on DPU ARM to bridge host unicast -> working multicast path.\n",
         prog);
+}
+
+static void write_stats_file(uint64_t pkt_count) {
+    if (!g_stats_file) return;
+    FILE *f = fopen(g_stats_file, "w");
+    if (!f) return;
+    fprintf(f, "%lu\n", pkt_count);
+    fclose(f);
 }
 
 int main(int argc, char **argv) {
@@ -66,6 +76,8 @@ int main(int argc, char **argv) {
             mcast_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--iface") && i + 1 < argc) {
             iface_ip = argv[++i];
+        } else if (!strcmp(argv[i], "--stats-file") && i + 1 < argc) {
+            g_stats_file = argv[++i];
         } else if (!strcmp(argv[i], "--no-restamp")) {
             restamp_t1 = false;
         } else if (!strcmp(argv[i], "--help")) {
@@ -171,6 +183,7 @@ int main(int argc, char **argv) {
     uint64_t pkt_count   = 0;
     uint64_t byte_count  = 0;
     uint64_t batch_count = 0;
+    write_stats_file(0);
 
     while (g_running) {
         int n_recv = recvmmsg(listen_fd, msgs_rx, BATCH, MSG_WAITFORONE, &rx_timeout);
@@ -223,6 +236,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < sent_total; ++i) byte_count += msgs_rx[i].msg_len;
         pkt_count   += sent_total;
         batch_count += 1;
+        if ((pkt_count & 0x3FFULL) == 0) write_stats_file(pkt_count);
 
         /* Lighter logging — once per ~10000 packets, batched, no \r flicker. */
         if (pkt_count % 100000 == 0) {
@@ -235,6 +249,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "\n[dpu_relay] stopped — forwarded %lu packets (%lu bytes total)\n",
             pkt_count, byte_count);
+    write_stats_file(pkt_count);
 
     close(listen_fd);
     close(send_fd);
