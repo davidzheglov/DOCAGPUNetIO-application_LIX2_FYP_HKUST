@@ -189,12 +189,19 @@ if [[ -n "$SENDER_SSH" ]]; then
     log_ok "Remote clock calibration helper: $EXPANDED_CLOCK_SCRIPT"
 
     log "Starting UDP clock calibration helper on $SENDER_SSH..."
-    sender_ssh "$SENDER_SSH" \
-        "pkill -f '[c]lock_cal_server.py' 2>/dev/null || true; \
-         nohup python3 $EXPANDED_CLOCK_SCRIPT --ip $CLOCK_CAL_BIND --port $CLOCK_CAL_PORT \
-              >/tmp/clock_cal_server.log 2>&1 </dev/null &"
+    CLOCK_PID_FILE="/tmp/doca_clock_cal_server.pid"
+    if ! sender_ssh "$SENDER_SSH" \
+        "sh -lc 'if test -f $CLOCK_PID_FILE; then kill \$(cat $CLOCK_PID_FILE) 2>/dev/null || true; rm -f $CLOCK_PID_FILE; fi; \
+                  nohup python3 $EXPANDED_CLOCK_SCRIPT --ip $CLOCK_CAL_BIND --port $CLOCK_CAL_PORT \
+                    >/tmp/clock_cal_server.log 2>&1 </dev/null & \
+                  echo \$! > $CLOCK_PID_FILE'" ; then
+        log_err "failed to launch clock_cal_server.py on $SENDER_SSH"
+        exit 1
+    fi
     sleep 0.5
-    if ! sender_ssh "$SENDER_SSH" "pgrep -af '[c]lock_cal_server.py' >/dev/null" 2>/dev/null; then
+    if ! sender_ssh "$SENDER_SSH" \
+        "sh -lc 'test -f $CLOCK_PID_FILE && kill -0 \$(cat $CLOCK_PID_FILE) 2>/dev/null'" \
+        2>/dev/null; then
         log_err "clock_cal_server.py did not stay running on $SENDER_SSH"
         sender_ssh "$SENDER_SSH" "tail -20 /tmp/clock_cal_server.log" 2>&1 || true
         exit 1
@@ -334,7 +341,7 @@ cleanup() {
     if [[ -n "$SENDER_SSH" ]]; then
         sender_ssh "$SENDER_SSH" \
             "pkill -x data_source 2>/dev/null || true; \
-             pkill -f '[c]lock_cal_server.py' 2>/dev/null || true; \
+             if test -f /tmp/doca_clock_cal_server.pid; then kill \$(cat /tmp/doca_clock_cal_server.pid) 2>/dev/null || true; rm -f /tmp/doca_clock_cal_server.pid; fi; \
              ssh ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
             >/dev/null 2>&1 || true
         if [[ -n "$SSH_CONTROL_PATH" ]]; then
