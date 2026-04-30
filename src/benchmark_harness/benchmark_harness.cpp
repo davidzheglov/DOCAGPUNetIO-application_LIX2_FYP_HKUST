@@ -516,6 +516,7 @@ static pid_t launch(const char *binary,
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
+        setpgid(0, 0);
         /* child */
         std::vector<const char *> argv;
         argv.push_back(binary);
@@ -525,6 +526,7 @@ static pid_t launch(const char *binary,
         perror("execv");
         _exit(1);
     }
+    setpgid(pid, pid);
     return pid;
 }
 
@@ -534,6 +536,7 @@ static pid_t launch_receiver(int tier, const char *binary,
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
+        setpgid(0, 0);
         std::vector<std::string> owned_args;
         std::vector<const char *> argv;
 
@@ -564,6 +567,7 @@ static pid_t launch_receiver(int tier, const char *binary,
         }
         _exit(1);
     }
+    setpgid(pid, pid);
     return pid;
 }
 
@@ -571,8 +575,24 @@ static pid_t launch_receiver(int tier, const char *binary,
 static void kill_proc(pid_t pid)
 {
     if (pid <= 0) return;
+
+    /* Receivers may be wrapped by sudo and may need a short graceful window
+     * for CUDA/DPDK/DOCA cleanup. Never block the whole sweep indefinitely. */
+    kill(-pid, SIGTERM);
     kill(pid, SIGTERM);
+
     int status;
+    for (int i = 0; i < 50; ++i) {
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc == pid || rc < 0) return;
+        usleep(100000);
+    }
+
+    fprintf(stderr,
+            "[harness] warning: pid %d did not exit after SIGTERM; sending SIGKILL\n",
+            pid);
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
 }
 
@@ -595,6 +615,7 @@ static pid_t launch_sender_ssh(long rate_hz, const std::string &stats_path)
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
+        setpgid(0, 0);
         std::vector<std::string> owned_args;
         std::vector<const char *> argv = {
             "ssh",
@@ -616,6 +637,7 @@ static pid_t launch_sender_ssh(long rate_hz, const std::string &stats_path)
         perror("execlp ssh");
         _exit(127);
     }
+    setpgid(pid, pid);
     return pid;
 }
 
