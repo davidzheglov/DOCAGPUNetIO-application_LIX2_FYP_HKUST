@@ -24,6 +24,7 @@ Apply `t_host = t_dpu + offset_ns` to bring DPU timestamps into the host frame.
 """
 
 import argparse
+import selectors
 import socket
 import struct
 import sys
@@ -41,20 +42,50 @@ def main():
     ap.add_argument("--port", type=int, default=6006)
     args = ap.parse_args()
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((args.ip, args.port))
-    print(f"[clock_cal] listening on {args.ip}:{args.port}", flush=True)
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.bind((args.ip, args.port))
+
+    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_sock.bind((args.ip, args.port))
+    tcp_sock.listen(16)
+    tcp_sock.setblocking(False)
+
+    sel = selectors.DefaultSelector()
+    sel.register(udp_sock, selectors.EVENT_READ, "udp")
+    sel.register(tcp_sock, selectors.EVENT_READ, "tcp_listen")
+    print(f"[clock_cal] listening on {args.ip}:{args.port} udp+tcp", flush=True)
 
     try:
         while True:
-            data, addr = sock.recvfrom(64)
-            t_b = time.time_ns()
-            if len(data) < 8:
-                continue
-            t_a = struct.unpack(REQ_FMT, data[:8])[0]
-            t_c = time.time_ns()
-            sock.sendto(struct.pack(REP_FMT, t_a, t_b, t_c), addr)
+            for key, _ in sel.select():
+                kind = key.data
+                if kind == "udp":
+                    data, addr = udp_sock.recvfrom(64)
+                    t_b = time.time_ns()
+                    if len(data) < 8:
+                        continue
+                    t_a = struct.unpack(REQ_FMT, data[:8])[0]
+                    t_c = time.time_ns()
+                    udp_sock.sendto(struct.pack(REP_FMT, t_a, t_b, t_c), addr)
+                elif kind == "tcp_listen":
+                    conn, _ = tcp_sock.accept()
+                    conn.setblocking(False)
+                    sel.register(conn, selectors.EVENT_READ, "tcp_conn")
+                else:
+                    conn = key.fileobj
+                    data = conn.recv(8)
+                    t_b = time.time_ns()
+                    if not data:
+                        sel.unregister(conn)
+                        conn.close()
+                        continue
+                    if len(data) < 8:
+                        continue
+                    t_a = struct.unpack(REQ_FMT, data[:8])[0]
+                    t_c = time.time_ns()
+                    conn.sendall(struct.pack(REP_FMT, t_a, t_b, t_c))
     except KeyboardInterrupt:
         print("\n[clock_cal] bye", flush=True)
 

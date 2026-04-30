@@ -188,7 +188,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     fi
     log_ok "Remote clock calibration helper: $EXPANDED_CLOCK_SCRIPT"
 
-    log "Starting UDP clock calibration helper on $SENDER_SSH..."
+    log "Starting UDP/TCP clock calibration helper on $SENDER_SSH..."
     CLOCK_PID_FILE="/tmp/doca_clock_cal_server.pid"
     if ! sender_ssh "$SENDER_SSH" \
         "sh -lc 'if test -f $CLOCK_PID_FILE; then kill \$(cat $CLOCK_PID_FILE) 2>/dev/null || true; rm -f $CLOCK_PID_FILE; fi; \

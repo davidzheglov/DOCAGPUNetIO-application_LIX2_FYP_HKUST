@@ -25,6 +25,7 @@
  */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -299,10 +300,106 @@ static ClockSample sample_clock_pair_udp()
     return best;
 }
 
+static bool connect_with_timeout(int fd, const sockaddr *addr, socklen_t len, int timeout_ms)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+
+    int rc = connect(fd, addr, len);
+    if (rc == 0) {
+        fcntl(fd, F_SETFL, flags);
+        return true;
+    }
+    if (errno != EINPROGRESS) return false;
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    timeval tv{.tv_sec = timeout_ms / 1000,
+               .tv_usec = (timeout_ms % 1000) * 1000};
+    rc = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+    if (rc <= 0) return false;
+
+    int err = 0;
+    socklen_t err_len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len) < 0 || err != 0) {
+        return false;
+    }
+    fcntl(fd, F_SETFL, flags);
+    return true;
+}
+
+static ClockSample sample_clock_pair_tcp()
+{
+    ClockSample best{};
+    if (g_sender_ssh.empty() || g_clock_cal_host.empty()) {
+        return sample_clock_pair_ssh();
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *res = nullptr;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", g_clock_cal_port);
+    if (getaddrinfo(g_clock_cal_host.c_str(), port_str, &hints, &res) != 0 || !res) {
+        return best;
+    }
+
+    int fd = -1;
+    for (addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect_with_timeout(fd, ai->ai_addr, ai->ai_addrlen, 250)) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return best;
+
+    timeval tv{.tv_sec = 0, .tv_usec = 200000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    for (int i = 0; i < 64; ++i) {
+        uint64_t t_a = wall_time_ns();
+        ssize_t sent = send(fd, &t_a, sizeof(t_a), 0);
+        if (sent != (ssize_t)sizeof(t_a)) continue;
+
+        uint64_t rep[3]{};
+        ssize_t nr = recv(fd, rep, sizeof(rep), MSG_WAITALL);
+        uint64_t t_d = wall_time_ns();
+        if (nr != (ssize_t)sizeof(rep)) continue;
+
+        uint64_t t_b = rep[1];
+        uint64_t t_c = rep[2];
+        uint64_t remote_span = (t_c >= t_b) ? (t_c - t_b) : 0;
+        uint64_t round_trip = (t_d >= t_a) ? (t_d - t_a) : 0;
+        uint64_t rtt = (round_trip >= remote_span) ? (round_trip - remote_span) : round_trip;
+        uint64_t local_ref = t_a + (round_trip / 2);
+        uint64_t remote_ref = t_b + ((t_c >= t_b) ? ((t_c - t_b) / 2) : 0);
+
+        if (!best.valid || rtt < best.rtt_ns) {
+            best.valid = true;
+            best.rtt_ns = rtt;
+            best.local_ref_ns = local_ref;
+            best.remote_ref_ns = remote_ref;
+            best.source = "tcp";
+        }
+        usleep(1000);
+    }
+
+    close(fd);
+    return best;
+}
+
 static ClockSample sample_clock_pair()
 {
     ClockSample udp = sample_clock_pair_udp();
     if (udp.valid) return udp;
+    ClockSample tcp = sample_clock_pair_tcp();
+    if (tcp.valid) return tcp;
     return sample_clock_pair_ssh();
 }
 
@@ -342,6 +439,8 @@ static bool start_remote_clock_server()
 
     for (int i = 0; i < 30; ++i) {
         ClockSample s = sample_clock_pair_udp();
+        if (s.valid) return true;
+        s = sample_clock_pair_tcp();
         if (s.valid) return true;
         usleep(100000);
     }
