@@ -201,6 +201,8 @@ static void run_replay(const char *csv_path, long rate_hz, uint8_t source_flag,
     if (fd < 0) return;
 
     const long ns_per_tick = 1000000000L / rate_hz;
+    const NS interval(ns_per_tick);
+    const NS max_lag = interval * 1024;
     uint32_t   tick_id     = 0;
 
     fprintf(stderr, "[replay] starting at %ld msg/sec (%.1f μs/tick)\n",
@@ -219,11 +221,21 @@ static void run_replay(const char *csv_path, long rate_hz, uint8_t source_flag,
             msg.last_price    = ticks[i].last_price;
             msg.volume        = ticks[i].volume;
 
-            /* Busy-wait until next send slot */
-            while (Clock::now() < next_send) CPU_PAUSE();
+            /* Busy-wait until next send slot. If the sender falls far behind
+             * (scheduler hiccup, SSH/stdout stall, kernel backpressure), reset
+             * the schedule instead of blasting a catch-up burst. The benchmark
+             * wants a paced offered rate, not repayment of missed slots. */
+            auto now = Clock::now();
+            while (now < next_send) {
+                CPU_PAUSE();
+                now = Clock::now();
+            }
+            if (now - next_send > max_lag) {
+                next_send = now;
+            }
             send_tick(fd, dest, msg);
             if ((tick_id & 0x3FFu) == 0) write_stats_file(tick_id + 1);
-            next_send += NS(ns_per_tick);
+            next_send += interval;
         }
         /* loop dataset */
     }
