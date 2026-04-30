@@ -77,8 +77,19 @@ def load(csv_path: Path):
                 "throughput":   float(r["throughput_per_sec"]),
                 "sig_total":    float(r.get("signals_total_per_sec", 0.0)),
                 "sig_actionable": float(r.get("signals_actionable_per_sec", 0.0)),
+                "clock_rtt_us": float(r.get("clock_rtt_us", 0.0) or 0.0),
             })
     return rows
+
+
+def cross_host_noise_floor_us(rows) -> float:
+    """Worst-case half-RTT across all runs in the CSV.
+    Cross-machine ingest/e2e measurements below this floor are not
+    statistically meaningful — they're inside the SSH-clock-sample noise. """
+    rtts = [r["clock_rtt_us"] for r in rows if r.get("clock_rtt_us", 0) > 0]
+    if not rtts:
+        return 0.0
+    return max(rtts) / 2.0
 
 
 def aggregate(rows):
@@ -232,8 +243,22 @@ def plot_stage_breakdown(agg, outdir, target_rate=100000):
     save(fig, outdir, "05_stage_breakdown.png")
 
 
-def plot_e2e_latency(agg, outdir):
-    """Receiver-ingress-to-output latency."""
+def _shade_noise_floor(ax, floor_us: float):
+    """Draw a translucent band over latency values below the cross-host
+    measurement floor, so readers see at a glance which numbers are
+    statistically meaningful and which sit inside the SSH-clock-sample noise.
+    No-op when floor_us == 0 (local-sender runs)."""
+    if floor_us <= 0:
+        return
+    ax.axhspan(0.0, floor_us, color="#cccccc", alpha=0.25, zorder=0)
+    ax.axhline(floor_us, color="#888888", linestyle=":", linewidth=1, zorder=0)
+    ax.text(0.99, floor_us, f"  cross-host noise floor ≈ {floor_us:.0f} µs",
+            transform=ax.get_yaxis_transform(),
+            ha="right", va="bottom", fontsize=8, color="#555555")
+
+
+def plot_e2e_latency(agg, outdir, noise_floor_us: float = 0.0):
+    """Receiver-ingress-to-output latency, with cross-host noise floor band."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "e2e_p50")
@@ -247,6 +272,7 @@ def plot_e2e_latency(agg, outdir):
                "End-to-end latency (receiver ingress → output)",
                "Offered tick rate (Hz)", "E2E latency T4−T1 (µs)",
                xlog=True, ylog=True)
+    _shade_noise_floor(ax, noise_floor_us)
     ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
     save(fig, outdir, "06_e2e_latency.png")
 
@@ -288,13 +314,20 @@ def main():
         print("CSV has no data rows", file=sys.stderr); sys.exit(1)
     agg = aggregate(rows)
 
+    floor_us = cross_host_noise_floor_us(rows)
+    if floor_us > 0:
+        print(f"Cross-host clock-sync noise floor: ≈{floor_us:.0f} µs "
+              f"(half of the worst RTT seen across runs). "
+              f"Latency claims below this on cross-machine metrics (ingest, e2e) "
+              f"should be reported as 'below the floor'.")
+
     print(f"Writing plots to {outdir.relative_to(REPO_ROOT)}/")
     plot_compute_latency(agg, outdir)
     plot_drop_curve(agg, outdir)
     plot_throughput(agg, outdir)
     plot_signal_rate(agg, outdir)
     plot_stage_breakdown(agg, outdir)
-    plot_e2e_latency(agg, outdir)
+    plot_e2e_latency(agg, outdir, noise_floor_us=floor_us)
     print(f"\nDone. {len(rows)} runs across "
           f"{len({t for t,_ in agg})} tier(s) × {len({r for _,r in agg})} rate(s).")
 

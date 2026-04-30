@@ -211,18 +211,21 @@ static uint64_t sender_t1_to_local_ns(uint64_t sender_t1_ns,
                                       const ClockSample &start,
                                       const ClockSample &end)
 {
-    if (!start.valid) return sender_t1_ns;
-    if (!end.valid || end.remote_ref_ns <= start.remote_ref_ns) {
-        int64_t offset = (int64_t)start.local_ref_ns - (int64_t)start.remote_ref_ns;
-        return (uint64_t)((int64_t)sender_t1_ns + offset);
-    }
+    bool have_start = start.valid;
+    bool have_end   = end.valid;
+    if (!have_start && !have_end) return sender_t1_ns;
 
-    long double remote_span = (long double)(end.remote_ref_ns - start.remote_ref_ns);
-    long double local_span  = (long double)((int64_t)end.local_ref_ns - (int64_t)start.local_ref_ns);
-    long double alpha       = ((long double)sender_t1_ns - (long double)start.remote_ref_ns) / remote_span;
-    long double mapped      = (long double)start.local_ref_ns + alpha * local_span;
-    if (mapped < 0.0L) mapped = 0.0L;
-    return (uint64_t)(mapped + 0.5L);
+    int64_t offset = 0;
+    if (have_start && have_end) {
+        int64_t start_off = (int64_t)start.local_ref_ns - (int64_t)start.remote_ref_ns;
+        int64_t end_off   = (int64_t)end.local_ref_ns   - (int64_t)end.remote_ref_ns;
+        offset = (start_off + end_off) / 2;
+    } else if (have_start) {
+        offset = (int64_t)start.local_ref_ns - (int64_t)start.remote_ref_ns;
+    } else {
+        offset = (int64_t)end.local_ref_ns - (int64_t)end.remote_ref_ns;
+    }
+    return (uint64_t)((int64_t)sender_t1_ns + offset);
 }
 
 static bool start_remote_clock_server()
@@ -443,6 +446,13 @@ struct RunResult {
     /* Signal-rate metrics (post-kernel SignalResult emissions on port 5006) */
     double signals_total_per_sec;       /* every processed tick → throughput proxy */
     double signals_actionable_per_sec;  /* only signal != 0 (real buy/sell decisions) */
+    /* Cross-machine clock-sync uncertainty for this run (µs).
+     * Derived from the start/end clock samples taken via SSH. The harness's
+     * effective measurement floor for any cross-host metric (ingest, e2e) is
+     * approximately max(rtt_us)/2. Sub-floor values should be reported as
+     * "below the measurement floor" rather than as point estimates. */
+    double clock_offset_us;             /* (start+end)/2 of (local-remote) offset */
+    double clock_rtt_us;                /* max(start, end) RTT — conservative */
 };
 
 static void write_header(std::ofstream &f)
@@ -454,7 +464,8 @@ static void write_header(std::ofstream &f)
       << "ingest_p50_us,ingest_p95_us,ingest_p99_us,ingest_mean_us,"
       << "compute_p50_us,compute_p95_us,compute_p99_us,compute_mean_us,"
       << "throughput_per_sec,"
-      << "signals_total_per_sec,signals_actionable_per_sec\n";
+      << "signals_total_per_sec,signals_actionable_per_sec,"
+      << "clock_offset_us,clock_rtt_us\n";
 }
 
 static void write_row(std::ofstream &f, const RunResult &r)
@@ -480,7 +491,9 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << ns_to_us(r.compute_p99)  << ',' << ns_to_us(r.compute_mean) << ','
       << r.throughput   << ','
       << r.signals_total_per_sec << ','
-      << r.signals_actionable_per_sec << '\n';
+      << r.signals_actionable_per_sec << ','
+      << r.clock_offset_us << ','
+      << r.clock_rtt_us << '\n';
     f.flush();
 }
 
@@ -623,6 +636,24 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
     ClockSample cal_end = sample_clock_pair();
+    if (g_sender_ssh.empty()) {
+        fprintf(stderr, "[harness] clock-cal: local sender (no offset needed)\n");
+    } else {
+        auto us = [](int64_t ns) { return (double)ns / 1000.0; };
+        int64_t start_off = cal_start.valid
+            ? (int64_t)cal_start.local_ref_ns - (int64_t)cal_start.remote_ref_ns : 0;
+        int64_t end_off = cal_end.valid
+            ? (int64_t)cal_end.local_ref_ns - (int64_t)cal_end.remote_ref_ns : 0;
+        fprintf(stderr,
+            "[harness] clock-cal: start(valid=%d off=%.1fus rtt=%.1fus) "
+            "end(valid=%d off=%.1fus rtt=%.1fus) mode=offset-only\n",
+            cal_start.valid ? 1 : 0, us(start_off), us((int64_t)cal_start.rtt_ns),
+            cal_end.valid ? 1 : 0, us(end_off), us((int64_t)cal_end.rtt_ns));
+        if (!cal_start.valid && !cal_end.valid) {
+            fprintf(stderr, "[harness] warning: no valid clock calibration samples for this run; "
+                            "using raw sender timestamps\n");
+        }
+    }
     uint64_t sent_ticks_window = (sent_ticks_end >= sent_ticks_start)
         ? (sent_ticks_end - sent_ticks_start) : 0;
 
@@ -693,6 +724,27 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         ? (double)n_signals_total / (double)duration_sec : 0.0;
     r.signals_actionable_per_sec = duration_sec > 0
         ? (double)n_signals_actionable / (double)duration_sec : 0.0;
+
+    /* Clock-sync uncertainty for this run — propagates into the CSV so plots
+     * can draw the cross-host noise floor. Local sender (no SSH) gets 0/0. */
+    if (g_sender_ssh.empty()) {
+        r.clock_offset_us = 0.0;
+        r.clock_rtt_us    = 0.0;
+    } else {
+        int64_t s_off = cal_start.valid
+            ? (int64_t)cal_start.local_ref_ns - (int64_t)cal_start.remote_ref_ns : 0;
+        int64_t e_off = cal_end.valid
+            ? (int64_t)cal_end.local_ref_ns - (int64_t)cal_end.remote_ref_ns : 0;
+        int n_valid = (cal_start.valid ? 1 : 0) + (cal_end.valid ? 1 : 0);
+        double avg_off_ns = n_valid > 0
+            ? (double)((cal_start.valid ? s_off : 0) + (cal_end.valid ? e_off : 0)) / n_valid
+            : 0.0;
+        uint64_t worst_rtt = std::max(
+            cal_start.valid ? cal_start.rtt_ns : 0ULL,
+            cal_end.valid   ? cal_end.rtt_ns   : 0ULL);
+        r.clock_offset_us = avg_off_ns / 1000.0;
+        r.clock_rtt_us    = (double)worst_rtt / 1000.0;
+    }
 
     fprintf(stderr,
         "[harness] T%d @%ld: n=%zu drop=%.2f%% "

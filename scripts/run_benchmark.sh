@@ -267,6 +267,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
+              --no-restamp \
               > /tmp/dpu_relay.log 2>&1 &'" ; then
         log_err "relay launch command returned non-zero; checking DPU log and port anyway"
     fi
