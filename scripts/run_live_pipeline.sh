@@ -5,7 +5,7 @@
 #  Architecture:
 #    Host: data_source --mode live --dest 192.168.100.2:6005
 #      ↓ (tmfifo_net0 management network, unicast UDP)
-#    DPU ARM: dpu_relay --listen-port 6005 --iface 10.10.10.1
+#    DPU ARM: dpu_relay --listen-port 6005 --iface 10.10.10.3
 #      ↓ (p0 → bridge → host PF0, multicast UDP)
 #    Host receivers: T1/T2/T3/T4 listening on 239.0.0.1:5005
 #
@@ -26,8 +26,15 @@ set -euo pipefail
 DPU_ARM_IP="192.168.100.2"
 DPU_ARM_USER="ubuntu"
 DPU_RELAY_PORT="6005"
-DPU_MCAST_IFACE="10.10.10.1"
-DPU_RELAY_PATH="/home/ubuntu/dpu_relay_dpu"
+DPU_MCAST_IFACE="10.10.10.3"
+DPU_RELAY_PATH="/home/ubuntu/dpu_relay"
+
+RECEIVER_IFACE="ens21f0np0"
+DPDK_PCI="0000:bd:00.0"
+RDMA_DEV="mlx5_0"
+GPU_ID="1"
+GPU_PCIE="0000:ac:00.0"
+NIC_PCIE="0000:bd:00.0"
 
 TIER=""
 SYMBOLS="BTCUSDT,ETHUSDT"
@@ -58,6 +65,20 @@ while [[ $# -gt 0 ]]; do
             DPU_ARM_IP="$2"; shift 2 ;;
         --dpu-relay-path)
             DPU_RELAY_PATH="$2"; shift 2 ;;
+        --dpu-mcast-iface)
+            DPU_MCAST_IFACE="$2"; shift 2 ;;
+        --receiver-iface)
+            RECEIVER_IFACE="$2"; shift 2 ;;
+        --dpdk-pci)
+            DPDK_PCI="$2"; shift 2 ;;
+        --rdma-dev)
+            RDMA_DEV="$2"; shift 2 ;;
+        --gpu)
+            GPU_ID="$2"; shift 2 ;;
+        --gpu-pcie)
+            GPU_PCIE="$2"; shift 2 ;;
+        --nic-pcie)
+            NIC_PCIE="$2"; shift 2 ;;
         --help|-h)
             cat <<'EOF'
 Usage: run_live_pipeline.sh --tier <1|2|3|4> [options]
@@ -72,7 +93,14 @@ Options:
   --fillsim <ip>          Fill simulator IP (default: 127.0.0.1)
   --dpu-user <user>       DPU ARM SSH user (default: ubuntu)
   --dpu-ip <ip>           DPU ARM management IP (default: 192.168.100.2)
-  --dpu-relay-path <path> Path to dpu_relay_dpu on DPU ARM (default: /home/ubuntu/dpu_relay_dpu)
+  --dpu-relay-path <path> Path to dpu_relay on DPU ARM (default: /home/ubuntu/dpu_relay)
+  --dpu-mcast-iface <ip>  DPU relay multicast egress IP (default: 10.10.10.3)
+  --receiver-iface <dev>  T1 receiver interface (default: ens21f0np0)
+  --dpdk-pci <pci>        T2 NIC PCIe address (default: 0000:bd:00.0)
+  --rdma-dev <dev>        T3 RDMA device (default: mlx5_0)
+  --gpu <id>              T4 CUDA device id (default: 1)
+  --gpu-pcie <pci>        T4 GPU PCIe address (default: 0000:ac:00.0)
+  --nic-pcie <pci>        T4 NIC PCIe address (default: 0000:bd:00.0)
 
 Examples:
   ./scripts/run_live_pipeline.sh --tier 1
@@ -147,26 +175,26 @@ RECEIVER_PID=""
 
 case "$TIER" in
     1)
-        $RECEIVER --tier 1 --iface ens21f0np0 \
+        $RECEIVER --tier 1 --iface "$RECEIVER_IFACE" \
             --harness "$HARNESS_IP" --fillsim "$FILLSIM_IP" &
         RECEIVER_PID=$!
         ;;
     2)
         # DPDK receiver — requires hugepages setup
         sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
-            $RECEIVER -a 0000:bd:00.0 -l 0-1 -n 4 -- \
+            $RECEIVER -a "$DPDK_PCI" -l 0-1 -n 4 -- \
             --port 0 --tier 2 --harness "$HARNESS_IP" --fillsim "$FILLSIM_IP" &
         RECEIVER_PID=$!
         ;;
     3)
-        $RECEIVER --dev mlx5_0 --tier 3 \
+        $RECEIVER --dev "$RDMA_DEV" --tier 3 \
             --harness "$HARNESS_IP" --fillsim "$FILLSIM_IP" &
         RECEIVER_PID=$!
         ;;
     4)
         sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
-            $RECEIVER --tier 4 --gpu 1 \
-            --gpu-pcie 0000:ac:00.0 --nic-pcie 0000:bd:00.0 \
+            $RECEIVER --tier 4 --gpu "$GPU_ID" \
+            --gpu-pcie "$GPU_PCIE" --nic-pcie "$NIC_PCIE" \
             --harness "$HARNESS_IP" --fillsim "$FILLSIM_IP" &
         RECEIVER_PID=$!
         ;;
