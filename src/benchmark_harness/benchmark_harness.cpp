@@ -598,6 +598,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     pfds[0].fd = result_fd; pfds[0].events = POLLIN;
     pfds[1].fd = signal_fd; pfds[1].events = POLLIN;
 
+    /* Track tick_id range observed in this run so drop_rate can be computed
+     * from tick_id gaps (internally consistent) rather than from sender vs
+     * receiver counts (window-misaligned by pipeline lag). */
+    uint32_t first_tick_id = 0;
+    bool     have_first_tick_id = false;
+
     while (Clock::now() < measure_end) {
         int pr = poll(pfds, 2, 50);  /* 50 ms tick */
         if (pr <= 0) continue;
@@ -608,6 +614,10 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             while ((n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT)) == sizeof(BenchmarkResult)) {
                 if (n == sizeof(BenchmarkResult)) {
                     if (!br.dropped) {
+                        if (!have_first_tick_id) {
+                            first_tick_id = br.tick_id;
+                            have_first_tick_id = true;
+                        }
                         if (have_last_tick_id && br.tick_id > last_tick_id + 1) {
                             n_inferred_missing_ticks +=
                                 (uint64_t)(br.tick_id - last_tick_id - 1);
@@ -688,9 +698,27 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     size_t n_ticks = e2e_ns.size();
     uint64_t processed_ticks = n_signals_total;
-    double drop_rate = sent_ticks_window > 0
-        ? (double)(sent_ticks_window > processed_ticks
-              ? (sent_ticks_window - processed_ticks) : 0ULL) / (double)sent_ticks_window
+
+    /* Drop-rate computation:
+     *
+     * The naive (sent_window - processed_window) / sent_window is unreliable
+     * because the sender's count window is wall-clock-aligned while the
+     * receiver's is offset by the pipeline lag (~e2e_p50). A tick sent in the
+     * last second of warmup may arrive during measurement, inflating
+     * processed_ticks above sent_ticks_window — we'd see negative drops.
+     *
+     * Instead we use the receiver's own tick_id stream, which is internally
+     * consistent: among the ticks actually received, how many tick_ids are
+     * missing in the [first..last] range observed during the window?
+     *
+     * This counts losses in the relay/network/socket-buffer paths but not
+     * losses where the sender produced a tick that *never* reached the
+     * receiver (whole tail of a saturating run). For that, sent_ticks_window
+     * vs the observed range gives a sanity check (still in CSV). */
+    uint64_t observed_range = (have_first_tick_id && have_last_tick_id)
+        ? (uint64_t)(last_tick_id - first_tick_id) + 1ULL : 0ULL;
+    double drop_rate = observed_range > 0
+        ? (double)n_inferred_missing_ticks / (double)observed_range
         : 0.0;
 
     RunResult r{};
