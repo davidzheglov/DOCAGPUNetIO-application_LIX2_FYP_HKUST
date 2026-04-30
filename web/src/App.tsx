@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Activity, BarChart3, CircuitBoard, Gauge, Layers3, PlayCircle, Radio } from "lucide-react";
+import { Activity, BarChart3, CircuitBoard, Gauge, Layers3, PlayCircle, Radio, Router } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
@@ -10,6 +10,7 @@ import { ResultsExplorer } from "@/views/ResultsExplorer";
 import { Comparison } from "@/views/Comparison";
 import { Architecture } from "@/views/Architecture";
 import { LivePipeline } from "@/views/LivePipeline";
+import { DpuDemo } from "@/views/DpuDemo";
 
 const nav = [
   { id: "overview", label: "Overview", icon: Gauge },
@@ -18,6 +19,7 @@ const nav = [
   { id: "compare", label: "Compare", icon: Layers3 },
   { id: "architecture", label: "Architecture", icon: CircuitBoard },
   { id: "live", label: "Live", icon: Radio },
+  { id: "dpu", label: "DPU Demo", icon: Router },
 ] as const;
 
 type ViewId = (typeof nav)[number]["id"];
@@ -38,6 +40,8 @@ export default function App() {
         return <Architecture />;
       case "live":
         return <LivePipeline />;
+      case "dpu":
+        return <DpuDemo />;
       default:
         return <Overview />;
     }
