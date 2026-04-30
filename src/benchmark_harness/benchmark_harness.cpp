@@ -428,6 +428,14 @@ static bool start_remote_clock_server()
 {
     if (g_sender_ssh.empty()) return true;
     if (g_clock_cal_host.empty()) return sample_clock_pair_ssh().valid;
+    if (g_clock_cal_host == "127.0.0.1" || g_clock_cal_host == "localhost") {
+        for (int i = 0; i < 30; ++i) {
+            ClockSample s = sample_clock_pair_tcp();
+            if (s.valid) return true;
+            usleep(100000);
+        }
+        return false;
+    }
 
     std::string cmd = ssh_base_cmd() + g_sender_ssh
         + " 'pkill -f '\\''[c]lock_cal_server.py'\\'' 2>/dev/null || true; "
@@ -450,6 +458,7 @@ static bool start_remote_clock_server()
 static void stop_remote_clock_server()
 {
     if (g_sender_ssh.empty()) return;
+    if (g_clock_cal_host == "127.0.0.1" || g_clock_cal_host == "localhost") return;
     std::string cmd = ssh_base_cmd() + g_sender_ssh
         + " 'pkill -f '\\''[c]lock_cal_server.py'\\'' 2>/dev/null || true'"
           " >/dev/null 2>&1";
