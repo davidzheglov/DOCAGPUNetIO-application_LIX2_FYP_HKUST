@@ -126,16 +126,6 @@ static std::string g_clock_cal_bind = "0.0.0.0";
 static std::string g_clock_cal_script
     = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/scripts/clock_cal_server.py";
 static int         g_clock_cal_port = 6006;
-static int         g_ssh_connect_timeout = 15;
-
-static std::string ssh_opts_common()
-{
-    return " -o BatchMode=yes"
-           " -o ConnectTimeout=" + std::to_string(g_ssh_connect_timeout) +
-           " -o ServerAliveInterval=5"
-           " -o ServerAliveCountMax=2"
-           " -o StrictHostKeyChecking=accept-new";
-}
 
 static std::string sender_stats_path_for_run(int run_id)
 {
@@ -195,7 +185,7 @@ static ReceiverStats read_receiver_stats_file(const std::string &path)
 
 static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
 {
-    std::string cmd = "ssh" + ssh_opts_common() + " ";
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
@@ -212,11 +202,11 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
 static uint64_t read_relay_counter_via_ssh()
 {
     if (g_sender_ssh.empty() || g_relay_stats_path.empty()) return 0;
-    std::string cmd = "ssh" + ssh_opts_common() + " ";
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
-    cmd += g_sender_ssh + " \"ssh" + ssh_opts_common() + " "
+    cmd += g_sender_ssh + " \"ssh -o BatchMode=yes -o ConnectTimeout=3 "
         + g_dpu_user + "@" + g_dpu_ip + " 'cat " + g_relay_stats_path
         + " 2>/dev/null || echo 0'\"";
 
@@ -236,7 +226,7 @@ static uint64_t wall_time_ns()
 
 static std::string ssh_base_cmd()
 {
-    std::string cmd = "ssh" + ssh_opts_common() + " ";
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
@@ -654,13 +644,10 @@ static pid_t launch_sender_ssh(long rate_hz, const std::string &stats_path)
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
         std::vector<std::string> owned_args;
-        owned_args.push_back("ConnectTimeout=" + std::to_string(g_ssh_connect_timeout));
         std::vector<const char *> argv = {
             "ssh",
             "-o", "BatchMode=yes",
-            "-o", owned_args[0].c_str(),
-            "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=2",
+            "-o", "ServerAliveInterval=10",
             "-o", "StrictHostKeyChecking=accept-new",
         };
         if (!g_sender_control_path.empty()) {
@@ -683,7 +670,7 @@ static pid_t launch_sender_ssh(long rate_hz, const std::string &stats_path)
 static void kill_remote_sender(void)
 {
     if (g_sender_ssh.empty()) return;
-    std::string cmd = "ssh" + ssh_opts_common() + " ";
+    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
@@ -1172,7 +1159,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--clock-cal-bind") && i+1<argc) g_clock_cal_bind = argv[++i];
         else if (!strcmp(argv[i],"--clock-cal-port") && i+1<argc) g_clock_cal_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--clock-cal-script") && i+1<argc) g_clock_cal_script = argv[++i];
-        else if (!strcmp(argv[i],"--ssh-timeout") && i+1<argc) g_ssh_connect_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 
