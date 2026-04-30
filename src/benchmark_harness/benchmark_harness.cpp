@@ -25,6 +25,7 @@
  */
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -118,6 +119,11 @@ static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernel
 static std::string g_dpu_user = "ubuntu";
 static std::string g_dpu_ip = "192.168.100.2";
 static std::string g_relay_stats_path;
+static std::string g_clock_cal_host;
+static std::string g_clock_cal_bind = "0.0.0.0";
+static std::string g_clock_cal_script
+    = "~/DOCAGPUNetIO-application_LIX2_FYP_HKUST/scripts/clock_cal_server.py";
+static int         g_clock_cal_port = 6006;
 
 static std::string sender_stats_path_for_run(int run_id)
 {
@@ -187,15 +193,17 @@ struct ClockSample {
     uint64_t remote_ref_ns = 0;
     uint64_t local_ref_ns  = 0;
     uint64_t rtt_ns        = 0;
+    const char *source     = "none";
 };
 
-static ClockSample sample_clock_pair()
+static ClockSample sample_clock_pair_ssh()
 {
     ClockSample best{};
     if (g_sender_ssh.empty()) {
         best.valid = true;
         best.local_ref_ns = wall_time_ns();
         best.remote_ref_ns = best.local_ref_ns;
+        best.source = "local";
         return best;
     }
 
@@ -224,10 +232,78 @@ static ClockSample sample_clock_pair()
             best.rtt_ns = rtt;
             best.local_ref_ns = local_ref;
             best.remote_ref_ns = remote_ref;
+            best.source = "ssh";
         }
         usleep(10000);
     }
     return best;
+}
+
+static ClockSample sample_clock_pair_udp()
+{
+    ClockSample best{};
+    if (g_sender_ssh.empty() || g_clock_cal_host.empty()) {
+        return sample_clock_pair_ssh();
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo *res = nullptr;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", g_clock_cal_port);
+    if (getaddrinfo(g_clock_cal_host.c_str(), port_str, &hints, &res) != 0 || !res) {
+        return best;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        return best;
+    }
+
+    timeval tv{.tv_sec = 0, .tv_usec = 200000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    for (int i = 0; i < 64; ++i) {
+        uint64_t t_a = wall_time_ns();
+        ssize_t sent = sendto(fd, &t_a, sizeof(t_a), 0, res->ai_addr, res->ai_addrlen);
+        if (sent != (ssize_t)sizeof(t_a)) continue;
+
+        uint64_t rep[3]{};
+        ssize_t nr = recv(fd, rep, sizeof(rep), 0);
+        uint64_t t_d = wall_time_ns();
+        if (nr != (ssize_t)sizeof(rep)) continue;
+
+        uint64_t t_b = rep[1];
+        uint64_t t_c = rep[2];
+        uint64_t remote_span = (t_c >= t_b) ? (t_c - t_b) : 0;
+        uint64_t round_trip = (t_d >= t_a) ? (t_d - t_a) : 0;
+        uint64_t rtt = (round_trip >= remote_span) ? (round_trip - remote_span) : round_trip;
+        uint64_t local_ref = t_a + (round_trip / 2);
+        uint64_t remote_ref = t_b + ((t_c >= t_b) ? ((t_c - t_b) / 2) : 0);
+
+        if (!best.valid || rtt < best.rtt_ns) {
+            best.valid = true;
+            best.rtt_ns = rtt;
+            best.local_ref_ns = local_ref;
+            best.remote_ref_ns = remote_ref;
+            best.source = "udp";
+        }
+        usleep(1000);
+    }
+
+    close(fd);
+    freeaddrinfo(res);
+    return best;
+}
+
+static ClockSample sample_clock_pair()
+{
+    ClockSample udp = sample_clock_pair_udp();
+    if (udp.valid) return udp;
+    return sample_clock_pair_ssh();
 }
 
 static uint64_t sender_t1_to_local_ns(uint64_t sender_t1_ns,
@@ -253,11 +329,32 @@ static uint64_t sender_t1_to_local_ns(uint64_t sender_t1_ns,
 
 static bool start_remote_clock_server()
 {
-    return sample_clock_pair().valid;
+    if (g_sender_ssh.empty()) return true;
+    if (g_clock_cal_host.empty()) return sample_clock_pair_ssh().valid;
+
+    std::string cmd = ssh_base_cmd() + g_sender_ssh
+        + " 'pkill -f clock_cal_server.py 2>/dev/null || true; "
+          "nohup python3 " + g_clock_cal_script
+        + " --ip " + g_clock_cal_bind
+        + " --port " + std::to_string(g_clock_cal_port)
+        + " >/tmp/clock_cal_server.log 2>&1 </dev/null &'";
+    if (system(cmd.c_str()) != 0) return false;
+
+    for (int i = 0; i < 30; ++i) {
+        ClockSample s = sample_clock_pair_udp();
+        if (s.valid) return true;
+        usleep(100000);
+    }
+    return false;
 }
 
 static void stop_remote_clock_server()
 {
+    if (g_sender_ssh.empty()) return;
+    std::string cmd = ssh_base_cmd() + g_sender_ssh
+        + " 'pkill -f clock_cal_server.py 2>/dev/null || true'"
+          " >/dev/null 2>&1";
+    system(cmd.c_str());
 }
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
@@ -658,10 +755,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         int64_t end_off = cal_end.valid
             ? (int64_t)cal_end.local_ref_ns - (int64_t)cal_end.remote_ref_ns : 0;
         fprintf(stderr,
-            "[harness] clock-cal: start(valid=%d off=%.1fus rtt=%.1fus) "
-            "end(valid=%d off=%.1fus rtt=%.1fus) mode=offset-only\n",
-            cal_start.valid ? 1 : 0, us(start_off), us((int64_t)cal_start.rtt_ns),
-            cal_end.valid ? 1 : 0, us(end_off), us((int64_t)cal_end.rtt_ns));
+            "[harness] clock-cal: start(valid=%d src=%s off=%.1fus rtt=%.1fus) "
+            "end(valid=%d src=%s off=%.1fus rtt=%.1fus) mode=offset-only\n",
+            cal_start.valid ? 1 : 0, cal_start.source,
+            us(start_off), us((int64_t)cal_start.rtt_ns),
+            cal_end.valid ? 1 : 0, cal_end.source,
+            us(end_off), us((int64_t)cal_end.rtt_ns));
         if (!cal_start.valid && !cal_end.valid) {
             fprintf(stderr, "[harness] warning: no valid clock calibration samples for this run; "
                             "using raw sender timestamps\n");
@@ -867,6 +966,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--dpu-user") && i+1<argc) g_dpu_user = argv[++i];
         else if (!strcmp(argv[i],"--dpu-ip") && i+1<argc) g_dpu_ip = argv[++i];
         else if (!strcmp(argv[i],"--relay-stats-path") && i+1<argc) g_relay_stats_path = argv[++i];
+        else if (!strcmp(argv[i],"--clock-cal-host") && i+1<argc) g_clock_cal_host = argv[++i];
+        else if (!strcmp(argv[i],"--clock-cal-bind") && i+1<argc) g_clock_cal_bind = argv[++i];
+        else if (!strcmp(argv[i],"--clock-cal-port") && i+1<argc) g_clock_cal_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--clock-cal-script") && i+1<argc) g_clock_cal_script = argv[++i];
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
     }
 

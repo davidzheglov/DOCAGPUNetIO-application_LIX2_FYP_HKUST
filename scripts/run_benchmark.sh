@@ -49,6 +49,7 @@ SENDER_REMOTE_DIR="${SENDER_REMOTE_DIR:-DOCAGPUNetIO-application_LIX2_FYP_HKUST}
 SENDER_BIN="${SENDER_BIN:-\$HOME/$SENDER_REMOTE_DIR/bin/data_source}"
 SENDER_CSV="${SENDER_CSV:-\$HOME/$SENDER_REMOTE_DIR/data/ticks.csv}"
 SENDER_DEST="${SENDER_DEST:-192.168.100.2:6005}"
+SENDER_HOST="${SENDER_SSH#*@}"
 
 # ── DPU relay (lxcpu2 DPU ARM, reached *from* lxcpu2 host) ──────────────────
 DPU_USER="${DPU_USER:-ubuntu}"
@@ -57,6 +58,12 @@ DPU_RELAY_PATH="${DPU_RELAY_PATH:-/home/ubuntu/dpu_relay}"
 DPU_MCAST_IFACE="${DPU_MCAST_IFACE:-10.10.10.3}"
 RELAY_PORT="${RELAY_PORT:-6005}"
 RELAY_STATS_PATH="${RELAY_STATS_PATH:-/tmp/doca_bench_relay_stats.txt}"
+
+# ── Cross-host clock calibration (UDP data path, started via SSH) ───────────
+CLOCK_CAL_HOST="${CLOCK_CAL_HOST:-$SENDER_HOST}"
+CLOCK_CAL_BIND="${CLOCK_CAL_BIND:-0.0.0.0}"
+CLOCK_CAL_PORT="${CLOCK_CAL_PORT:-6006}"
+CLOCK_CAL_SCRIPT="${CLOCK_CAL_SCRIPT:-\$HOME/$SENDER_REMOTE_DIR/scripts/clock_cal_server.py}"
 
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
 SENDER_PASSWORD=0
@@ -76,6 +83,9 @@ while [[ $# -gt 0 ]]; do
         --iface)        IFACE_ARG="--iface $2"; shift 2 ;;
         --receiver-iface) RECEIVER_IFACE_ARG="--receiver-iface $2"; shift 2 ;;
         --sender-ssh)   SENDER_SSH="$2"; shift 2 ;;
+        --clock-cal-host) CLOCK_CAL_HOST="$2"; shift 2 ;;
+        --clock-cal-bind) CLOCK_CAL_BIND="$2"; shift 2 ;;
+        --clock-cal-port) CLOCK_CAL_PORT="$2"; shift 2 ;;
         --sender-password) SENDER_PASSWORD=1; shift ;;
         --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
         --light-bench)  LIGHT_BENCH=1; shift ;;
@@ -169,6 +179,15 @@ if [[ -n "$SENDER_SSH" ]]; then
     fi
     log_ok "Remote data_source: $EXPANDED_BIN"
 
+    log "Checking remote clock calibration helper..."
+    EXPANDED_CLOCK_SCRIPT=$(sender_ssh "$SENDER_SSH" "echo $CLOCK_CAL_SCRIPT")
+    if ! sender_ssh "$SENDER_SSH" "test -f $EXPANDED_CLOCK_SCRIPT" 2>/dev/null; then
+        log_err "Clock calibration helper not found at $EXPANDED_CLOCK_SCRIPT"
+        log_err "  Sync the repo to $SENDER_SSH or set CLOCK_CAL_SCRIPT=/path/to/clock_cal_server.py"
+        exit 1
+    fi
+    log_ok "Remote clock calibration helper: $EXPANDED_CLOCK_SCRIPT"
+
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
@@ -258,6 +277,7 @@ ${C}═════════════════════════�
     runs      : $TOTAL_RUNS  (~${ETA_M} min total)
     csv       : $CSV_PATH ($CSV_ROWS rows, $SYMBOLS symbols)
     results   : $RESULTS
+    clock cal : ${CLOCK_CAL_HOST:-local}:${CLOCK_CAL_PORT} (bind $CLOCK_CAL_BIND)
 ${C}══════════════════════════════════════════════════════════════════════${R}
 
 EOF
@@ -323,6 +343,10 @@ if [[ -n "$SENDER_SSH" ]]; then
     SENDER_ARGS+=(--dpu-user "$DPU_USER")
     SENDER_ARGS+=(--dpu-ip "$DPU_IP")
     SENDER_ARGS+=(--relay-stats-path "$RELAY_STATS_PATH")
+    SENDER_ARGS+=(--clock-cal-host "$CLOCK_CAL_HOST")
+    SENDER_ARGS+=(--clock-cal-bind "$CLOCK_CAL_BIND")
+    SENDER_ARGS+=(--clock-cal-port "$CLOCK_CAL_PORT")
+    SENDER_ARGS+=(--clock-cal-script "$CLOCK_CAL_SCRIPT")
     [[ -n "$SSH_CONTROL_PATH" ]] && SENDER_ARGS+=(--sender-control-path "$SSH_CONTROL_PATH")
 fi
 if [[ $LIGHT_BENCH -eq 1 ]]; then
