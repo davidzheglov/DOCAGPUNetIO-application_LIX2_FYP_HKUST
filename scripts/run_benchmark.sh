@@ -66,6 +66,9 @@ CLOCK_CAL_PORT="${CLOCK_CAL_PORT:-6006}"
 CLOCK_CAL_SCRIPT="${CLOCK_CAL_SCRIPT:-\$HOME/$SENDER_REMOTE_DIR/scripts/clock_cal_server.py}"
 CLOCK_TUNNEL_PID=""
 
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-15}"
+DPU_CONNECT_TIMEOUT="${DPU_CONNECT_TIMEOUT:-15}"
+
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
 SENDER_PASSWORD=0
 SSH_CONTROL_PATH=""
@@ -113,8 +116,17 @@ else
     C=""; OK=""; ERR=""; DIM=""; R=""
 fi
 
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
-SCP_OPTS=(-q)
+SSH_OPTS=(-o BatchMode=yes
+          -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+          -o ServerAliveInterval=5
+          -o ServerAliveCountMax=2
+          -o StrictHostKeyChecking=accept-new)
+SCP_OPTS=(-q
+          -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+          -o ServerAliveInterval=5
+          -o ServerAliveCountMax=2
+          -o StrictHostKeyChecking=accept-new)
+DPU_SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=$DPU_CONNECT_TIMEOUT -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o StrictHostKeyChecking=accept-new"
 log()    { printf "%s[bench]%s %s\n" "$C" "$R" "$*"; }
 log_ok() { printf "%s[bench]%s %s✓%s %s\n" "$C" "$R" "$OK" "$R" "$*"; }
 log_err(){ printf "%s[bench]%s %s✗%s %s\n" "$C" "$R" "$ERR" "$R" "$*" >&2; }
@@ -125,15 +137,29 @@ sender_scp() { scp "${SCP_OPTS[@]}" "$@"; }
 if [[ -n "$SENDER_SSH" && $SENDER_PASSWORD -eq 1 ]]; then
     SSH_CONTROL_PATH="/tmp/bench_sender_ssh_${USER}_$$"
     log "Opening reusable SSH session to $SENDER_SSH (password may be prompted once)..."
-    if ! ssh -o BatchMode=no -o ConnectTimeout=5 \
+    if ! ssh -o BatchMode=no -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
+             -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+             -o StrictHostKeyChecking=accept-new \
              -o ControlMaster=yes -o ControlPersist=yes \
              -o ControlPath="$SSH_CONTROL_PATH" \
              "$SENDER_SSH" "true"; then
         log_err "SSH to $SENDER_SSH failed"
         exit 1
     fi
-    SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH")
-    SCP_OPTS=(-q -o ControlMaster=no -o ControlPath="$SSH_CONTROL_PATH")
+    SSH_OPTS=(-o BatchMode=yes
+              -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+              -o ServerAliveInterval=5
+              -o ServerAliveCountMax=2
+              -o StrictHostKeyChecking=accept-new
+              -o ControlMaster=no
+              -o ControlPath="$SSH_CONTROL_PATH")
+    SCP_OPTS=(-q
+              -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+              -o ServerAliveInterval=5
+              -o ServerAliveCountMax=2
+              -o StrictHostKeyChecking=accept-new
+              -o ControlMaster=no
+              -o ControlPath="$SSH_CONTROL_PATH")
     log_ok "Reusable SSH session established"
 fi
 
@@ -211,7 +237,7 @@ if [[ -n "$SENDER_SSH" ]]; then
 
     if [[ "$CLOCK_CAL_HOST" == "$SENDER_HOST" || "$CLOCK_CAL_HOST" == "lxcpu2.cse.ust.hk" ]]; then
         log "Opening persistent SSH tunnel for clock calibration..."
-        ssh "${SSH_OPTS[@]}" -N \
+        ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -N \
             -L "127.0.0.1:${CLOCK_CAL_PORT}:127.0.0.1:${CLOCK_CAL_PORT}" \
             "$SENDER_SSH" &
         CLOCK_TUNNEL_PID=$!
@@ -226,7 +252,7 @@ if [[ -n "$SENDER_SSH" ]]; then
 
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
     if ! sender_ssh "$SENDER_SSH" \
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
+        "ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
         log_err "lxcpu2 host cannot SSH to its DPU ARM ($DPU_USER@$DPU_IP)"
         log_err "  On $SENDER_SSH: ssh-copy-id ${DPU_USER}@${DPU_IP}"
         exit 1
@@ -234,7 +260,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     log_ok "lxcpu2 → DPU ARM SSH OK"
 
     log "Checking dpu_relay on DPU ARM..."
-    if ! sender_ssh "$SENDER_SSH" "ssh ${DPU_USER}@${DPU_IP} 'test -x $DPU_RELAY_PATH'" 2>/dev/null; then
+    if ! sender_ssh "$SENDER_SSH" "ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'test -x $DPU_RELAY_PATH'" 2>/dev/null; then
         log_err "dpu_relay missing on DPU ARM at $DPU_RELAY_PATH"
         log_err "  On $SENDER_SSH: cd ~/$SENDER_REMOTE_DIR && make dpu_relay_dpu && \\"
         log_err "    scp bin/dpu_relay_dpu ${DPU_USER}@${DPU_IP}:$DPU_RELAY_PATH"
@@ -322,7 +348,7 @@ EOF
 if [[ -n "$SENDER_SSH" ]]; then
     log "Starting dpu_relay on $DPU_USER@$DPU_IP via $SENDER_SSH..."
     if ! sender_ssh "$SENDER_SSH" \
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
+        "ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true; sleep 0.3; \
          rm -f $RELAY_STATS_PATH; \
          nohup $DPU_RELAY_PATH --listen-port $RELAY_PORT --iface $DPU_MCAST_IFACE \
               --stats-file $RELAY_STATS_PATH \
@@ -332,10 +358,10 @@ if [[ -n "$SENDER_SSH" ]]; then
     fi
     sleep 1
     if ! sender_ssh "$SENDER_SSH" \
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
+        "ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'ss -lun | grep -q :$RELAY_PORT'" 2>/dev/null; then
         log_err "dpu_relay failed to bind port $RELAY_PORT on DPU ARM"
         sender_ssh "$SENDER_SSH" \
-            "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
+            "ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'tail -20 /tmp/dpu_relay.log'" 2>&1 || true
         exit 1
     fi
     log_ok "dpu_relay listening on $DPU_IP:$RELAY_PORT"
@@ -362,7 +388,7 @@ cleanup() {
         sender_ssh "$SENDER_SSH" \
             "pkill -x data_source 2>/dev/null || true; \
              if test -f /tmp/doca_clock_cal_server.pid; then kill \$(cat /tmp/doca_clock_cal_server.pid) 2>/dev/null || true; rm -f /tmp/doca_clock_cal_server.pid; fi; \
-             ssh ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
+             ssh $DPU_SSH_OPTS ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
             >/dev/null 2>&1 || true
         if [[ -n "$SSH_CONTROL_PATH" ]]; then
             ssh -o ControlPath="$SSH_CONTROL_PATH" -O exit "$SENDER_SSH" >/dev/null 2>&1 || true
@@ -388,6 +414,7 @@ if [[ -n "$SENDER_SSH" ]]; then
     SENDER_ARGS+=(--clock-cal-bind "$CLOCK_CAL_BIND")
     SENDER_ARGS+=(--clock-cal-port "$CLOCK_CAL_PORT")
     SENDER_ARGS+=(--clock-cal-script "$CLOCK_CAL_SCRIPT")
+    SENDER_ARGS+=(--ssh-timeout "$SSH_CONNECT_TIMEOUT")
     [[ -n "$SSH_CONTROL_PATH" ]] && SENDER_ARGS+=(--sender-control-path "$SSH_CONTROL_PATH")
 fi
 if [[ $LIGHT_BENCH -eq 1 ]]; then
