@@ -64,6 +64,7 @@ CLOCK_CAL_HOST="${CLOCK_CAL_HOST:-$SENDER_HOST}"
 CLOCK_CAL_BIND="${CLOCK_CAL_BIND:-0.0.0.0}"
 CLOCK_CAL_PORT="${CLOCK_CAL_PORT:-6006}"
 CLOCK_CAL_SCRIPT="${CLOCK_CAL_SCRIPT:-\$HOME/$SENDER_REMOTE_DIR/scripts/clock_cal_server.py}"
+CLOCK_TUNNEL_PID=""
 
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
 SENDER_PASSWORD=0
@@ -208,6 +209,21 @@ if [[ -n "$SENDER_SSH" ]]; then
     fi
     log_ok "Clock calibration helper running on ${CLOCK_CAL_BIND}:${CLOCK_CAL_PORT}"
 
+    if [[ "$CLOCK_CAL_HOST" == "$SENDER_HOST" || "$CLOCK_CAL_HOST" == "lxcpu2.cse.ust.hk" ]]; then
+        log "Opening persistent SSH tunnel for clock calibration..."
+        ssh "${SSH_OPTS[@]}" -N \
+            -L "127.0.0.1:${CLOCK_CAL_PORT}:127.0.0.1:${CLOCK_CAL_PORT}" \
+            "$SENDER_SSH" &
+        CLOCK_TUNNEL_PID=$!
+        sleep 0.5
+        if ! kill -0 "$CLOCK_TUNNEL_PID" 2>/dev/null; then
+            log_err "clock calibration SSH tunnel failed to start"
+            exit 1
+        fi
+        CLOCK_CAL_HOST="127.0.0.1"
+        log_ok "Clock calibration tunnel ready at ${CLOCK_CAL_HOST}:${CLOCK_CAL_PORT}"
+    fi
+
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
@@ -332,6 +348,10 @@ cleanup() {
     if [[ -n "$HARNESS_PID" ]] && kill -0 "$HARNESS_PID" 2>/dev/null; then
         kill "$HARNESS_PID" 2>/dev/null || true
         wait "$HARNESS_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$CLOCK_TUNNEL_PID" ]] && kill -0 "$CLOCK_TUNNEL_PID" 2>/dev/null; then
+        kill "$CLOCK_TUNNEL_PID" 2>/dev/null || true
+        wait "$CLOCK_TUNNEL_PID" 2>/dev/null || true
     fi
     pkill -f bin/cpu_receiver  2>/dev/null || true
     pkill -f bin/dpdk_receiver 2>/dev/null || true
