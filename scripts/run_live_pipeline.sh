@@ -4,7 +4,8 @@
 # This script runs on the receiver host (lxcpu1). It starts:
 #   1. scripts/show_risk.py to display SignalResult trade/risk output.
 #   2. The selected receiver tier, using the known-good manual commands.
-#   3. bash scripts/run_live_sender.sh for Binance -> DPU relay -> multicast.
+#   3. SSH to lxcpu2 and run bash scripts/run_live_sender.sh there. That sender
+#      script then SSHes into the lxcpu2 DPU ARM core and starts dpu_relay.
 #
 # Receiver stdout/stderr is left visible so GPU/DPDK/RDMA kernel logs appear in
 # the terminal. show_risk.py listens on UDP 5006 and prints trade signals.
@@ -16,6 +17,9 @@ SYMBOLS="${SYMBOLS:-BTCUSDT,ETHUSDT}"
 HARNESS_IP="${HARNESS_IP:-127.0.0.1}"
 FILLSIM_IP="${FILLSIM_IP:-127.0.0.1}"
 SHOW_RAW=0
+
+SENDER_SSH="${SENDER_SSH:-lix2@lxcpu2.cse.ust.hk}"
+SENDER_REMOTE_DIR="${SENDER_REMOTE_DIR:-DOCAGPUNetIO-application_LIX2_FYP_HKUST}"
 
 DPU_USER="${DPU_USER:-ubuntu}"
 DPU_IP="${DPU_IP:-192.168.100.2}"
@@ -39,6 +43,8 @@ Options:
   --harness <ip>             Receiver BenchmarkResult destination (default: ${HARNESS_IP})
   --fillsim <ip>             Receiver SignalResult destination (default: ${FILLSIM_IP})
   --raw-signals              Print every SignalResult instead of dashboard view
+  --sender-ssh <user@host>   lxcpu2 sender host (default: ${SENDER_SSH})
+  --sender-dir <dir>         Repo dir under remote HOME (default: ${SENDER_REMOTE_DIR})
   --dpu-user <user>          DPU ARM SSH user (default: ${DPU_USER})
   --dpu-ip <ip>              DPU ARM management IP (default: ${DPU_IP})
   --dpu-relay-path <path>    DPU relay path (default: ${DPU_RELAY_PATH})
@@ -63,6 +69,8 @@ while [[ $# -gt 0 ]]; do
         --harness) HARNESS_IP="$2"; shift 2 ;;
         --fillsim) FILLSIM_IP="$2"; shift 2 ;;
         --raw-signals) SHOW_RAW=1; shift ;;
+        --sender-ssh) SENDER_SSH="$2"; shift 2 ;;
+        --sender-dir) SENDER_REMOTE_DIR="$2"; shift 2 ;;
         --dpu-user) DPU_USER="$2"; shift 2 ;;
         --dpu-ip) DPU_IP="$2"; shift 2 ;;
         --dpu-relay-path) DPU_RELAY_PATH="$2"; shift 2 ;;
@@ -93,10 +101,13 @@ case "$TIER" in
 esac
 
 [[ -x "$RECEIVER" ]] || { echo "Error: missing $RECEIVER; run make t${TIER}" >&2; exit 1; }
-[[ -x "bin/data_source_live" ]] || { echo "Error: missing bin/data_source_live; run make data_source_live" >&2; exit 1; }
-[[ -x "bin/dpu_relay_dpu" ]] || { echo "Error: missing bin/dpu_relay_dpu; run make dpu_relay_dpu" >&2; exit 1; }
-[[ -f "scripts/run_live_sender.sh" ]] || { echo "Error: missing scripts/run_live_sender.sh" >&2; exit 1; }
 [[ -f "scripts/show_risk.py" ]] || { echo "Error: missing scripts/show_risk.py" >&2; exit 1; }
+
+if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$SENDER_SSH" \
+    "test -f \"\$HOME/$SENDER_REMOTE_DIR/scripts/run_live_sender.sh\""; then
+    echo "Error: remote sender script missing on $SENDER_SSH: ~/$SENDER_REMOTE_DIR/scripts/run_live_sender.sh" >&2
+    exit 1
+fi
 
 if [[ -t 1 ]]; then
     C_PIPE=$'\e[1;36m'
@@ -138,7 +149,8 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 echo "${C_PIPE}[pipeline]${C_RST} starting live T${TIER} pipeline"
-echo "${C_PIPE}[pipeline]${C_RST} symbols=${SYMBOLS} dpu=${DPU_USER}@${DPU_IP} relay=${DPU_RELAY_PATH} iface=${DPU_MCAST_IFACE}"
+echo "${C_PIPE}[pipeline]${C_RST} symbols=${SYMBOLS} sender=${SENDER_SSH}:~/${SENDER_REMOTE_DIR}"
+echo "${C_PIPE}[pipeline]${C_RST} dpu=${DPU_USER}@${DPU_IP} relay=${DPU_RELAY_PATH} iface=${DPU_MCAST_IFACE}"
 
 SHOW_ARGS=(scripts/show_risk.py --rate-hz 1.0)
 if [[ "$SHOW_RAW" -eq 1 ]]; then
@@ -188,21 +200,15 @@ esac
 
 sleep 2
 
-echo "${C_PIPE}[pipeline]${C_RST} starting sender: bash scripts/run_live_sender.sh"
-DPU_USER="$DPU_USER" \
-DPU_IP="$DPU_IP" \
-DPU_RELAY_PATH="$DPU_RELAY_PATH" \
-DPU_MCAST_IFACE="$DPU_MCAST_IFACE" \
-RELAY_PORT="$RELAY_PORT" \
-SYMBOLS="$SYMBOLS" \
-    bash scripts/run_live_sender.sh \
-        --symbols "$SYMBOLS" \
-        --dpu-user "$DPU_USER" \
-        --dpu-ip "$DPU_IP" \
-        --dpu-relay-path "$DPU_RELAY_PATH" \
-        --iface "$DPU_MCAST_IFACE" \
-        --port "$RELAY_PORT" \
-        > >(tag "[SENDER]" "$C_SEND") 2>&1 &
+echo "${C_PIPE}[pipeline]${C_RST} starting sender on ${SENDER_SSH}: bash scripts/run_live_sender.sh"
+REMOTE_CMD=$(printf 'cd "$HOME/%s" && DPU_USER=%q DPU_IP=%q DPU_RELAY_PATH=%q DPU_MCAST_IFACE=%q RELAY_PORT=%q SYMBOLS=%q bash scripts/run_live_sender.sh --symbols %q --dpu-user %q --dpu-ip %q --dpu-relay-path %q --iface %q --port %q' \
+    "$SENDER_REMOTE_DIR" \
+    "$DPU_USER" "$DPU_IP" "$DPU_RELAY_PATH" "$DPU_MCAST_IFACE" "$RELAY_PORT" "$SYMBOLS" \
+    "$SYMBOLS" "$DPU_USER" "$DPU_IP" "$DPU_RELAY_PATH" "$DPU_MCAST_IFACE" "$RELAY_PORT")
+
+ssh -tt -o BatchMode=yes -o ServerAliveInterval=10 "$SENDER_SSH" \
+    "$REMOTE_CMD" \
+    > >(tag "[SENDER]" "$C_SEND") 2>&1 &
 SENDER_PID=$!
 
 echo
