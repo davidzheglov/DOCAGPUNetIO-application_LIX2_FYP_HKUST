@@ -12,8 +12,8 @@ and writes 6 PNGs to results/plots_<timestamp>/:
   05_stage_breakdown.png    — stacked p50 ingress/compute/egress per tier @ 100k Hz
   06_e2e_latency.png        — receiver-ingress-to-output p50/p99
 
-Current benchmark definition for T1-T4 uses a single receiver-side clock on
-lxcpu1:
+Current benchmark definition for T1-T4 uses sender-side T1 in TickMessage,
+then reconciles sender/receiver clocks in the harness:
   ingress = T2 - T1
   compute = T3 - T2
   e2e = T4 - T1

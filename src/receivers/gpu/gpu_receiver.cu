@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <thread>
 #include <chrono>
 
@@ -179,6 +180,15 @@ struct ResultRing {
     uint32_t     depth   = RESULT_QUEUE_DEPTH;
 };
 
+struct GpuKernelStats {
+    uint64_t polls;
+    uint64_t bursts;
+    uint64_t rx_pkts;
+    uint64_t addr_zero;
+    uint64_t port_miss;
+    uint64_t ring_writes;
+};
+
 /* ── GPUNetIO persistent receive + process kernel (DOCA 3.x API) ─────────── */
 /*
  * Uses doca_gpu_dev_eth_rxq_recv<WARP_SCOPE> — the warp-scope template
@@ -231,6 +241,7 @@ __global__ void gpu_recv_process_kernel(
     ResultSlot              *result_ring,
     volatile uint64_t       *ring_head,
     uint32_t                 ring_depth,
+    GpuKernelStats          *stats,
     uint8_t                  tier,
     int                      use_nic_t1,
     int                      light_mode)
@@ -472,6 +483,15 @@ __global__ void gpu_recv_process_kernel(
         /* Ensure all threads complete before next burst */
         __syncthreads();
     }
+
+    if (tid == 0 && stats != nullptr) {
+        stats->polls       = s_poll_count;
+        stats->bursts      = s_recv_count;
+        stats->rx_pkts     = s_pkt_total;
+        stats->addr_zero   = s_addr_zero;
+        stats->port_miss   = s_port_miss;
+        stats->ring_writes = s_ring_writes;
+    }
 }
 
 /* ── CPU forwarding thread ──────────────────────────────────────��─────────── */
@@ -492,6 +512,8 @@ struct ForwardCtx {
     sockaddr_in        signal_dest{};
     bool               t1_bypass_gpu_cycle_conversion = false;
     std::atomic<bool>  stop{false};
+    std::atomic<uint64_t> forwarded{0};
+    std::atomic<uint64_t> ring_overflow_drops{0};
 };
 
 template<typename T>
@@ -634,6 +656,8 @@ static void cpu_forward_thread(ForwardCtx *ctx)
     fprintf(stderr, "[CPU-FWD] stopped. total forwarded=%llu ring_overflow_drops=%llu\n",
             (unsigned long long)fwd_count,
             (unsigned long long)ring_overflow_drop);
+    ctx->forwarded.store(fwd_count, std::memory_order_relaxed);
+    ctx->ring_overflow_drops.store(ring_overflow_drop, std::memory_order_relaxed);
 }
 
 /* ── DOCA host-side initialisation (DOCA 3.x API) ─────────────────────── */
@@ -651,6 +675,31 @@ struct DocaContext {
 
 static bool g_use_nic_t1 = false;
 static bool g_light_bench = false;
+static const char *g_stats_file = nullptr;
+
+static void write_receiver_stats(const char *path,
+                                 uint64_t flow_pkts,
+                                 const GpuKernelStats &gpu,
+                                 uint64_t cpu_forwarded,
+                                 uint64_t ring_overflow)
+{
+    if (path == nullptr || path[0] == '\0') return;
+
+    std::ofstream f(path);
+    if (!f) {
+        fprintf(stderr, "[gpu_receiver] warning: cannot write stats file %s\n", path);
+        return;
+    }
+    f << "flow_pkts=" << flow_pkts << '\n'
+      << "gpu_rx_pkts=" << gpu.rx_pkts << '\n'
+      << "gpu_bursts=" << gpu.bursts << '\n'
+      << "gpu_polls=" << gpu.polls << '\n'
+      << "gpu_ring_writes=" << gpu.ring_writes << '\n'
+      << "gpu_addr_zero=" << gpu.addr_zero << '\n'
+      << "gpu_port_miss=" << gpu.port_miss << '\n'
+      << "cpu_forwarded=" << cpu_forwarded << '\n'
+      << "ring_overflow=" << ring_overflow << '\n';
+}
 
 static size_t get_page_size(void)
 {
@@ -1001,6 +1050,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
         else if (!strcmp(argv[i],"--nic-t1"))                     g_use_nic_t1 = true;
         else if (!strcmp(argv[i],"--light-bench"))                g_light_bench = true;
+        else if (!strcmp(argv[i],"--stats-file") && i+1<argc)     g_stats_file = argv[++i];
     }
 
     fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
@@ -1052,6 +1102,13 @@ int main(int argc, char **argv)
     uint64_t *d_ring_head = nullptr;
     CUDA_CHECK(cudaHostGetDevicePointer(&d_ring_slots, ring.slots, 0));
     CUDA_CHECK(cudaHostGetDevicePointer(&d_ring_head, ring.head, 0));
+
+    GpuKernelStats *h_gpu_stats = nullptr;
+    GpuKernelStats *d_gpu_stats = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_gpu_stats, sizeof(GpuKernelStats),
+                              cudaHostAllocMapped));
+    std::memset(h_gpu_stats, 0, sizeof(GpuKernelStats));
+    CUDA_CHECK(cudaHostGetDevicePointer(&d_gpu_stats, h_gpu_stats, 0));
 
     /* Quit flag — host-pinned mapped memory so CPU writes are
      * immediately visible to the GPU without cudaMemcpy */
@@ -1131,6 +1188,7 @@ int main(int argc, char **argv)
         d_ring_slots,
         d_ring_head,
         ring.depth,
+        d_gpu_stats,
         tier,
         g_use_nic_t1 ? 1 : 0,
         g_light_bench ? 1 : 0);
@@ -1181,6 +1239,21 @@ int main(int argc, char **argv)
     fwd_ctx.stop = true;
     fwd_thread.join();
 
+    uint64_t flow_pkts = 0;
+    if (doca.flow_entry) {
+        doca_flow_entries_process(doca.flow_port, 0, 100, 0);
+        struct doca_flow_resource_query stats = {};
+        doca_error_t qerr = doca_flow_resource_query_entry(doca.flow_entry, &stats);
+        if (qerr == DOCA_SUCCESS)
+            flow_pkts = stats.counter.total_pkts;
+    }
+
+    write_receiver_stats(g_stats_file,
+                         flow_pkts,
+                         *h_gpu_stats,
+                         fwd_ctx.forwarded.load(std::memory_order_relaxed),
+                         fwd_ctx.ring_overflow_drops.load(std::memory_order_relaxed));
+
     /* Cleanup */
     doca_ctx_stop(doca.rxq_ctx);
     doca_eth_rxq_destroy(doca.rxq_cpu);
@@ -1197,6 +1270,7 @@ int main(int argc, char **argv)
     cudaFree(d_avg_loss);
     cudaFree(d_last_mid);
     cudaFreeHost(d_quit);
+    cudaFreeHost(h_gpu_stats);
     cudaFreeHost(ring.slots);
     cudaFreeHost(ring.head);
     close(harness_fd);
