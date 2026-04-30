@@ -120,7 +120,6 @@ static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernel
 static std::string g_dpu_user = "ubuntu";
 static std::string g_dpu_ip = "192.168.100.2";
 static std::string g_relay_stats_path;
-static std::string g_receiver_stats_path;
 static std::string g_clock_cal_host;
 static std::string g_clock_cal_bind = "0.0.0.0";
 static std::string g_clock_cal_script
@@ -132,55 +131,12 @@ static std::string sender_stats_path_for_run(int run_id)
     return "/tmp/doca_bench_sender_stats_" + std::to_string(run_id) + ".txt";
 }
 
-static std::string receiver_stats_path_for_run(int run_id)
-{
-    return "/tmp/doca_bench_receiver_stats_" + std::to_string(run_id) + ".txt";
-}
-
 static uint64_t read_counter_from_file(const std::string &path)
 {
     std::ifstream f(path);
     uint64_t v = 0;
     if (f) f >> v;
     return v;
-}
-
-struct ReceiverStats {
-    uint64_t flow_pkts = 0;
-    uint64_t gpu_rx_pkts = 0;
-    uint64_t gpu_bursts = 0;
-    uint64_t gpu_polls = 0;
-    uint64_t gpu_ring_writes = 0;
-    uint64_t gpu_addr_zero = 0;
-    uint64_t gpu_port_miss = 0;
-    uint64_t cpu_forwarded = 0;
-    uint64_t ring_overflow = 0;
-};
-
-static ReceiverStats read_receiver_stats_file(const std::string &path)
-{
-    ReceiverStats stats{};
-    std::ifstream f(path);
-    if (!f) return stats;
-
-    std::string line;
-    while (std::getline(f, line)) {
-        size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = line.substr(0, eq);
-        uint64_t val = strtoull(line.c_str() + eq + 1, nullptr, 10);
-
-        if      (key == "flow_pkts")        stats.flow_pkts = val;
-        else if (key == "gpu_rx_pkts")      stats.gpu_rx_pkts = val;
-        else if (key == "gpu_bursts")       stats.gpu_bursts = val;
-        else if (key == "gpu_polls")        stats.gpu_polls = val;
-        else if (key == "gpu_ring_writes")  stats.gpu_ring_writes = val;
-        else if (key == "gpu_addr_zero")    stats.gpu_addr_zero = val;
-        else if (key == "gpu_port_miss")    stats.gpu_port_miss = val;
-        else if (key == "cpu_forwarded")    stats.cpu_forwarded = val;
-        else if (key == "ring_overflow")    stats.ring_overflow = val;
-    }
-    return stats;
 }
 
 static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
@@ -548,10 +504,6 @@ static std::vector<std::string> receiver_args(int tier)
         args.push_back(g_gpu_pcie);
         args.push_back("--nic-pcie");
         args.push_back(g_nic_pcie);
-        if (!g_receiver_stats_path.empty()) {
-            args.push_back("--stats-file");
-            args.push_back(g_receiver_stats_path);
-        }
     }
 
     return args;
@@ -729,11 +681,6 @@ struct RunResult {
      * "below the measurement floor" rather than as point estimates. */
     double clock_offset_us;             /* (start+end)/2 of (local-remote) offset */
     double clock_rtt_us;                /* max(start, end) RTT — conservative */
-    uint64_t receiver_flow_pkts;
-    uint64_t receiver_gpu_rx_pkts;
-    uint64_t receiver_gpu_ring_writes;
-    uint64_t receiver_cpu_forwarded;
-    uint64_t receiver_ring_overflow;
 };
 
 static void write_header(std::ofstream &f)
@@ -746,10 +693,7 @@ static void write_header(std::ofstream &f)
       << "compute_p50_us,compute_p95_us,compute_p99_us,compute_mean_us,"
       << "throughput_per_sec,"
       << "signals_total_per_sec,signals_actionable_per_sec,"
-      << "clock_offset_us,clock_rtt_us,"
-      << "receiver_flow_pkts,receiver_gpu_rx_pkts,"
-      << "receiver_gpu_ring_writes,receiver_cpu_forwarded,"
-      << "receiver_ring_overflow\n";
+      << "clock_offset_us,clock_rtt_us\n";
 }
 
 static void write_row(std::ofstream &f, const RunResult &r)
@@ -777,12 +721,7 @@ static void write_row(std::ofstream &f, const RunResult &r)
       << r.signals_total_per_sec << ','
       << r.signals_actionable_per_sec << ','
       << r.clock_offset_us << ','
-      << r.clock_rtt_us << ','
-      << r.receiver_flow_pkts << ','
-      << r.receiver_gpu_rx_pkts << ','
-      << r.receiver_gpu_ring_writes << ','
-      << r.receiver_cpu_forwarded << ','
-      << r.receiver_ring_overflow << '\n';
+      << r.clock_rtt_us << '\n';
     f.flush();
 }
 
@@ -795,8 +734,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "\n[harness] RUN %d | tier=T%d | rate=%ld | rep=%d\n",
         run_id, tier, rate_hz, repetition);
     std::string sender_stats_path = sender_stats_path_for_run(run_id);
-    std::string receiver_stats_path = receiver_stats_path_for_run(run_id);
-    g_receiver_stats_path = (tier == 4 || tier == 5) ? receiver_stats_path : "";
 
     /* Kill any leftover receivers locally; on remote host the SSH launcher
      * will pkill data_source itself before starting the new one. */
@@ -817,7 +754,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         rm_cmd += g_sender_ssh + " 'rm -f " + sender_stats_path + "'";
         system(rm_cmd.c_str());
     }
-    unlink(receiver_stats_path.c_str());
     usleep(300000);
 
     /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
@@ -987,7 +923,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
     kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
     usleep(100000);
-    ReceiverStats receiver_stats = read_receiver_stats_file(receiver_stats_path);
 
     size_t n_ticks = e2e_ns.size();
     uint64_t processed_ticks = processed_tick_ids.size();
@@ -1085,11 +1020,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         r.clock_offset_us = avg_off_ns / 1000.0;
         r.clock_rtt_us    = (double)worst_rtt / 1000.0;
     }
-    r.receiver_flow_pkts = receiver_stats.flow_pkts;
-    r.receiver_gpu_rx_pkts = receiver_stats.gpu_rx_pkts;
-    r.receiver_gpu_ring_writes = receiver_stats.gpu_ring_writes;
-    r.receiver_cpu_forwarded = receiver_stats.cpu_forwarded;
-    r.receiver_ring_overflow = receiver_stats.ring_overflow;
 
     fprintf(stderr,
         "[harness] T%d @%ld: n=%zu drop=%.2f%% "
@@ -1106,17 +1036,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         (unsigned long long)n_rejected_too_old,
         r.e2e_p50 / 1000.0, r.e2e_p99 / 1000.0, r.throughput,
         r.signals_total_per_sec, r.signals_actionable_per_sec);
-    if (tier == 4 || tier == 5) {
-        fprintf(stderr,
-            "[harness] T%d receiver-stats: flow=%llu gpu_rx=%llu "
-            "ring_writes=%llu cpu_fwd=%llu ring_overflow=%llu\n",
-            tier,
-            (unsigned long long)receiver_stats.flow_pkts,
-            (unsigned long long)receiver_stats.gpu_rx_pkts,
-            (unsigned long long)receiver_stats.gpu_ring_writes,
-            (unsigned long long)receiver_stats.cpu_forwarded,
-            (unsigned long long)receiver_stats.ring_overflow);
-    }
 
     return r;
 }
