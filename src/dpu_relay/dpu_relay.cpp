@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
     uint64_t pkt_count   = 0;
     uint64_t byte_count  = 0;
     uint64_t batch_count = 0;
+    uint64_t last_stats_pkt_count = 0;
     write_stats_file(0);
 
     while (g_running) {
@@ -236,7 +237,10 @@ int main(int argc, char **argv) {
         for (int i = 0; i < sent_total; ++i) byte_count += msgs_rx[i].msg_len;
         pkt_count   += sent_total;
         batch_count += 1;
-        if ((pkt_count & 0x3FFULL) == 0) write_stats_file(pkt_count);
+        if (pkt_count - last_stats_pkt_count >= 4096) {
+            write_stats_file(pkt_count);
+            last_stats_pkt_count = pkt_count;
+        }
 
         /* Lighter logging — once per ~10000 packets, batched, no \r flicker. */
         if (pkt_count % 100000 == 0) {

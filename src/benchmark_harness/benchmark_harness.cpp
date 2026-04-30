@@ -736,7 +736,21 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
      * losses where the sender produced a tick that *never* reached the
      * receiver (whole tail of a saturating run). For that, sent_ticks_window
      * vs the observed range gives a sanity check (still in CSV). */
-    uint64_t sent_denominator = relay_ticks_window > 0 ? relay_ticks_window : sent_ticks_window;
+    uint64_t sent_denominator = sent_ticks_window;
+    bool using_relay_denominator = false;
+    if (relay_ticks_window > 0) {
+        uint64_t relay_slack = sent_ticks_window / 4 + 8192;
+        if (sent_ticks_window == 0 || relay_ticks_window <= sent_ticks_window + relay_slack) {
+            sent_denominator = relay_ticks_window;
+            using_relay_denominator = true;
+        } else {
+            fprintf(stderr,
+                    "[harness] warning: ignoring implausible relay count "
+                    "(relay=%llu sender=%llu)\n",
+                    (unsigned long long)relay_ticks_window,
+                    (unsigned long long)sent_ticks_window);
+        }
+    }
     if (sent_ticks_window > 0) {
         uint64_t seen_latency = latency_tick_ids.size();
         n_inferred_missing_ticks = sent_ticks_window > seen_latency
@@ -802,11 +816,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     fprintf(stderr,
         "[harness] T%d @%ld: n=%zu drop=%.2f%% "
-        "(sent=%llu processed=%llu rx_drop=%llu gap_drop=%llu invalid=%llu too_old=%llu) "
+        "(sent=%llu source=%s processed=%llu rx_drop=%llu gap_drop=%llu invalid=%llu too_old=%llu) "
         "e2e_p50=%.1fus e2e_p99=%.1fus "
         "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
-        (unsigned long long)sent_ticks_window,
+        (unsigned long long)sent_denominator,
+        using_relay_denominator ? "relay" : "sender",
         (unsigned long long)processed_ticks,
         (unsigned long long)n_dropped,
         (unsigned long long)n_inferred_missing_ticks,
