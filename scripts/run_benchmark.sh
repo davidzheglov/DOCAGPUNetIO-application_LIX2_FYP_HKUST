@@ -188,6 +188,19 @@ if [[ -n "$SENDER_SSH" ]]; then
     fi
     log_ok "Remote clock calibration helper: $EXPANDED_CLOCK_SCRIPT"
 
+    log "Starting UDP clock calibration helper on $SENDER_SSH..."
+    sender_ssh "$SENDER_SSH" \
+        "pkill -f clock_cal_server.py 2>/dev/null || true; \
+         nohup python3 $EXPANDED_CLOCK_SCRIPT --ip $CLOCK_CAL_BIND --port $CLOCK_CAL_PORT \
+              >/tmp/clock_cal_server.log 2>&1 </dev/null &"
+    sleep 0.5
+    if ! sender_ssh "$SENDER_SSH" "pgrep -af clock_cal_server.py >/dev/null" 2>/dev/null; then
+        log_err "clock_cal_server.py did not stay running on $SENDER_SSH"
+        sender_ssh "$SENDER_SSH" "tail -20 /tmp/clock_cal_server.log" 2>&1 || true
+        exit 1
+    fi
+    log_ok "Clock calibration helper running on ${CLOCK_CAL_BIND}:${CLOCK_CAL_PORT}"
+
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
     if ! sender_ssh "$SENDER_SSH" \
         "ssh -o BatchMode=yes -o ConnectTimeout=5 ${DPU_USER}@${DPU_IP} 'true'" 2>/dev/null; then
@@ -321,6 +334,7 @@ cleanup() {
     if [[ -n "$SENDER_SSH" ]]; then
         sender_ssh "$SENDER_SSH" \
             "pkill -x data_source 2>/dev/null || true; \
+             pkill -f clock_cal_server.py 2>/dev/null || true; \
              ssh ${DPU_USER}@${DPU_IP} 'pkill -x dpu_relay 2>/dev/null || true'" \
             >/dev/null 2>&1 || true
         if [[ -n "$SSH_CONTROL_PATH" ]]; then
