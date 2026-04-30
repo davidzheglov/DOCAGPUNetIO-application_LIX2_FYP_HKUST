@@ -667,6 +667,17 @@ select:focus {
   margin-top: 12px;
 }
 
+.tier-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: -4px;
+}
+
+.tier-preset-row .toggle {
+  min-width: 72px;
+}
+
 .operator-error {
   margin-top: 12px;
   padding: 10px;
@@ -768,10 +779,20 @@ select:focus {
   background: rgba(255, 255, 255, .075);
 }
 
+.terminal-login--danger {
+  color: #ffe4e6;
+  border-color: rgba(251, 113, 133, .36);
+  background: rgba(251, 113, 133, .12);
+}
+
 .terminal-connect-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.terminal-connect-row--triple {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .terminal-connect-row--secondary {
@@ -956,6 +977,38 @@ select:focus {
 .download-card span {
   color: #a8bac5;
   font-size: 13px;
+}
+
+.download-action {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.copyback-status {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 12px;
+  color: #d8f8ff;
+  border: 1px solid rgba(125, 211, 252, .2);
+  border-radius: 8px;
+  background: rgba(125, 211, 252, .07);
+}
+
+.copyback-status span {
+  color: #a8bac5;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.copyback-status pre {
+  max-height: 150px;
+  margin: 6px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #b9d2dd;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .artifact-list {
@@ -1454,6 +1507,7 @@ td {
   }
 
   .terminal-controls,
+  .terminal-connect-row,
   .terminal-command-row,
   .quick-command-grid {
     grid-template-columns: 1fr;

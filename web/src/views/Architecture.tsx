@@ -3,7 +3,7 @@ import { ArrowRight, Cpu, Database, Network, Server, Zap } from "lucide-react";
 import { tierCopy } from "@/lib/demo";
 import { tierName } from "@/lib/format";
 
-const tierIds = [1, 2, 3, 4, 5] as const;
+const tierIds = [1, 2, 3, 4] as const;
 
 export function Architecture() {
   const [tier, setTier] = useState<(typeof tierIds)[number]>(4);

@@ -26,8 +26,6 @@ export function tierName(tier?: number | null): string {
       return "T3 RDMA";
     case 4:
       return "T4 GPUNetIO";
-    case 5:
-      return "T5 GPUNetIO+DPU";
     default:
       return "Tier n/a";
   }

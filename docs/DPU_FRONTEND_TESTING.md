@@ -22,8 +22,8 @@ npm install
 npm run dev
 ```
 
-Open the Vite URL and select **DPU Demo**. The left **Operator Controls** panel
-contains the buttons that actually talk to the servers.
+Open the Vite URL and select **DPU Demo**. The **Terminal Controls** panel under
+the two live terminals sends prepared commands into those terminals.
 
 At the top of **DPU Demo** there are two remote terminal panes:
 
@@ -32,10 +32,11 @@ At the top of **DPU Demo** there are two remote terminal panes:
 
 Each terminal has its own optional SSH password field, a **Host / DPU ARM**
 context selector, a **Login to ARM Core DPU** button, quick command buttons, a
-**Send Password** button for nested SSH prompts, and a command line with
-**Submit**. These terminal panes are persistent SSH sessions: opening a shell
-does not create a one-command job, and later commands are written into the same
-live terminal until you click **Close**.
+**Send Password** button for nested SSH prompts, a **Ctrl+C** button for
+stopping long-running scripts, and a command line with **Submit**. These
+terminal panes are persistent SSH sessions: opening a shell does not create a
+one-command job, and later commands are written into the same live terminal
+until you click **Close**.
 
 The sender pane intentionally opens through `lxcpu1` first. After the receiver
 shell connects, the frontend also opens a sender-side shell to `lxcpu1`; then
@@ -44,21 +45,30 @@ lix2@lxcpu2.cse.ust.hk` inside that live shell. Use **Send Password** if the
 nested SSH prompt asks for it. The DPU login button sends `ssh -vvv
 ubuntu@192.168.100.2` into whichever live shell is currently open.
 
-The operator buttons cover the main script regimes:
+The terminal control buttons under the two terminals cover the main script
+regimes. They send commands into the live receiver/sender terminals instead of
+starting detached backend jobs, so `sudo` prompts and SSH password prompts stay
+interactive:
 
-- **Connect Servers**: SSH preflight for both hosts and both DPU ARM cores.
+- **Terminal Preflight**: host and DPU checks sent into both terminals.
 - **Crosslink Diagnose**: runs `bash scripts/diagnose_crosslink.sh` on
-  `lxcpu1`.
-- **Datapath Diagnose**: runs `bash scripts/diagnose_datapath.sh` on `lxcpu1`.
-- **Live Crypto Sender**: runs `bash scripts/run_live_sender.sh` on `lxcpu2`.
-  Change **Live Crypto Symbols** to choose feeds such as
+  the receiver terminal.
+- **Datapath Diagnose**: runs `bash scripts/diagnose_datapath.sh` on the
+  receiver terminal.
+- **Live Crypto Sender**: runs `bash scripts/run_live_sender.sh` on the sender
+  terminal. Change **Live Crypto Symbols** to choose feeds such as
   `BTCUSDT,ETHUSDT,SOLUSDT`.
-- **Benchmark Sweep**: runs `bash scripts/run_benchmark.sh` on `lxcpu1` with
-  editable tiers, rates, reps, warmup, duration, CSV rows, CSV symbols, DPU
-  relay path, relay port, and sender DPU egress IP.
-- **Collect Results**: creates archives on both remote hosts and copies recent
-  `results/` CSV/log/JSON/PNG/TXT files back into local
-  `results/remote_dpu/<timestamp>/`.
+- **Benchmark Sweep**: runs `bash scripts/run_benchmark.sh` in the receiver
+  terminal with editable T1-T4 tiers, rates, reps, warmup, duration, CSV rows,
+  CSV symbols, DPU relay path, relay port, and sender DPU egress IP.
+- **Prepare Remote Archives**: creates `/tmp/dpu_demo_*_results_*.tgz`
+  archives from both remote `results/` folders and prints the `scp` command.
+  This does not copy data to the local Mac by itself.
+- **Pull Remote Results** in the **Received Data** panel starts a backend SCP
+  copy-back job. It creates remote archives, downloads them to
+  `results/remote_dpu/`, extracts them, and refreshes the download list.
+- **Stop Sender/Relay** sends cleanup commands for stale `data_source` and
+  `dpu_relay` processes. Use it before a benchmark if port `6005` is busy.
 
 The terminal panes also include script-specific buttons. Receiver-side buttons
 include datapath diagnostics, `listen_results.py`, `test_link.py recv`, and
@@ -66,7 +76,7 @@ live receiver launchers. Sender-side buttons include `run_live_sender.sh`,
 `test_link.py send`, relay log tailing, and sender cleanup.
 
 The frontend now prefers `http://127.0.0.1:8002`, then falls back to any
-`VITE_API_URL`, `8001`, and `8000`. The **Operator Controls** panel shows the
+`VITE_API_URL`, `8001`, and `8000`. The **Terminal Controls** panel shows the
 backend URL it is actually using.
 
 If port `8002` is already in use, find the existing API process:
@@ -98,23 +108,20 @@ VITE_API_URL=http://127.0.0.1:8002 npm run dev
 6. Use **Login to ARM Core DPU** in either terminal when you want to enter the
    local DPU ARM shell.
 7. Edit **Live Crypto Symbols** if you want a different Binance feed list.
-8. In **Operator Controls**, click **Connect Servers**.
+8. In **Terminal Controls**, click **Terminal Preflight**.
 9. If connection passes, click **Crosslink Diagnose** or **Datapath Diagnose**.
 10. For a live crypto demo, click **Live Crypto Sender** or use the sender
     terminal's **Live Crypto Sender** button.
 11. For benchmark data, click **Benchmark Sweep**.
-12. Click **Collect Results** whenever you want to SCP recent remote outputs
-    back without running a new benchmark.
-13. Use **Download latest CSV** in the **Received Data** panel.
+12. Click **Prepare Remote Archives** when you only want remote `/tmp/*.tgz`
+    bundles, or click **Pull Remote Results** to SCP receiver/sender artifacts
+    back to `results/remote_dpu/` on your Mac.
+13. Use **Ctrl+C** on the relevant terminal to stop live sender, listener, or
+    benchmark scripts without closing the SSH session.
 
-The benchmark runs `scripts/run_benchmark.sh` on `lxcpu1`, uses `lxcpu2` as the
-sender, and copies the newest `results/benchmark_*.csv` back into:
-
-```text
-results/remote_dpu/<timestamp>/
-```
-
-The job console prints the copied artifact path and an `/artifacts/...` URL.
+The benchmark runs `scripts/run_benchmark.sh` on `lxcpu1` inside the receiver
+terminal and uses `lxcpu2` as the sender. Because it is terminal-driven, sudo
+and SSH password prompts remain usable.
 
 ## Updating the remote repos
 

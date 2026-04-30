@@ -111,6 +111,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ text }),
     }),
+  interruptTerminalSession: (sessionId: string) =>
+    request<{ session: TerminalSession }>(`/api/terminal/sessions/${sessionId}/interrupt`, {
+      method: "POST",
+    }),
   closeTerminalSession: (sessionId: string) =>
     request<{ session: TerminalSession }>(`/api/terminal/sessions/${sessionId}/close`, {
       method: "POST",

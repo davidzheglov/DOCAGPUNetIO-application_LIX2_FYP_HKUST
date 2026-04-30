@@ -53,7 +53,7 @@ app.add_middleware(
 
 
 class BenchmarkRequest(BaseModel):
-    tier: int = Field(4, description="Supported by scripts/benchmark.py: 1, 4, or 5")
+    tier: int = Field(4, description="Supported benchmark tiers: 1, 2, 3, or 4")
     rate_hz: int = Field(50000, gt=0)
     repetition: int = Field(1, ge=1)
     warmup_sec: int = Field(5, ge=0)
@@ -107,7 +107,7 @@ class DpuDemoRequest(BaseModel):
     live_rate_hz: int | None = Field(None, gt=0)
     harness_ip: str = "127.0.0.1"
     fillsim_ip: str = "127.0.0.1"
-    tiers: str = "1,4"
+    tiers: str = "1,2,3,4"
     rates: str = "50000,500000"
     reps: int = Field(1, ge=1)
     warmup_sec: int = Field(2, ge=0)
@@ -533,6 +533,17 @@ def terminal_send(session_id: str, text: str) -> TerminalSession:
     return session
 
 
+def terminal_interrupt(session_id: str) -> TerminalSession:
+    session = TERMINAL_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Terminal session not found")
+    if not session.child or not session.child.isalive():
+        session.status = "closed"
+        raise HTTPException(status_code=400, detail="Terminal session is closed")
+    session.child.sendcontrol("c")
+    return session
+
+
 def terminal_close(session_id: str) -> TerminalSession:
     session = TERMINAL_SESSIONS.get(session_id)
     if not session:
@@ -548,8 +559,13 @@ def terminal_close(session_id: str) -> TerminalSession:
 
 
 def benchmark_command(req: BenchmarkRequest) -> list[str]:
-    if req.tier not in {1, 4, 5}:
-        raise HTTPException(status_code=400, detail="scripts/benchmark.py currently supports tiers 1, 4, and 5.")
+    if req.tier not in {1, 2, 3, 4}:
+        raise HTTPException(status_code=400, detail="Supported benchmark tiers are 1, 2, 3, and 4.")
+    if not (REPO_ROOT / "scripts" / "benchmark.py").exists():
+        raise HTTPException(
+            status_code=404,
+            detail="scripts/benchmark.py is not present in this branch. Use DPU Demo Benchmark Sweep for the T1-T4 run_benchmark.sh path.",
+        )
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "benchmark.py"),
@@ -639,7 +655,7 @@ def health() -> dict[str, Any]:
             "uid": os.geteuid() if hasattr(os, "geteuid") else None,
         },
         "native_pipeline_note": (
-            "The web app can run anywhere, but T2-T5 native benchmarks require the Ubuntu/CUDA/DOCA/BlueField host."
+            "The web app can run anywhere, but T2-T4 native benchmarks require the Ubuntu/CUDA/DOCA/BlueField host."
             if platform.system() != "Linux"
             else "Linux host detected; native availability depends on CUDA, DOCA, DPDK, and DPU setup."
         ),
@@ -754,6 +770,12 @@ def get_terminal_session(session_id: str) -> dict[str, Any]:
 @app.post("/api/terminal/sessions/{session_id}/input")
 def send_terminal_input(session_id: str, req: TerminalInputRequest) -> dict[str, Any]:
     session = terminal_send(session_id, req.text)
+    return {"session": session.snapshot()}
+
+
+@app.post("/api/terminal/sessions/{session_id}/interrupt")
+def interrupt_terminal_session(session_id: str) -> dict[str, Any]:
+    session = terminal_interrupt(session_id)
     return {"session": session.snapshot()}
 
 

@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Activity, Cable, Cpu, Download, Gauge, KeyRound, PlugZap, RefreshCw, Router, Send, Server, ShieldCheck, SquareTerminal, TerminalSquare } from "lucide-react";
+import { Activity, Cable, Cpu, Download, Gauge, KeyRound, PlugZap, RefreshCw, Send, Server, SquareTerminal, TerminalSquare } from "lucide-react";
 import { api } from "@/lib/api";
 import type { DpuDemoRequest, Job, TerminalSession } from "@/lib/types";
-import { CommandConsole } from "@/components/CommandConsole";
 
 const defaults: DpuDemoRequest = {
   action: "preflight",
@@ -22,7 +21,7 @@ const defaults: DpuDemoRequest = {
   live_rate_hz: null,
   harness_ip: "127.0.0.1",
   fillsim_ip: "127.0.0.1",
-  tiers: "1,4",
+  tiers: "1,2,3,4",
   rates: "50000,500000",
   reps: 1,
   warmup_sec: 2,
@@ -32,25 +31,100 @@ const defaults: DpuDemoRequest = {
   csv_path: "data/ticks.csv",
   regen_csv: false,
   local_sender: false,
-  quick: true,
+  quick: false,
   light_bench: true,
   verbose_ssh: false,
   timeout_sec: 1800,
 };
 
 const actions = [
-  { id: "preflight", label: "Connect Servers", icon: PlugZap, description: "SSH to both hosts and both local DPU ARM cores" },
-  { id: "diagnose", label: "Crosslink Diagnose", icon: SquareTerminal, description: "Run diagnose_crosslink.sh on receiver" },
-  { id: "datapath", label: "Datapath Diagnose", icon: Activity, description: "Run diagnose_datapath.sh on receiver" },
-  { id: "live_sender", label: "Live Crypto Sender", icon: Send, description: "Run run_live_sender.sh on lxcpu2" },
-  { id: "benchmark", label: "Benchmark Sweep", icon: Gauge, description: "Run run_benchmark.sh and copy CSV back" },
-  { id: "collect", label: "Collect Results", icon: Download, description: "SCP result CSVs, logs, plots from both hosts" },
+  { id: "preflight", label: "Terminal Preflight", icon: PlugZap, description: "Send host and DPU checks into both live terminals" },
+  { id: "diagnose", label: "Crosslink Diagnose", icon: SquareTerminal, description: "Run diagnose_crosslink.sh in the receiver terminal" },
+  { id: "datapath", label: "Datapath Diagnose", icon: Activity, description: "Run diagnose_datapath.sh in the receiver terminal" },
+  { id: "live_sender", label: "Live Crypto Sender", icon: Send, description: "Run run_live_sender.sh in the sender terminal" },
+  { id: "benchmark", label: "Benchmark Sweep", icon: Gauge, description: "Run run_benchmark.sh in the receiver terminal" },
+  { id: "collect", label: "Prepare Remote Archives", icon: Download, description: "Create /tmp result archives from both live terminals" },
 ] as const;
+
+type TerminalAction = typeof actions[number]["id"];
+
+type TerminalPaneHandle = {
+  sendCommand: (command: string) => boolean;
+};
 
 function bytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function sh(value: string | number | null | undefined) {
+  return `'${String(value ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
+function dpuEnv(form: DpuDemoRequest) {
+  return [
+    `DPU_USER=${sh(form.dpu_user)}`,
+    `DPU_IP=${sh(form.dpu_ip)}`,
+    `DPU_RELAY_PATH=${sh(form.dpu_relay_path)}`,
+    `DPU_MCAST_IFACE=${sh(form.sender_dpu_iface)}`,
+    `RELAY_PORT=${sh(form.relay_port)}`,
+  ].join(" ");
+}
+
+function benchmarkCommand(form: DpuDemoRequest) {
+  const parts = [
+    "bash scripts/run_benchmark.sh",
+    form.quick ? "--quick" : "",
+    "--tiers", sh(form.tiers),
+    "--rates", sh(form.rates),
+    "--reps", sh(form.reps),
+    "--warmup", sh(form.warmup_sec),
+    "--duration", sh(form.duration_sec),
+    "--csv-rows", sh(form.csv_rows),
+    "--symbols", sh(form.csv_symbols),
+    "--csv", sh(form.csv_path),
+    "--iface", sh(form.sender_dpu_iface),
+    "--receiver-iface", sh(form.receiver_iface),
+    "--sender-ssh", sh(form.sender_host),
+    form.regen_csv ? "--regen-csv" : "",
+    form.local_sender ? "--local-sender" : "",
+    form.light_bench ? "--light-bench" : "",
+    "--sender-password",
+  ].filter(Boolean).join(" ");
+  return `cd ${sh(form.remote_repo)} && ${dpuEnv(form)} ${parts}`;
+}
+
+function liveSenderCommand(form: DpuDemoRequest) {
+  return [
+    `cd ${sh(form.remote_repo)} && bash scripts/run_live_sender.sh`,
+    "--symbols", sh(form.live_symbols),
+    "--dpu-ip", sh(form.dpu_ip),
+    "--dpu-user", sh(form.dpu_user),
+    "--dpu-relay-path", sh(form.dpu_relay_path),
+    "--iface", sh(form.sender_dpu_iface),
+    "--port", sh(form.relay_port),
+    form.verbose_ssh ? "--verbose" : "",
+  ].filter(Boolean).join(" ");
+}
+
+function archiveCommand(form: DpuDemoRequest, label: "receiver" | "sender", host: string) {
+  return [
+    `cd ${sh(form.remote_repo)} &&`,
+    `archive=/tmp/dpu_demo_${label}_results_$(date +%Y%m%d_%H%M%S).tgz &&`,
+    "tar -czf \"$archive\" results 2>/dev/null &&",
+    "ls -lh \"$archive\" &&",
+    "printf 'Prepared %s\\n' \"$archive\" &&",
+    `printf 'Remote archive only. Copy locally with: scp %s:%s results/remote_dpu/\\n' ${sh(host)} "$archive"`,
+  ].join(" ");
+}
+
+function cleanupCommand(form: DpuDemoRequest) {
+  return [
+    "pkill -f 'data_source_live|data_source' 2>/dev/null || true",
+    `ssh ${sh(`${form.dpu_user}@${form.dpu_ip}`)} 'pkill -f dpu_relay 2>/dev/null || true'`,
+    `ss -lunp 2>/dev/null | grep ${sh(String(form.relay_port))} || true`,
+  ].join("; ");
 }
 
 type TerminalPaneProps = {
@@ -122,7 +196,7 @@ function PersistentTerminalConsole({ session, output, onClose }: { session: Term
   );
 }
 
-function TerminalPane({
+const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(function TerminalPane({
   role,
   title,
   host,
@@ -140,7 +214,7 @@ function TerminalPane({
   autoConnectToken,
   autoPassword,
   onConnected,
-}: TerminalPaneProps) {
+}, ref) {
   const [password, setPassword] = useState("");
   const [context, setContext] = useState<"host" | "dpu">("host");
   const [command, setCommand] = useState("hostname; whoami; pwd");
@@ -175,6 +249,21 @@ function TerminalPane({
     },
     onSuccess: (data) => setSession(data.session),
   });
+  const interruptSession = useMutation({
+    mutationFn: () => {
+      if (!session) throw new Error("No terminal session is open");
+      return api.interruptTerminalSession(session.id);
+    },
+    onSuccess: (data) => setSession(data.session),
+  });
+
+  useImperativeHandle(ref, () => ({
+    sendCommand: (nextCommand: string) => {
+      if (!session || session.status === "closed") return false;
+      run("host", nextCommand);
+      return true;
+    },
+  }), [session]);
 
   useEffect(() => {
     if (!session?.id) return;
@@ -227,13 +316,15 @@ function TerminalPane({
         { label: "Listen Results", command: `cd ${remoteRepo} && python3 scripts/listen_results.py` },
         { label: "Link Receiver", command: `cd ${remoteRepo} && python3 scripts/test_link.py recv --bind ${receiverDpuIface === "10.10.10.1" ? "10.10.10.2" : receiverDpuIface}` },
         { label: "Live Receiver T1", command: `cd ${remoteRepo} && bash scripts/run_live_pipeline.sh --tier 1 --symbols ${liveSymbols} --harness ${harnessIp} --fillsim ${fillsimIp} --dpu-user ${dpuUser} --dpu-ip ${dpuIp} --dpu-relay-path ${dpuRelayPath}` },
+        { label: "Live Receiver T2", command: `cd ${remoteRepo} && bash scripts/run_live_pipeline.sh --tier 2 --symbols ${liveSymbols} --harness ${harnessIp} --fillsim ${fillsimIp} --dpu-user ${dpuUser} --dpu-ip ${dpuIp} --dpu-relay-path ${dpuRelayPath}` },
+        { label: "Live Receiver T3", command: `cd ${remoteRepo} && bash scripts/run_live_pipeline.sh --tier 3 --symbols ${liveSymbols} --harness ${harnessIp} --fillsim ${fillsimIp} --dpu-user ${dpuUser} --dpu-ip ${dpuIp} --dpu-relay-path ${dpuRelayPath}` },
         { label: "Live Receiver T4", command: `cd ${remoteRepo} && bash scripts/run_live_pipeline.sh --tier 4 --symbols ${liveSymbols} --harness ${harnessIp} --fillsim ${fillsimIp} --dpu-user ${dpuUser} --dpu-ip ${dpuIp} --dpu-relay-path ${dpuRelayPath}` },
       ]
     : [
         { label: "Live Crypto Sender", command: `cd ${remoteRepo} && bash scripts/run_live_sender.sh --symbols ${liveSymbols} --dpu-ip ${dpuIp} --dpu-user ${dpuUser} --dpu-relay-path ${dpuRelayPath} --iface ${senderDpuIface} --port ${relayPort}` },
         { label: "Link Sender", command: `cd ${remoteRepo} && python3 scripts/test_link.py send --dest 10.10.10.2 --bind ${senderDpuIface} --count 50 --rate 10` },
         { label: "Relay Log", command: `ssh ${dpuUser}@${dpuIp} 'tail -80 /tmp/dpu_relay.log 2>/dev/null || true'` },
-        { label: "Kill Sender", command: `pkill -f data_source 2>/dev/null || true; ssh ${dpuUser}@${dpuIp} 'pkill -f dpu_relay 2>/dev/null || true'` },
+        { label: "Kill Sender", command: `pkill -f 'data_source_live|data_source' 2>/dev/null || true; ssh ${dpuUser}@${dpuIp} 'pkill -f dpu_relay 2>/dev/null || true'` },
       ];
 
   return (
@@ -282,7 +373,7 @@ function TerminalPane({
         ) : null}
       </div>
 
-      <div className="terminal-connect-row terminal-connect-row--secondary">
+      <div className="terminal-connect-row terminal-connect-row--secondary terminal-connect-row--triple">
         <button
           type="button"
           className="terminal-login"
@@ -298,6 +389,10 @@ function TerminalPane({
         <button type="button" className="terminal-login terminal-login--muted" onClick={sendPassword} disabled={!session || session.status === "closed" || !password}>
           <KeyRound size={17} />
           Send Password
+        </button>
+        <button type="button" className="terminal-login terminal-login--danger" onClick={() => interruptSession.mutate()} disabled={!session || session.status === "closed" || interruptSession.isPending}>
+          <SquareTerminal size={17} />
+          Ctrl+C
         </button>
       </div>
 
@@ -350,42 +445,110 @@ function TerminalPane({
 
       {openSession.error ? <div className="operator-error">{openSession.error.message}</div> : null}
       {sendInput.error ? <div className="operator-error">{sendInput.error.message}</div> : null}
+      {interruptSession.error ? <div className="operator-error">{interruptSession.error.message}</div> : null}
       <PersistentTerminalConsole session={session} output={output} onClose={() => closeSession.mutate()} />
     </section>
   );
-}
+});
 
 export function DpuDemo() {
   const [form, setForm] = useState<DpuDemoRequest>(defaults);
-  const [job, setJob] = useState<Job | null>(null);
   const [senderBootstrap, setSenderBootstrap] = useState<{ token: number; password: string }>({ token: 0, password: "" });
+  const [operatorMessage, setOperatorMessage] = useState("Open both terminals, then use these buttons to send commands into them.");
+  const [copyJob, setCopyJob] = useState<Job | null>(null);
+  const receiverRef = useRef<TerminalPaneHandle>(null);
+  const senderRef = useRef<TerminalPaneHandle>(null);
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const artifacts = useQuery({ queryKey: ["dpu-artifacts"], queryFn: api.dpuArtifacts, refetchInterval: 6000 });
-  const start = useMutation({
-    mutationFn: api.startDpuDemo,
+  const copyResults = useMutation({
+    mutationFn: () => api.startDpuDemo({ ...form, action: "collect" }),
     onSuccess: (data) => {
-      setJob(data.job);
-      artifacts.refetch();
+      setCopyJob(data.job);
+      setOperatorMessage("Local SCP copy-back started. The backend will archive remote results and download them into results/remote_dpu/.");
     },
   });
-  const stopJob = useMutation({
-    mutationFn: (id: string) => api.stopJob(id),
-    onSuccess: (data) => setJob(data.job),
+  const copyJobStatus = useQuery({
+    queryKey: ["copy-job", copyJob?.id],
+    queryFn: () => api.job(copyJob!.id),
+    enabled: Boolean(copyJob?.id && ["queued", "running"].includes(copyJob.status)),
+    refetchInterval: 1000,
   });
-  const updateJob = useCallback((next: Job) => setJob(next), []);
+
+  useEffect(() => {
+    const next = copyJobStatus.data?.job;
+    if (!next) return;
+    setCopyJob(next);
+    if (next.status === "completed") {
+      setOperatorMessage("Remote results were copied locally. The Received Data list has been refreshed.");
+      artifacts.refetch();
+    }
+    if (next.status === "failed") {
+      setOperatorMessage("Local result copy-back failed. Check the copy log and SSH password/key setup.");
+    }
+  }, [artifacts, copyJobStatus.data?.job]);
 
   function setValue<K extends keyof DpuDemoRequest>(key: K, value: DpuDemoRequest[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  function runAction(action: DpuDemoRequest["action"]) {
-    const payload = { ...form, action };
-    setForm(payload);
-    start.mutate(payload);
+  function sendToReceiver(commandText: string) {
+    return receiverRef.current?.sendCommand(commandText) ?? false;
   }
 
-  const running = start.isPending || job?.status === "running" || job?.status === "queued";
-  const status = job?.status ?? "idle";
+  function sendToSender(commandText: string) {
+    return senderRef.current?.sendCommand(commandText) ?? false;
+  }
+
+  function runAction(action: TerminalAction) {
+    setValue("action", action);
+    let ok = false;
+    if (action === "preflight") {
+      const receiverCheck = `cd ${sh(form.remote_repo)} && hostname; pwd; git branch --show-current; git log -1 --oneline; ip -br -4 addr; ssh -vvv ${sh(`${form.dpu_user}@${form.dpu_ip}`)} 'hostname; whoami; ip -br -4 addr || true'`;
+      const senderCheck = `cd ${sh(form.remote_repo)} && hostname; pwd; git branch --show-current; git log -1 --oneline; ip -br -4 addr show tmfifo_net0 || true; ssh -vvv ${sh(`${form.dpu_user}@${form.dpu_ip}`)} 'hostname; whoami; ip -br -4 addr || true'`;
+      ok = sendToReceiver(receiverCheck) && sendToSender(senderCheck);
+      setOperatorMessage(ok ? "Preflight commands sent to both terminals." : "Open both terminal sessions before running preflight.");
+      return;
+    }
+    if (action === "diagnose") {
+      ok = sendToReceiver(`cd ${sh(form.remote_repo)} && bash scripts/diagnose_crosslink.sh`);
+      setOperatorMessage(ok ? "Crosslink diagnose sent to the receiver terminal." : "Open the receiver terminal first.");
+      return;
+    }
+    if (action === "datapath") {
+      ok = sendToReceiver(`cd ${sh(form.remote_repo)} && bash scripts/diagnose_datapath.sh`);
+      setOperatorMessage(ok ? "Datapath diagnose sent to the receiver terminal." : "Open the receiver terminal first.");
+      return;
+    }
+    if (action === "live_sender") {
+      ok = sendToSender(liveSenderCommand(form));
+      setOperatorMessage(ok ? "Live crypto sender command sent to the sender terminal." : "Open and connect the sender terminal first.");
+      return;
+    }
+    if (action === "benchmark") {
+      ok = sendToReceiver(benchmarkCommand(form));
+      setOperatorMessage(ok ? "Benchmark sweep command sent to the receiver terminal. Sudo/password prompts will stay interactive there." : "Open the receiver terminal first.");
+      return;
+    }
+    if (action === "collect") {
+      const receiverOk = sendToReceiver(archiveCommand(form, "receiver", form.receiver_host));
+      const senderOk = sendToSender(archiveCommand(form, "sender", form.sender_host));
+      setOperatorMessage(receiverOk && senderOk ? "Remote archive commands sent. This does not copy files to the Mac; use Pull Remote Results below for SCP copy-back." : "Open both terminals before preparing result archives.");
+    }
+  }
+
+  function runCleanup() {
+    const receiverOk = sendToReceiver(cleanupCommand(form));
+    const senderOk = sendToSender(cleanupCommand(form));
+    setOperatorMessage(receiverOk || senderOk ? "Cleanup commands sent. Use this before Benchmark Sweep if relay port 6005 is already busy." : "Open at least one terminal before cleanup.");
+  }
+
+  function setTierPreset(tiers: string) {
+    setValue("tiers", tiers);
+    setOperatorMessage(`Benchmark tiers set to ${tiers}.`);
+  }
+
+  const status = health.data?.ok ? "ready" : "backend";
+  const statusDot = health.data?.ok ? "completed" : "failed";
   const newest = artifacts.data?.artifacts?.[0];
   const backendProblem = health.error instanceof Error ? health.error.message : null;
 
@@ -397,13 +560,14 @@ export function DpuDemo() {
           <h1>Connect, run, and collect data from lxcpu1 and lxcpu2.</h1>
         </div>
         <div className="console-status">
-          <span className={`status-dot status-dot--${status}`} />
+          <span className={`status-dot status-dot--${statusDot}`} />
           <span>{status}</span>
         </div>
       </section>
 
       <div className="terminal-grid">
         <TerminalPane
+          ref={receiverRef}
           role="receiver"
           title="lxcpu1 receiver"
           host={form.receiver_host}
@@ -417,9 +581,13 @@ export function DpuDemo() {
           harnessIp={form.harness_ip}
           fillsimIp={form.fillsim_ip}
           dpuRelayPath={form.dpu_relay_path}
-          onConnected={(password) => setSenderBootstrap((prev) => ({ token: prev.token + 1, password }))}
+          onConnected={(password) => {
+            setSenderBootstrap((prev) => ({ token: prev.token + 1, password }));
+            if (password) setValue("ssh_password", password);
+          }}
         />
         <TerminalPane
+          ref={senderRef}
           role="sender"
           title="lxcpu2 sender"
           host={form.sender_host}
@@ -443,16 +611,16 @@ export function DpuDemo() {
         <section className="glass-panel operator-panel">
           <div className="panel-heading">
             <div>
-              <h2>Operator Controls</h2>
-              <p>Use these buttons in order during the demo.</p>
+              <h2>Terminal Controls</h2>
+              <p>Buttons below send commands into the live terminals above.</p>
             </div>
             <PlugZap size={20} />
           </div>
 
           <div className="operator-status">
-            <span className={`status-dot status-dot--${status}`} />
+            <span className={`status-dot status-dot--${statusDot}`} />
             <strong>{status}</strong>
-            <span>{job?.kind ?? "ready for remote server connection"}</span>
+            <span>{operatorMessage}</span>
           </div>
 
           <div className={health.data?.ok ? "backend-status backend-status--ok" : "backend-status backend-status--bad"}>
@@ -470,7 +638,6 @@ export function DpuDemo() {
                   type="button"
                   className={item.id === "benchmark" ? "operator-action operator-action--primary" : "operator-action"}
                   onClick={() => runAction(item.id)}
-                  disabled={running}
                 >
                   <Icon size={20} />
                   <span>{item.label}</span>
@@ -480,21 +647,25 @@ export function DpuDemo() {
             })}
           </div>
 
+          <button type="button" className="secondary-button operator-refresh" onClick={runCleanup}>
+            <SquareTerminal size={17} />
+            Stop Sender/Relay
+          </button>
+
           <button type="button" className="secondary-button operator-refresh" onClick={() => artifacts.refetch()}>
             <RefreshCw size={17} />
             Refresh Downloaded Data
           </button>
 
-          {start.error ? <div className="operator-error">{start.error.message}</div> : null}
           {backendProblem ? <div className="operator-error">{backendProblem}</div> : null}
-          <div className="operator-hint">If a job is running, controls stay visible but disabled until it finishes or is stopped from the console.</div>
+          <div className="operator-hint">Use the Ctrl+C button on a terminal to stop a running script without closing the SSH session.</div>
         </section>
 
         <section className="glass-panel control-panel">
           <div className="panel-heading">
             <div>
               <h2>Connection</h2>
-              <p>These values are sent to the local backend, which then SSHes into the HKUST servers.</p>
+              <p>These values are used to build commands for the live receiver and sender terminals.</p>
             </div>
             <Cable size={20} />
           </div>
@@ -564,6 +735,13 @@ export function DpuDemo() {
               <span>Tiers</span>
               <input value={form.tiers} onChange={(event) => setValue("tiers", event.target.value)} />
             </label>
+            <div className="form-grid__wide tier-preset-row">
+              {["1", "2", "3", "4", "1,2,3,4"].map((tiers) => (
+                <button key={tiers} type="button" className={form.tiers === tiers ? "toggle is-on" : "toggle"} onClick={() => setTierPreset(tiers)}>
+                  {tiers === "1,2,3,4" ? "T1-T4" : `T${tiers}`}
+                </button>
+              ))}
+            </div>
             <label>
               <span>Rates</span>
               <input value={form.rates} onChange={(event) => setValue("rates", event.target.value)} />
@@ -603,10 +781,14 @@ export function DpuDemo() {
           <div className="panel-heading">
             <div>
               <h2>Received Data</h2>
-              <p>{newest ? newest.name : "Benchmark CSV files will appear here after copy-back."}</p>
+              <p>{newest ? newest.name : "Benchmark CSV files will appear here after local copy-back."}</p>
             </div>
             <Download size={20} />
           </div>
+          <button type="button" className="primary-button download-action" onClick={() => copyResults.mutate()} disabled={copyResults.isPending || Boolean(copyJob && ["queued", "running"].includes(copyJob.status))}>
+            <Download size={17} />
+            Pull Remote Results
+          </button>
           {newest ? (
             <a className="download-card" href={api.artifactUrl(newest.url)} download>
               <Download size={22} />
@@ -617,9 +799,17 @@ export function DpuDemo() {
             <div className="download-card download-card--empty">
               <Download size={22} />
               <strong>No copied data yet</strong>
-              <span>Run Benchmark after the connection test passes.</span>
+              <span>Use Pull Remote Results to SCP receiver/sender artifacts into results/remote_dpu/.</span>
             </div>
           )}
+          {copyJob ? (
+            <div className="copyback-status">
+              <strong>Copy-back {copyJob.status}</strong>
+              <span>{copyJob.run_dir ?? copyJob.id}</span>
+              <pre>{copyJob.lines.slice(-10).join("\n")}</pre>
+            </div>
+          ) : null}
+          {copyResults.error ? <div className="operator-error">{copyResults.error.message}</div> : null}
           <div className="artifact-list">
             {(artifacts.data?.artifacts ?? []).slice(0, 6).map((item) => (
               <a key={item.path} href={api.artifactUrl(item.url)} download>
@@ -631,75 +821,6 @@ export function DpuDemo() {
         </section>
       </div>
 
-      <div className="dashboard-grid">
-        <section className="glass-panel dpu-topology">
-          <div className="panel-heading">
-            <div>
-              <h2>Topology</h2>
-              <p>{health.data?.python_packages?.pexpect ? "Password prompt support is installed." : "Password prompt support needs pexpect."}</p>
-            </div>
-            <Router size={20} />
-          </div>
-          <div className="topology-stack">
-            <div>
-              <Server size={19} />
-              <strong>lxcpu1 receiver</strong>
-              <span>{form.receiver_host}</span>
-            </div>
-            <div>
-              <Router size={19} />
-              <strong>BlueField ARM</strong>
-              <span>{form.dpu_user}@{form.dpu_ip}</span>
-            </div>
-            <div>
-              <Server size={19} />
-              <strong>lxcpu2 sender</strong>
-              <span>{form.sender_host}</span>
-            </div>
-          </div>
-          <div className="status-list status-list--single">
-            <div>
-              <span className={`status-dot status-dot--${health.data?.tools.ssh ? "completed" : "failed"}`} />
-              <span>ssh</span>
-            </div>
-            <div>
-              <span className={`status-dot status-dot--${health.data?.tools.scp ? "completed" : "failed"}`} />
-              <span>scp</span>
-            </div>
-            <div>
-              <span className={`status-dot status-dot--${health.data?.python_packages?.pexpect ? "completed" : "failed"}`} />
-              <span>pexpect</span>
-            </div>
-          </div>
-          <div className="credential-note">
-            <KeyRound size={17} />
-            <span>Password values are sent only to the local API runner and are not printed in the job command.</span>
-          </div>
-        </section>
-
-        <section className="glass-panel dpu-topology">
-          <div className="panel-heading">
-            <div>
-              <h2>Run Parameters</h2>
-              <p>The benchmark action runs the receiver-host script and copies the newest CSV back locally.</p>
-            </div>
-            <ShieldCheck size={20} />
-          </div>
-          <div className="run-param-grid">
-            <div><span>Tiers</span><strong>{form.tiers}</strong></div>
-            <div><span>Rates</span><strong>{form.rates}</strong></div>
-            <div><span>Duration</span><strong>{form.duration_sec}s</strong></div>
-            <div><span>Warmup</span><strong>{form.warmup_sec}s</strong></div>
-            <div><span>Receiver iface</span><strong>{form.receiver_iface}</strong></div>
-            <div><span>Crypto symbols</span><strong>{form.live_symbols}</strong></div>
-            <div><span>Relay port</span><strong>{form.relay_port}</strong></div>
-            <div><span>Sender DPU iface</span><strong>{form.sender_dpu_iface}</strong></div>
-            <div><span>Remote repo</span><strong>{form.remote_repo}</strong></div>
-          </div>
-        </section>
-      </div>
-
-      <CommandConsole job={job} onJobUpdate={updateJob} onStop={() => job?.id && stopJob.mutate(job.id)} />
     </div>
   );
 }

@@ -108,11 +108,11 @@ export function Overview() {
       </div>
 
       <section className="glass-panel tier-strip">
-        {[1, 2, 3, 4, 5].map((tier) => (
+        {[1, 2, 3, 4].map((tier) => (
           <div className="tier-strip__item" key={tier}>
             <Zap size={18} />
             <strong>{tierName(tier)}</strong>
-            <span>{tier === 1 ? "CPU copies" : tier === 4 ? "Zero-copy GPUNetIO" : tier === 5 ? "DPU sourced" : "Advanced path"}</span>
+            <span>{tier === 1 ? "CPU copies" : tier === 2 ? "DPDK bypass" : tier === 3 ? "RDMA landing" : "Zero-copy GPUNetIO"}</span>
           </div>
         ))}
       </section>

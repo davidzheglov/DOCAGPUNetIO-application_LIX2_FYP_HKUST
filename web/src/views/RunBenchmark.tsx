@@ -65,7 +65,7 @@ export function RunBenchmark() {
           <div className="panel-heading">
             <div>
               <h2>Run Configuration</h2>
-              <p>Tiers 1, 4, and 5 are wired through the single-run benchmark driver.</p>
+              <p>Tiers 1 through 4 are the supported benchmark paths in this branch.</p>
             </div>
             <Settings size={20} />
           </div>
@@ -75,8 +75,9 @@ export function RunBenchmark() {
               <span>Tier</span>
               <select value={form.tier} onChange={(event) => setValue("tier", Number(event.target.value))}>
                 <option value={1}>T1 CPU naive</option>
+                <option value={2}>T2 DPDK</option>
+                <option value={3}>T3 RDMA</option>
                 <option value={4}>T4 GPUNetIO</option>
-                <option value={5}>T5 GPUNetIO + DPU</option>
               </select>
             </label>
             <label>
@@ -153,7 +154,7 @@ export function RunBenchmark() {
             ))}
           </div>
           <div className="build-buttons">
-            {["core", "t1", "t4", "data_source_live"].map((target) => (
+            {["core", "t1", "t2", "t3", "t4", "data_source_live"].map((target) => (
               <button key={target} className="secondary-button" onClick={() => build.mutate(target)}>
                 <Wrench size={16} />
                 make {target}
