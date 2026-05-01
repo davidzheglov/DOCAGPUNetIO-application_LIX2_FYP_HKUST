@@ -529,6 +529,13 @@ static uint64_t cyc_delta_to_ns(uint64_t delta_cyc, double ns_per_cyc)
     return (uint64_t)((double)delta_cyc * ns_per_cyc);
 }
 
+static uint64_t host_wall_now_ns()
+{
+    auto now = std::chrono::system_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now.time_since_epoch()).count();
+}
+
 static void cpu_forward_thread(ForwardCtx *ctx)
 {
     uint64_t fwd_count = 0;
@@ -595,10 +602,12 @@ static void cpu_forward_thread(ForwardCtx *ctx)
                                            ctx->gpu_cyc_anchor,
                                            ctx->host_wall_anchor_ns,
                                            ctx->ns_per_cyc);
-                br.t4_ns  = cyc_to_wall_ns(br.t4_ns,
-                                           ctx->gpu_cyc_anchor,
-                                           ctx->host_wall_anchor_ns,
-                                           ctx->ns_per_cyc);
+                /* For apples-to-apples benchmark staging, T4's published t4
+                 * is when the CPU forwarding path has a host-visible result,
+                 * matching T1-T3's post-readback host timestamp semantics.
+                 * The GPU ring-write timestamp is intentionally not exported
+                 * as t4 because it excludes the result visibility/export cost. */
+                br.t4_ns = host_wall_now_ns();
                 br.compute_ns = cyc_delta_to_ns(br.compute_ns, ctx->ns_per_cyc);
                 sig.t3_ns = br.t3_ns;
                 sig.t4_ns = br.t4_ns;
