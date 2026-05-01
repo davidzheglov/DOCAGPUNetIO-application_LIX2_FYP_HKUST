@@ -61,6 +61,31 @@ static const int DEFAULT_REPS     = 3;
  * Without this cap, a socket that is continuously readable can trap the
  * harness inside recv() draining loops long past the warmup/measurement end. */
 static const int MAX_SOCKET_DRAIN_PER_TICK = 8192;
+static const int MAX_POST_RUN_DRAIN_ROUNDS = 128;
+
+static void drain_stale_results(int result_fd, int signal_fd)
+{
+    BenchmarkResult br{};
+    SignalResult sr{};
+
+    for (int round = 0; round < MAX_POST_RUN_DRAIN_ROUNDS; ++round) {
+        bool drained_any = false;
+        for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK; ++i) {
+            if (recv(result_fd, &br, sizeof(br), MSG_DONTWAIT) != sizeof(br)) break;
+            drained_any = true;
+        }
+        for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK; ++i) {
+            if (recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT) != sizeof(sr)) break;
+            drained_any = true;
+        }
+        if (!drained_any) return;
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "[harness] warning: result sockets still had backlog after post-run drain; "
+            "continuing with bounded cleanup\n");
+}
 
 /* ── Percentile helper ───────────────────────────────────────────────────── */
 static double percentile(std::vector<double> &v, double p)
@@ -901,6 +926,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
     kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
     usleep(100000);
+    drain_stale_results(result_fd, signal_fd);
 
     uint64_t sent_ticks_end = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
