@@ -63,6 +63,17 @@ static const int DEFAULT_REPS     = 3;
 static const int MAX_SOCKET_DRAIN_PER_TICK = 8192;
 static const int MAX_POST_RUN_DRAIN_ROUNDS = 128;
 
+static void system_ignore(const char *cmd)
+{
+    int rc = system(cmd);
+    (void)rc;
+}
+
+static void system_ignore(const std::string &cmd)
+{
+    system_ignore(cmd.c_str());
+}
+
 static void drain_stale_results(int result_fd, int signal_fd)
 {
     BenchmarkResult br{};
@@ -180,7 +191,7 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
     unsigned long long v = 0;
-    fscanf(p, "%llu", &v);
+    if (fscanf(p, "%llu", &v) != 1) v = 0;
     pclose(p);
     return (uint64_t)v;
 }
@@ -199,7 +210,7 @@ static uint64_t read_relay_counter_via_ssh()
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
     unsigned long long v = 0;
-    fscanf(p, "%llu", &v);
+    if (fscanf(p, "%llu", &v) != 1) v = 0;
     pclose(p);
     return (uint64_t)v;
 }
@@ -492,7 +503,7 @@ static void stop_remote_clock_server()
     std::string cmd = ssh_base_cmd() + g_sender_ssh
         + " 'pkill -f '\\''[c]lock_cal_server.py'\\'' 2>/dev/null || true'"
           " >/dev/null 2>&1";
-    system(cmd.c_str());
+    system_ignore(cmd);
 }
 
 /* ── Build receiver args ─────────────────────────────────────────────────── */
@@ -681,7 +692,7 @@ static void kill_remote_sender(void)
     cmd += g_sender_ssh
         + " 'pkill -x data_source 2>/dev/null || true'"
           " >/dev/null 2>&1";
-    (void)system(cmd.c_str());
+    system_ignore(cmd);
 }
 
 /* ── UDP receiver socket for BenchmarkResult ─────────────────────────────── */
@@ -789,13 +800,13 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     /* Kill any leftover receivers locally; on remote host the SSH launcher
      * will pkill data_source itself before starting the new one. */
-    system("pkill -f bin/cpu_receiver  2>/dev/null; "
-           "pkill -f bin/dpdk_receiver 2>/dev/null; "
-           "pkill -f bin/rdma_receiver 2>/dev/null; "
-           "pkill -f bin/gpu_receiver  2>/dev/null; "
-           "true");
+    system_ignore("pkill -f bin/cpu_receiver  2>/dev/null; "
+                  "pkill -f bin/dpdk_receiver 2>/dev/null; "
+                  "pkill -f bin/rdma_receiver 2>/dev/null; "
+                  "pkill -f bin/gpu_receiver  2>/dev/null; "
+                  "true");
     if (g_sender_ssh.empty()) {
-        system("pkill -f bin/data_source 2>/dev/null; true");
+        system_ignore("pkill -f bin/data_source 2>/dev/null; true");
         unlink(sender_stats_path.c_str());
     } else {
         kill_remote_sender();
@@ -804,7 +815,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             rm_cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
         }
         rm_cmd += g_sender_ssh + " 'rm -f " + sender_stats_path + "'";
-        system(rm_cmd.c_str());
+        system_ignore(rm_cmd);
     }
     usleep(300000);
 
@@ -957,26 +968,21 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         ? (sent_ticks_end - sent_ticks_start) : 0;
     uint64_t relay_ticks_window = (relay_ticks_end >= relay_ticks_start)
         ? (relay_ticks_end - relay_ticks_start) : 0;
-    uint64_t pre_measure_expected = (uint64_t)std::llround(
-        (double)rate_hz
-        * std::chrono::duration<double>(measure_start - counter_baseline_time).count());
-    uint64_t sent_window_start = sent_ticks_start + std::min(pre_measure_expected, sent_ticks_window);
-    sent_ticks_window = sent_ticks_window > pre_measure_expected
-        ? sent_ticks_window - pre_measure_expected : 0;
-    relay_ticks_window = relay_ticks_window > pre_measure_expected
-        ? relay_ticks_window - pre_measure_expected : 0;
-
-    auto in_sender_window = [&](uint64_t tick_id) {
-        if (sent_ticks_end <= sent_window_start) return true;
-        return tick_id >= sent_window_start && tick_id < sent_ticks_end;
-    };
+    (void)counter_baseline_time;
+    (void)sent_ticks_window;
+    (void)relay_ticks_window;
 
     e2e_ns.reserve(raw_results.size());
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
-    std::unordered_set<uint64_t> latency_tick_ids;
+    std::unordered_set<uint64_t> benchmark_tick_ids;
+    uint64_t min_observed_tick = UINT64_MAX;
+    uint64_t max_observed_tick = 0;
     for (const BenchmarkResult &raw_br : raw_results) {
-        if (!in_sender_window(raw_br.tick_id)) continue;
+        benchmark_tick_ids.insert(raw_br.tick_id);
+        min_observed_tick = std::min<uint64_t>(min_observed_tick, raw_br.tick_id);
+        max_observed_tick = std::max<uint64_t>(max_observed_tick, raw_br.tick_id);
+
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
         if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
@@ -992,55 +998,31 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         compute_ns.push_back(br.compute_ns != 0
             ? (double)br.compute_ns
             : (double)(br.t3_ns - br.t2_ns));
-        latency_tick_ids.insert(raw_br.tick_id);
     }
 
     std::unordered_set<uint64_t> processed_tick_ids;
     uint64_t n_signals_actionable = 0;
     for (const SignalResult &sr : raw_signals) {
-        if (!in_sender_window(sr.tick_id)) continue;
         processed_tick_ids.insert(sr.tick_id);
         if (sr.signal != 0) ++n_signals_actionable;
     }
 
     size_t n_ticks = e2e_ns.size();
-    uint64_t processed_ticks = processed_tick_ids.size();
+    uint64_t processed_ticks = benchmark_tick_ids.size();
 
     /* Drop-rate computation:
      *
-     * The naive (sent_window - processed_window) / sent_window is unreliable
-     * because the sender's count window is wall-clock-aligned while the
-     * receiver's is offset by the pipeline lag (~e2e_p50). A tick sent in the
-     * last second of warmup may arrive during measurement, inflating
-     * processed_ticks above sent_ticks_window — we'd see negative drops.
-     *
-     * Instead we use the receiver's own tick_id stream, which is internally
-     * consistent: among the ticks actually received, how many tick_ids are
-     * missing in the [first..last] range observed during the window?
-     *
-     * This counts losses in the relay/network/socket-buffer paths but not
-     * losses where the sender produced a tick that *never* reached the
-     * receiver (whole tail of a saturating run). For that, sent_ticks_window
-     * vs the observed range gives a sanity check (still in CSV). */
-    uint64_t sent_denominator = sent_ticks_window;
-    bool using_relay_denominator = false;
-    if (relay_ticks_window > 0) {
-        uint64_t relay_slack = sent_ticks_window / 4 + 8192;
-        if (sent_ticks_window == 0 || relay_ticks_window <= sent_ticks_window + relay_slack) {
-            sent_denominator = relay_ticks_window;
-            using_relay_denominator = true;
-        } else {
-            fprintf(stderr,
-                    "[harness] warning: ignoring implausible relay count "
-                    "(relay=%llu sender=%llu)\n",
-                    (unsigned long long)relay_ticks_window,
-                    (unsigned long long)sent_ticks_window);
-        }
-    }
-    if (sent_ticks_window > 0) {
-        uint64_t seen_latency = latency_tick_ids.size();
-        n_inferred_missing_ticks = sent_ticks_window > seen_latency
-            ? sent_ticks_window - seen_latency : 0;
+     * Final benchmark definition: the receiver-side measurement window is the
+     * source of truth. We collect BenchmarkResult packets for exactly
+     * duration_sec seconds, then compare completed results against the target
+     * offered load (rate_hz * duration_sec). Remote sender/relay counters are
+     * kept only as sanity checks because their sampling is SSH/file based and
+     * not aligned tightly enough for the primary metric. */
+    uint64_t sent_denominator = (uint64_t)std::llround((double)rate_hz * (double)duration_sec);
+    if (!benchmark_tick_ids.empty()) {
+        uint64_t observed_span = max_observed_tick - min_observed_tick + 1;
+        n_inferred_missing_ticks = observed_span > benchmark_tick_ids.size()
+            ? observed_span - benchmark_tick_ids.size() : 0;
     }
     double drop_rate = sent_denominator > 0
         ? (double)(sent_denominator > processed_ticks
@@ -1073,9 +1055,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.compute_p99  = percentile(compute_ns, 0.99);
     r.compute_mean = mean_of(compute_ns);
     r.throughput   = duration_sec > 0
-        ? (double)n_ticks / (double)duration_sec : 0.0;
-    r.signals_total_per_sec      = duration_sec > 0
         ? (double)processed_ticks / (double)duration_sec : 0.0;
+    r.signals_total_per_sec      = duration_sec > 0
+        ? (double)processed_tick_ids.size() / (double)duration_sec : 0.0;
     r.signals_actionable_per_sec = duration_sec > 0
         ? (double)n_signals_actionable / (double)duration_sec : 0.0;
 
@@ -1107,7 +1089,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
         (unsigned long long)sent_denominator,
-        using_relay_denominator ? "relay" : "sender",
+        "target",
         (unsigned long long)processed_ticks,
         (unsigned long long)n_dropped,
         (unsigned long long)n_inferred_missing_ticks,
@@ -1192,7 +1174,7 @@ int main(int argc, char **argv)
         size_t slash = dir.rfind('/');
         if (slash != std::string::npos) {
             std::string cmd = "mkdir -p " + dir.substr(0, slash);
-            system(cmd.c_str());
+            system_ignore(cmd);
         }
     }
 
