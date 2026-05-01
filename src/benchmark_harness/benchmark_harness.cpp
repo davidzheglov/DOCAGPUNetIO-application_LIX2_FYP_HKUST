@@ -146,11 +146,11 @@ static uint64_t read_counter_from_file(const std::string &path)
 
 static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
 {
-    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    std::string cmd = "timeout 2s ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
-    cmd += g_sender_ssh + " 'cat " + remote_path + " 2>/dev/null || echo 0'";
+    cmd += g_sender_ssh + " 'cat " + remote_path + " 2>/dev/null || echo 0' 2>/dev/null";
 
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
@@ -163,13 +163,13 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
 static uint64_t read_relay_counter_via_ssh()
 {
     if (g_sender_ssh.empty() || g_relay_stats_path.empty()) return 0;
-    std::string cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 ";
+    std::string cmd = "timeout 2s ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 ";
     if (!g_sender_control_path.empty()) {
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
-    cmd += g_sender_ssh + " \"ssh -o BatchMode=yes -o ConnectTimeout=3 "
+    cmd += g_sender_ssh + " \"ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 "
         + g_dpu_user + "@" + g_dpu_ip + " 'cat " + g_relay_stats_path
-        + " 2>/dev/null || echo 0'\"";
+        + " 2>/dev/null || echo 0'\" 2>/dev/null";
 
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
@@ -783,6 +783,15 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
     usleep(300000);
 
+    /* Remote SSH bookkeeping can stall if the DPU ARM is busy. Do it before
+     * the timed receiver window so warmup/measurement remain wall-clock bound. */
+    ClockSample cal_start = sample_clock_pair();
+    uint64_t sent_ticks_start = g_sender_ssh.empty()
+        ? read_counter_from_file(sender_stats_path)
+        : read_remote_counter_via_ssh(sender_stats_path);
+    uint64_t relay_ticks_start = read_relay_counter_via_ssh();
+    auto counter_baseline_time = Clock::now();
+
     /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
     pid_t ds_pid = -1;
     if (!g_sender_ssh.empty()) {
@@ -846,12 +855,8 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t n_rejected_invalid_order = 0;
     uint64_t n_rejected_too_old = 0;
     std::vector<SignalResult> raw_signals;
-    ClockSample cal_start = sample_clock_pair();
-    uint64_t sent_ticks_start = g_sender_ssh.empty()
-        ? read_counter_from_file(sender_stats_path)
-        : read_remote_counter_via_ssh(sender_stats_path);
-    uint64_t relay_ticks_start = read_relay_counter_via_ssh();
-    auto measure_end = Clock::now() + Sec(duration_sec);
+    auto measure_start = Clock::now();
+    auto measure_end = measure_start + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
 
     pollfd pfds[2];
@@ -916,10 +921,18 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         ? (sent_ticks_end - sent_ticks_start) : 0;
     uint64_t relay_ticks_window = (relay_ticks_end >= relay_ticks_start)
         ? (relay_ticks_end - relay_ticks_start) : 0;
+    uint64_t pre_measure_expected = (uint64_t)std::llround(
+        (double)rate_hz
+        * std::chrono::duration<double>(measure_start - counter_baseline_time).count());
+    uint64_t sent_window_start = sent_ticks_start + std::min(pre_measure_expected, sent_ticks_window);
+    sent_ticks_window = sent_ticks_window > pre_measure_expected
+        ? sent_ticks_window - pre_measure_expected : 0;
+    relay_ticks_window = relay_ticks_window > pre_measure_expected
+        ? relay_ticks_window - pre_measure_expected : 0;
 
     auto in_sender_window = [&](uint64_t tick_id) {
-        if (sent_ticks_end <= sent_ticks_start) return true;
-        return tick_id >= sent_ticks_start && tick_id < sent_ticks_end;
+        if (sent_ticks_end <= sent_window_start) return true;
+        return tick_id >= sent_window_start && tick_id < sent_ticks_end;
     };
 
     e2e_ns.reserve(raw_results.size());

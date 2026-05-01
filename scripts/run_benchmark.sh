@@ -211,17 +211,26 @@ if [[ -n "$SENDER_SSH" ]]; then
 
     if [[ "$CLOCK_CAL_HOST" == "$SENDER_HOST" || "$CLOCK_CAL_HOST" == "lxcpu2.cse.ust.hk" ]]; then
         log "Opening persistent SSH tunnel for clock calibration..."
-        ssh "${SSH_OPTS[@]}" -N \
+        if (echo >"/dev/tcp/127.0.0.1/${CLOCK_CAL_PORT}") >/dev/null 2>&1; then
+            log_ok "Existing local service/tunnel is reachable at 127.0.0.1:${CLOCK_CAL_PORT}"
+            CLOCK_CAL_HOST="127.0.0.1"
+        else
+            ssh "${SSH_OPTS[@]}" -N \
             -L "127.0.0.1:${CLOCK_CAL_PORT}:127.0.0.1:${CLOCK_CAL_PORT}" \
             "$SENDER_SSH" &
-        CLOCK_TUNNEL_PID=$!
-        sleep 0.5
-        if ! kill -0 "$CLOCK_TUNNEL_PID" 2>/dev/null; then
-            log_err "clock calibration SSH tunnel failed to start"
-            exit 1
+            CLOCK_TUNNEL_PID=$!
+            sleep 0.5
+            if ! kill -0 "$CLOCK_TUNNEL_PID" 2>/dev/null; then
+                log_err "clock calibration SSH tunnel failed to start"
+                exit 1
+            fi
+            if ! (echo >"/dev/tcp/127.0.0.1/${CLOCK_CAL_PORT}") >/dev/null 2>&1; then
+                log_err "clock calibration tunnel started but local port is not reachable"
+                exit 1
+            fi
+            CLOCK_CAL_HOST="127.0.0.1"
+            log_ok "Clock calibration tunnel ready at ${CLOCK_CAL_HOST}:${CLOCK_CAL_PORT}"
         fi
-        CLOCK_CAL_HOST="127.0.0.1"
-        log_ok "Clock calibration tunnel ready at ${CLOCK_CAL_HOST}:${CLOCK_CAL_PORT}"
     fi
 
     log "Verifying SSH from $SENDER_SSH → $DPU_USER@$DPU_IP (DPU relay path)..."
