@@ -164,6 +164,36 @@ static void drain_run_accounting_after_stop(int result_fd, int signal_fd,
             "continuing with bounded cleanup\n");
 }
 
+static void drain_run_accounting_until_quiet(int result_fd, int signal_fd,
+                                             std::unordered_set<uint64_t> &result_tick_ids,
+                                             std::unordered_set<uint64_t> &signal_tick_ids,
+                                             uint64_t &n_dropped,
+                                             uint64_t &n_signals_actionable,
+                                             int max_ms)
+{
+    auto deadline = Clock::now() + std::chrono::milliseconds(max_ms);
+    int idle_rounds = 0;
+
+    while (Clock::now() < deadline && idle_rounds < 50) {
+        size_t before = result_tick_ids.size() + signal_tick_ids.size();
+        uint64_t dropped_before = n_dropped;
+        uint64_t signals_before = n_signals_actionable;
+
+        drain_run_accounting(result_fd, signal_fd,
+                              result_tick_ids, signal_tick_ids,
+                              n_dropped, n_signals_actionable, deadline);
+
+        size_t after = result_tick_ids.size() + signal_tick_ids.size();
+        if (after == before && dropped_before == n_dropped &&
+            signals_before == n_signals_actionable) {
+            ++idle_rounds;
+            usleep(1000);
+        } else {
+            idle_rounds = 0;
+        }
+    }
+}
+
 /* ── Percentile helper ───────────────────────────────────────────────────── */
 static double percentile(std::vector<double> &v, double p)
 {
@@ -253,25 +283,6 @@ static uint64_t read_remote_counter_via_ssh(const std::string &remote_path)
         cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
     }
     cmd += g_sender_ssh + " 'cat " + remote_path + " 2>/dev/null || echo 0' 2>/dev/null";
-
-    FILE *p = popen(cmd.c_str(), "r");
-    if (!p) return 0;
-    unsigned long long v = 0;
-    if (fscanf(p, "%llu", &v) != 1) v = 0;
-    pclose(p);
-    return (uint64_t)v;
-}
-
-static uint64_t read_relay_counter_via_ssh()
-{
-    if (g_sender_ssh.empty() || g_relay_stats_path.empty()) return 0;
-    std::string cmd = "timeout 2s ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 ";
-    if (!g_sender_control_path.empty()) {
-        cmd += "-o ControlMaster=no -o ControlPath=" + g_sender_control_path + " ";
-    }
-    cmd += g_sender_ssh + " \"ssh -o BatchMode=yes -o ConnectTimeout=1 -o ConnectionAttempts=1 "
-        + g_dpu_user + "@" + g_dpu_ip + " 'cat " + g_relay_stats_path
-        + " 2>/dev/null || echo 0'\" 2>/dev/null";
 
     FILE *p = popen(cmd.c_str(), "r");
     if (!p) return 0;
@@ -1001,13 +1012,23 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         }
     }
 
-    /* Stop traffic as soon as the measurement deadline passes. All slower
-     * bookkeeping below must happen after the receiver is no longer running,
-     * otherwise the log makes the measurement window look longer than it is. */
-    kill_proc(rx_pid);
+    /* Stop traffic as soon as the measurement deadline passes. Stop the
+     * sender first, then keep draining result sockets while the receiver
+     * flushes in-flight work. If we kill the receiver first, T4 can dump a
+     * large CPU-FWD backlog while the harness is blocked in waitpid(), causing
+     * localhost UDP result loss that looks like pipeline drop. */
     if (!g_sender_ssh.empty()) {
         kill_remote_sender();   /* tells the remote machine to stop sending */
+    } else if (ds_pid > 0) {
+        kill(-ds_pid, SIGTERM);
+        kill(ds_pid, SIGTERM);
     }
+
+    drain_run_accounting_until_quiet(result_fd, signal_fd,
+                                     full_run_result_tick_ids, full_run_signal_tick_ids,
+                                     n_dropped, n_signals_actionable, 2000);
+
+    kill_proc(rx_pid);
     kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
     usleep(100000);
     drain_run_accounting_after_stop(result_fd, signal_fd,
