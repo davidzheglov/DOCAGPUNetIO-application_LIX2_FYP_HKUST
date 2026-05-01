@@ -1131,6 +1131,22 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 (unsigned long long)sent_denominator);
     }
 
+    /* Soft-tolerance for the cross-host edge of the validity check:
+     * t1 is sender-stamped + offset-corrected, t2 is receiver-stamped on the
+     * local host. With a ~250-500 µs SSH-clock-sync RTT, the corrected t1
+     * can exceed the receiver t2 by tens-to-hundreds of µs on tiers whose
+     * ingest is small (e.g. T3 RDMA at 100 k Hz, where ingest_p50 ≈ 1 ms is
+     * comparable to the clock noise). That trips the strict `t2 >= t1`
+     * check and silently drops valid samples. We allow the *cross-host*
+     * inequality (t2 vs t1) to slip by up to half of the worst RTT
+     * observed in this run, which equals the cross-host noise floor the
+     * plots already shade. The two intra-host checks (t3 ≥ t2, t4 > t1)
+     * stay strict — those are receiver-clock only and have no excuse. */
+    uint64_t worst_rtt_ns = std::max(
+        cal_start.valid ? cal_start.rtt_ns : 0ULL,
+        cal_end.valid   ? cal_end.rtt_ns   : 0ULL);
+    int64_t cross_host_slack_ns = (int64_t)(worst_rtt_ns / 2);
+
     e2e_ns.reserve(raw_results.size());
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
@@ -1138,7 +1154,11 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         if (raw_br.tick_id >= sent_denominator) continue;
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
-        if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
+        bool t2_geq_t1_soft = ((int64_t)br.t2_ns + cross_host_slack_ns)
+                            >= (int64_t)br.t1_ns;
+        bool t3_geq_t2      = br.t3_ns >= br.t2_ns;
+        bool t4_gt_t1       = br.t4_ns > br.t1_ns;
+        if (!(t4_gt_t1 && t3_geq_t2 && t2_geq_t1_soft)) {
             ++n_rejected_invalid_order;
             continue;
         }
@@ -1146,8 +1166,13 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             ++n_rejected_too_old;
             continue;
         }
+        /* Clamp negative ingest (within the slack) to zero so percentile
+         * stats don't get pulled down by noise; e2e and compute use the
+         * raw differences since they're not affected by the slack. */
+        double ingest_diff = (double)((int64_t)br.t2_ns - (int64_t)br.t1_ns);
+        if (ingest_diff < 0.0) ingest_diff = 0.0;
         e2e_ns.push_back((double)(br.t4_ns - br.t1_ns));
-        ingest_ns.push_back((double)(br.t2_ns - br.t1_ns));
+        ingest_ns.push_back(ingest_diff);
         compute_ns.push_back(br.compute_ns != 0
             ? (double)br.compute_ns
             : (double)(br.t3_ns - br.t2_ns));

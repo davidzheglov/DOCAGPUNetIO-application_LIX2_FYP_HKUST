@@ -92,26 +92,55 @@ def cross_host_noise_floor_us(rows) -> float:
     return max(rtts) / 2.0
 
 
+METRIC_KEYS = ("drop", "e2e_p50", "e2e_p99",
+               "ingest_p50", "ingest_p99",
+               "compute_p50", "compute_p99",
+               "throughput", "sig_total", "sig_actionable")
+
+
 def aggregate(rows):
-    """Group by (tier, rate), median across reps."""
+    """Group by (tier, rate). Return median, min and max for each metric across
+    reps. Median preserves the existing behaviour; min/max are added so plots
+    can shade the run-to-run spread without changing any existing call site."""
     grouped = defaultdict(list)
     for r in rows:
         grouped[(r["tier"], r["rate"])].append(r)
     out = {}
     for key, runs in grouped.items():
-        out[key] = {
-            k: float(np.median([r[k] for r in runs]))
-            for k in ("drop", "e2e_p50", "e2e_p99",
-                     "ingest_p50", "ingest_p99",
-                     "compute_p50", "compute_p99",
-                     "throughput", "sig_total", "sig_actionable")
-        }
+        entry = {}
+        for k in METRIC_KEYS:
+            vals = [r[k] for r in runs]
+            entry[k] = float(np.median(vals))
+            entry[k + "_min"] = float(np.min(vals))
+            entry[k + "_max"] = float(np.max(vals))
+        entry["_n_reps"] = len(runs)
+        out[key] = entry
     return out
 
 
 def tier_series(agg, tier, key):
     rates = sorted(r for (t, r) in agg.keys() if t == tier)
     return rates, [agg[(tier, r)][key] for r in rates]
+
+
+def tier_band(agg, tier, key):
+    """Return (rates, lo, hi) for shading the min/max band across reps. lo and
+    hi collapse to the median when there's only one rep, so calling this is
+    safe even when --reps 1."""
+    rates = sorted(r for (t, r) in agg.keys() if t == tier)
+    lo = [agg[(tier, r)][key + "_min"] for r in rates]
+    hi = [agg[(tier, r)][key + "_max"] for r in rates]
+    return rates, lo, hi
+
+
+def _shade_band(ax, tier, agg, key, color, alpha=0.15):
+    """No-op when reps==1 or all values match (zero-area band)."""
+    rates, lo, hi = tier_band(agg, tier, key)
+    if not rates:
+        return
+    if all(abs(h - l) < 1e-9 for l, h in zip(lo, hi)):
+        return
+    ax.fill_between(rates, lo, hi, color=color, alpha=alpha, linewidth=0)
 
 
 # ─── Plot helpers ─────────────────────────────────────────────────────────────
@@ -141,12 +170,13 @@ def save(fig, outdir: Path, name: str):
 # ─── Plot functions ───────────────────────────────────────────────────────────
 
 def plot_compute_latency(agg, outdir):
-    """Per-tick GPU compute comparison."""
+    """Per-tick GPU compute comparison. Shaded band = min/max across reps."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "compute_p50")
         _,     p99 = tier_series(agg, tier, "compute_p99")
         c, m = TIER_COLOR[tier], TIER_MARKER[tier]
+        _shade_band(ax, tier, agg, "compute_p50", c)
         ax.plot(rates, p50, color=c, marker=m, linewidth=2,
                 label=f"{TIER_LABEL[tier]}  p50")
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
@@ -163,8 +193,14 @@ def plot_drop_curve(agg, outdir):
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, drop = tier_series(agg, tier, "drop")
+        c = TIER_COLOR[tier]
+        # Manual fill_between in percent — drop is fraction in agg.
+        rates_b, lo, hi = tier_band(agg, tier, "drop")
+        if rates_b and any(abs(h - l) > 1e-9 for l, h in zip(lo, hi)):
+            ax.fill_between(rates_b, [l * 100 for l in lo], [h * 100 for h in hi],
+                            color=c, alpha=0.15, linewidth=0)
         ax.plot(rates, [d * 100 for d in drop],
-                color=TIER_COLOR[tier], marker=TIER_MARKER[tier],
+                color=c, marker=TIER_MARKER[tier],
                 linewidth=2, label=TIER_LABEL[tier])
     setup_axes(ax, "Completion loss vs offered rate",
                "Offered tick rate (Hz)", "Unprocessed ticks / sent ticks (%)")
@@ -181,7 +217,9 @@ def plot_throughput(agg, outdir):
             linewidth=1, label="Ideal y=x")
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, tput = tier_series(agg, tier, "throughput")
-        ax.plot(rates, tput, color=TIER_COLOR[tier],
+        c = TIER_COLOR[tier]
+        _shade_band(ax, tier, agg, "throughput", c)
+        ax.plot(rates, tput, color=c,
                 marker=TIER_MARKER[tier], linewidth=2, label=TIER_LABEL[tier])
     setup_axes(ax, "Achieved tick throughput vs offered rate",
                "Offered tick rate (Hz)", "Achieved throughput (ticks/sec)",
@@ -198,6 +236,8 @@ def plot_signal_rate(agg, outdir):
         rates, sig_t = tier_series(agg, tier, "sig_total")
         _,     sig_a = tier_series(agg, tier, "sig_actionable")
         c, m = TIER_COLOR[tier], TIER_MARKER[tier]
+        _shade_band(axes[0], tier, agg, "sig_total",      c)
+        _shade_band(axes[1], tier, agg, "sig_actionable", c)
         axes[0].plot(rates, sig_t, color=c, marker=m, linewidth=2,
                      label=TIER_LABEL[tier])
         axes[1].plot(rates, sig_a, color=c, marker=m, linewidth=2,
@@ -273,12 +313,14 @@ def _shade_noise_floor(ax, floor_us: float):
 
 
 def plot_e2e_latency(agg, outdir, noise_floor_us: float = 0.0):
-    """Receiver-ingress-to-output latency, with cross-host noise floor band."""
+    """Receiver-ingress-to-output latency, with cross-host noise floor band
+    and a min/max band across reps for the p50 line."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for tier in sorted({t for (t, _) in agg.keys()}):
         rates, p50 = tier_series(agg, tier, "e2e_p50")
         _,     p99 = tier_series(agg, tier, "e2e_p99")
         c, m = TIER_COLOR[tier], TIER_MARKER[tier]
+        _shade_band(ax, tier, agg, "e2e_p50", c)
         ax.plot(rates, p50, color=c, marker=m, linewidth=2,
                 label=f"{TIER_LABEL[tier]}  p50")
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
