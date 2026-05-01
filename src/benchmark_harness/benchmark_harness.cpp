@@ -3,8 +3,8 @@
  *
  * Orchestrates 75 benchmark runs: 5 tiers × 5 rates × 3 repetitions.
  * For each run:
- *   1. Launch data_source (replay mode) at the target rate.
- *   2. Launch the tier-specific receiver binary.
+ *   1. Launch the tier-specific receiver binary.
+ *   2. Launch data_source (replay mode) at the target rate.
  *   3. Account for, but do not time, BenchmarkResult packets during warmup.
  *   4. Collect BenchmarkResult packets for the measurement window.
  *   5. Kill both subprocesses.
@@ -960,6 +960,17 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
      * tick_id for each run, so the final counter is the full-run denominator. */
     ClockSample cal_start = sample_clock_pair();
 
+    /* Launch receiver before the sender so warmup does not include traffic
+     * sent to a receiver that is not initialized yet. This keeps startup
+     * loss/queueing out of the measured sender tick window, especially for
+     * T1 where CUDA init and multicast join happen inside the receiver. */
+    std::vector<std::string> rx_args = receiver_args(tier);
+    pid_t rx_pid = launch_receiver(tier, receiver_binary(tier), rx_args);
+    if (rx_pid < 0) {
+        fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
+    }
+    usleep(800000);
+
     /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
     pid_t ds_pid = -1;
     if (!g_sender_ssh.empty()) {
@@ -979,17 +990,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         }
         ds_pid = launch("./bin/data_source", ds_args);
     }
-    if (ds_pid < 0) { fprintf(stderr, "Failed to launch data_source\n"); }
-
-    /* Brief pause for data_source to start (longer for remote — SSH + pkill) */
-    usleep(g_sender_ssh.empty() ? 200000 : 800000);
-
-    /* Launch receiver */
-    std::vector<std::string> rx_args = receiver_args(tier);
-    pid_t rx_pid = launch_receiver(tier, receiver_binary(tier), rx_args);
-    if (rx_pid < 0) {
-        kill_proc(ds_pid);
-        fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
+    if (ds_pid < 0) {
+        kill_proc(rx_pid);
+        fprintf(stderr, "Failed to launch data_source\n");
     }
 
     std::unordered_set<uint64_t> full_run_result_tick_ids;
