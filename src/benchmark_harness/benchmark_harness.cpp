@@ -305,6 +305,7 @@ static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-po
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
 static int         g_bench_work_iters = 0; /* opt-in synthetic compute load */
+static const int   MAX_BENCH_WORK_ITERS = 16384;
 static std::string g_dpu_user = "ubuntu";
 static std::string g_dpu_ip = "192.168.100.2";
 static std::string g_relay_stats_path;
@@ -1293,6 +1294,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--bench-work") && i+1<argc) {
             g_bench_work_iters = std::max(0, atoi(argv[++i]));
         }
+    }
+    if (g_bench_work_iters > MAX_BENCH_WORK_ITERS) {
+        fprintf(stderr,
+                "[harness] refusing --bench-work %d; max supported for fair "
+                "visual-only load is %d\n",
+                g_bench_work_iters, MAX_BENCH_WORK_ITERS);
+        return 2;
     }
 
     /* Parse tier list */

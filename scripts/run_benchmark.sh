@@ -42,6 +42,7 @@ REGEN_CSV=0
 QUICK=0
 LIGHT_BENCH=0
 BENCH_WORK=0
+MAX_BENCH_WORK="${MAX_BENCH_WORK:-16384}"
 IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for sender/DPU mcast egress)
 RECEIVER_IFACE_ARG=""  # forwarded as --receiver-iface to harness (T1 CPU receiver iface name)
 
@@ -98,6 +99,16 @@ while [[ $# -gt 0 ]]; do
         *)              echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+if [[ ! "$BENCH_WORK" =~ ^[0-9]+$ ]]; then
+    echo "Invalid --bench-work value: $BENCH_WORK (expected non-negative integer)" >&2
+    exit 1
+fi
+if (( BENCH_WORK > MAX_BENCH_WORK )); then
+    echo "Refusing --bench-work $BENCH_WORK: this would dominate/drop the benchmark." >&2
+    echo "Use <= $MAX_BENCH_WORK for visual-only synthetic load, or set MAX_BENCH_WORK to override deliberately." >&2
+    exit 1
+fi
 
 if [[ $QUICK -eq 1 ]]; then
     # All four tiers, two rates, single rep — covers the full receiver matrix

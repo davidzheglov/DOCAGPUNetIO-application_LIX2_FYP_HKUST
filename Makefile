@@ -16,7 +16,7 @@
 #    make t4          — T4/T5: GPUNetIO receiver (needs DOCA SDK)
 #
 #  Convenience:
-#    make all         — core + t2 + t3 + t4 (attempts all, skips missing deps)
+#    make all         — core + t2 + t3 + t4 (fails fast on missing deps)
 #    make bench       — run quick benchmark after building core
 #    make clean       — remove bin/
 #
@@ -36,6 +36,7 @@ ARCH_FLAG := -arch=sm_$(CUDA_ARCH)
 
 COMMON    := src/common
 BINDIR    := bin
+MAKEFILE_DEPS := Makefile
 
 # WebSocket support for --mode live (requires libwebsockets)
 WS_LIBS   := -lwebsockets -lssl -lcrypto -lpthread
@@ -75,13 +76,13 @@ DATA_LIVE := $(BINDIR)/data_source_live
 
 data_source: $(DATA_BIN)
 
-$(DATA_BIN): $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+$(DATA_BIN): $(DATA_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
 	@echo "  [OK] $@"
 
 data_source_live: $(DATA_LIVE)
 
-$(DATA_LIVE): $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+$(DATA_LIVE): $(DATA_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(CXX) $(CXXFLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $@ $(WS_LIBS)
 	@echo "  [OK] $@  (with Binance WebSocket)"
 
@@ -94,7 +95,7 @@ DPU_RELAY_BIN := $(BINDIR)/dpu_relay
 
 dpu_relay: $(DPU_RELAY_BIN)
 
-$(DPU_RELAY_BIN): $(DPU_RELAY_SRC) | $(BINDIR)
+$(DPU_RELAY_BIN): $(DPU_RELAY_SRC) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
 	@echo "  [OK] $@"
 
@@ -107,7 +108,7 @@ T1_BIN := $(BINDIR)/cpu_receiver
 
 t1: $(T1_BIN)
 
-$(T1_BIN): $(T1_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+$(T1_BIN): $(T1_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh $(MAKEFILE_DEPS) | $(BINDIR)
 	$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $< -o $@
 	@echo "  [OK] $@"
 
@@ -120,15 +121,16 @@ T2_BIN := $(BINDIR)/dpdk_receiver
 
 t2: $(T2_BIN)
 
-$(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+$(T2_BIN): $(T2_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh $(MAKEFILE_DEPS) | $(BINDIR)
 	@if [ -z "$(DPDK_LIBS)" ]; then \
-		echo "  [SKIP] T2: libdpdk not found (run: apt install dpdk-dev)"; \
+		echo "  [FAIL] T2: libdpdk not found (run: apt install dpdk-dev)"; \
+		exit 1; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
 		    -Xcompiler "$(DPDK_CFLAGS)" \
 		    $< -o $@ $(DPDK_LIBS) \
 		&& echo "  [OK] $@" \
-		|| echo "  [FAIL] T2: link failed"; \
+		|| { echo "  [FAIL] T2: compile/link failed"; exit 1; }; \
 	fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -140,14 +142,16 @@ T3_BIN := $(BINDIR)/rdma_receiver
 
 t3: $(T3_BIN)
 
-$(T3_BIN): $(T3_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh | $(BINDIR)
+$(T3_BIN): $(T3_SRC) $(COMMON_HDRS) $(COMMON)/process_kernel.cuh $(MAKEFILE_DEPS) | $(BINDIR)
 	@if ! pkg-config --exists libibverbs 2>/dev/null && \
 	    ! [ -f /usr/include/infiniband/verbs.h ]; then \
-		echo "  [SKIP] T3: libibverbs not found (run: apt install libibverbs-dev)"; \
+		echo "  [FAIL] T3: libibverbs not found (run: apt install libibverbs-dev)"; \
+		exit 1; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) \
-		    $< -o $@ $(RDMA_LIBS); \
-		echo "  [OK] $@"; \
+		    $< -o $@ $(RDMA_LIBS) \
+		&& echo "  [OK] $@" \
+		|| { echo "  [FAIL] T3: compile/link failed"; exit 1; }; \
 	fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -159,15 +163,17 @@ T4_BIN := $(BINDIR)/gpu_receiver
 
 t4: $(T4_BIN)
 
-$(T4_BIN): $(T4_SRC) $(COMMON_HDRS) | $(BINDIR)
+$(T4_BIN): $(T4_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	@if [ ! -d "$(DOCA_ROOT)/include" ]; then \
-		echo "  [SKIP] T4/T5: DOCA SDK not found at $(DOCA_ROOT)"; \
+		echo "  [FAIL] T4/T5: DOCA SDK not found at $(DOCA_ROOT)"; \
 		echo "         Install DOCA SDK or set DOCA_ROOT=/path/to/doca"; \
+		exit 1; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) -I$(COMMON) $(DOCA_INC) \
 		    -DALLOW_EXPERIMENTAL_API \
-		    $< -o $@ $(DOCA_LIBS); \
-		echo "  [OK] $@  (T4 + T5 share this binary)"; \
+		    $< -o $@ $(DOCA_LIBS) \
+		&& echo "  [OK] $@  (T4 + T5 share this binary)" \
+		|| { echo "  [FAIL] T4/T5: compile/link failed"; exit 1; }; \
 	fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -179,7 +185,7 @@ FILL_BIN := $(BINDIR)/fill_simulator
 
 fill_sim: $(FILL_BIN)
 
-$(FILL_BIN): $(FILL_SRC) $(COMMON_HDRS) | $(BINDIR)
+$(FILL_BIN): $(FILL_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
 	@echo "  [OK] $@"
 
@@ -192,7 +198,7 @@ HARNESS_BIN := $(BINDIR)/benchmark_harness
 
 harness: $(HARNESS_BIN)
 
-$(HARNESS_BIN): $(HARNESS_SRC) $(COMMON_HDRS) | $(BINDIR)
+$(HARNESS_BIN): $(HARNESS_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(CXX) $(CXXFLAGS) -I$(COMMON) $< -o $@
 	@echo "  [OK] $@"
 
@@ -232,13 +238,13 @@ DPU_CXX   := aarch64-linux-gnu-g++
 DPU_FLAGS := -O3 -std=c++17 -static-libstdc++
 DPU_BIN   := $(BINDIR)/data_source_dpu
 
-data_source_dpu: $(DATA_SRC) $(COMMON_HDRS) | $(BINDIR)
+data_source_dpu: $(DATA_SRC) $(COMMON_HDRS) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(DPU_CXX) $(DPU_FLAGS) $(WS_FLAGS) -I$(COMMON) $< -o $(DPU_BIN) $(WS_LIBS)
 	@echo "  [OK] $(DPU_BIN)  (aarch64 — deploy to DPU with scp)"
 
 DPU_RELAY_DPU_BIN := $(BINDIR)/dpu_relay_dpu
 
-dpu_relay_dpu: $(DPU_RELAY_SRC) | $(BINDIR)
+dpu_relay_dpu: $(DPU_RELAY_SRC) $(MAKEFILE_DEPS) | $(BINDIR)
 	$(DPU_CXX) $(DPU_FLAGS) $< -o $(DPU_RELAY_DPU_BIN)
 	@echo "  [OK] $(DPU_RELAY_DPU_BIN)  (aarch64 — deploy to DPU with scp)"
 
@@ -251,14 +257,16 @@ TEST_FLOW_BIN := $(BINDIR)/doca_flow_test
 
 test_flow: $(TEST_FLOW_BIN)
 
-$(TEST_FLOW_BIN): $(TEST_FLOW_SRC) | $(BINDIR)
+$(TEST_FLOW_BIN): $(TEST_FLOW_SRC) $(MAKEFILE_DEPS) | $(BINDIR)
 	@if [ ! -d "$(DOCA_ROOT)/include" ]; then \
-		echo "  [SKIP] test_flow: DOCA SDK not found at $(DOCA_ROOT)"; \
+		echo "  [FAIL] test_flow: DOCA SDK not found at $(DOCA_ROOT)"; \
+		exit 1; \
 	else \
 		$(NVCC) $(NVCCFLAGS) $(ARCH_FLAG) $(DOCA_INC) \
 		    -DALLOW_EXPERIMENTAL_API \
-		    $< -o $@ $(DOCA_LIBS); \
-		echo "  [OK] $@"; \
+		    $< -o $@ $(DOCA_LIBS) \
+		&& echo "  [OK] $@" \
+		|| { echo "  [FAIL] test_flow: compile/link failed"; exit 1; }; \
 	fi
 
 # ── Clean ──────────────────────────────────────────────────────────────────

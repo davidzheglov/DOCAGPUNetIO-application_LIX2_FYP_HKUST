@@ -152,7 +152,8 @@ def plot_compute_latency(agg, outdir):
         ax.plot(rates, p99, color=c, marker=m, linestyle="--",
                 alpha=0.6, label=f"{TIER_LABEL[tier]}  p99")
     setup_axes(ax, "Per-tick GPU compute latency",
-               "Offered tick rate (Hz)", "Per-tick compute latency (µs)")
+               "Offered tick rate (Hz)", "Per-tick compute latency (µs)",
+               xlog=True, ylog=True)
     ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
     save(fig, outdir, "01_compute_latency.png")
 
@@ -225,7 +226,8 @@ def plot_stage_breakdown(agg, outdir, target_rate=100000):
     e2e_v   = [agg[(t, target_rate)]["e2e_p50"]     for t in tiers]
     egress  = [max(0.0, e2e_v[i] - ingest[i] - compute[i]) for i in range(len(tiers))]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, (ax, ax_compute) = plt.subplots(
+        1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [2.2, 1.0]})
     labels = [TIER_LABEL[t] for t in tiers]
     x = np.arange(len(tiers))
     ax.bar(x, ingest,  label="Ingress (T2−T1)", color="#cccccc")
@@ -240,6 +242,19 @@ def plot_stage_breakdown(agg, outdir, target_rate=100000):
     ax.set_ylabel("Latency (µs)", fontsize=10)
     ax.grid(True, axis="y", alpha=0.25)
     ax.legend(fontsize=9, loc="upper right")
+
+    compute_for_plot = [max(v, 1e-3) for v in compute]
+    ax_compute.bar(x, compute_for_plot, color="#2a9d8f")
+    ax_compute.set_yscale("log")
+    ax_compute.set_xticks(x)
+    ax_compute.set_xticklabels([l.split(" ")[0] for l in labels], fontsize=9)
+    ax_compute.set_title("Compute only", fontsize=11, pad=10)
+    ax_compute.set_ylabel("p50 compute latency (µs)", fontsize=10)
+    ax_compute.grid(True, axis="y", which="both", alpha=0.25)
+    for xi, val in zip(x, compute):
+        shown = max(val, 1e-3)
+        ax_compute.text(xi, shown, f"{val:.2g} µs",
+                        ha="center", va="bottom", fontsize=8)
     save(fig, outdir, "05_stage_breakdown.png")
 
 
