@@ -142,6 +142,19 @@ __device__ static void compute_risk_mc(
     cvar_95 = mc_mean - 2.0627128443 * mc_std;          /* φ/Φ at z */
 }
 
+/* Deterministic opt-in benchmark load. This is intentionally separate from the
+ * real signal math so final plots can label it as synthetic compute work. */
+__device__ static float synthetic_bench_work(float x, int iters)
+{
+    float acc = x;
+#pragma unroll 1
+    for (int i = 0; i < iters; ++i) {
+        acc = fmaf(acc, 1.000001f, 0.000001f * (float)(i + 1));
+        acc = fmaf(acc, 0.999999f, 0.0000003f);
+    }
+    return acc;
+}
+
 /* ── Main processing kernel ─────────────────────────────────────────────────── */
 
 /*
@@ -163,7 +176,8 @@ __global__ void process_ticks_kernel(
     double             * __restrict__ d_avg_loss,
     double             * __restrict__ d_last_mid,
     uint64_t                         t2_ns,      /* batch arrival time, T1-T3 */
-    int                              light_mode)
+    int                              light_mode,
+    int                              bench_work_iters)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_ticks) return;
@@ -247,6 +261,11 @@ __global__ void process_ticks_kernel(
         compute_risk_mc(mid, vol_dev, seed,
                         var_95, cvar_95, mc_mean, mc_std);
     }
+    if (bench_work_iters > 0) {
+        float work = synthetic_bench_work((float)(mid + spread + rsi),
+                                          bench_work_iters);
+        mc_std += (double)work * 1e-12;  /* keep the loop live, negligibly. */
+    }
 
     /* ── Stamp T3 (GPU clock, converted to wall-clock ns by harness) ── */
     uint64_t t3 = clock64();
@@ -294,7 +313,8 @@ extern "C" void launch_process_ticks(
     double             *d_last_mid,
     uint64_t            t2_ns,
     cudaStream_t        stream,
-    bool                light_mode)
+    bool                light_mode,
+    int                 bench_work_iters)
 {
     if (n_ticks <= 0) return;
     int threads = 256;
@@ -302,5 +322,5 @@ extern "C" void launch_process_ticks(
     process_ticks_kernel<<<blocks, threads, 0, stream>>>(
         d_ticks, n_ticks, d_signals, d_compute_start_cycles,
         d_fast_ema, d_slow_ema, d_avg_gain, d_avg_loss, d_last_mid,
-        t2_ns, light_mode ? 1 : 0);
+        t2_ns, light_mode ? 1 : 0, bench_work_iters);
 }

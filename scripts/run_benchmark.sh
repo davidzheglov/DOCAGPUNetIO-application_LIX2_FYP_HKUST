@@ -20,6 +20,7 @@
 #    ./scripts/run_benchmark.sh --sender-password                   # prompt once for lxcpu2 SSH password
 #    ./scripts/run_benchmark.sh --receiver-iface ens21f0np0
 #    ./scripts/run_benchmark.sh --light-bench
+#    ./scripts/run_benchmark.sh --light-bench --bench-work 4096
 #    ./scripts/run_benchmark.sh --symbols 64 --csv-rows 2000000    # bigger stress
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -40,6 +41,7 @@ CSV_PATH="data/ticks.csv"
 REGEN_CSV=0
 QUICK=0
 LIGHT_BENCH=0
+BENCH_WORK=0
 IFACE_ARG=""    # forwarded as --iface to harness (NIC IP for sender/DPU mcast egress)
 RECEIVER_IFACE_ARG=""  # forwarded as --receiver-iface to harness (T1 CPU receiver iface name)
 
@@ -90,8 +92,9 @@ while [[ $# -gt 0 ]]; do
         --sender-password) SENDER_PASSWORD=1; shift ;;
         --local-sender) LOCAL_SENDER=1; SENDER_SSH=""; shift ;;
         --light-bench)  LIGHT_BENCH=1; shift ;;
+        --bench-work)   BENCH_WORK="$2"; shift 2 ;;
         --quick)        QUICK=1; shift ;;
-        --help|-h)      sed -n '2,22p' "$0"; exit 0 ;;
+        --help|-h)      sed -n '2,24p' "$0"; exit 0 ;;
         *)              echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -321,6 +324,7 @@ ${C}═════════════════════════�
     duration  : ${DURATION}s
     runs      : $TOTAL_RUNS  (~${ETA_M} min total)
     csv       : $CSV_PATH ($CSV_ROWS rows, $SYMBOLS symbols)
+    bench work: $BENCH_WORK synthetic iterations/tick
     results   : $RESULTS
     clock cal : ${CLOCK_CAL_HOST:-local}:${CLOCK_CAL_PORT} (bind $CLOCK_CAL_BIND)
 ${C}══════════════════════════════════════════════════════════════════════${R}
@@ -401,6 +405,9 @@ if [[ -n "$SENDER_SSH" ]]; then
 fi
 if [[ $LIGHT_BENCH -eq 1 ]]; then
     SENDER_ARGS+=(--light-bench)
+fi
+if [[ "$BENCH_WORK" != "0" ]]; then
+    SENDER_ARGS+=(--bench-work "$BENCH_WORK")
 fi
 
 "$HARNESS" \

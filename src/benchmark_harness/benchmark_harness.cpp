@@ -304,6 +304,7 @@ static std::string g_sender_csv
 static std::string g_sender_dest = "192.168.100.2:6005";  /* DPU relay listen-port */
 static std::string g_sender_control_path; /* optional shared SSH control socket */
 static bool        g_light_bench = false; /* skip Monte Carlo in receiver kernels */
+static int         g_bench_work_iters = 0; /* opt-in synthetic compute load */
 static std::string g_dpu_user = "ubuntu";
 static std::string g_dpu_ip = "192.168.100.2";
 static std::string g_relay_stats_path;
@@ -659,6 +660,10 @@ static std::vector<std::string> receiver_args(int tier)
 
     if (g_light_bench)
         args.push_back("--light-bench");
+    if (g_bench_work_iters > 0) {
+        args.push_back("--bench-work");
+        args.push_back(std::to_string(g_bench_work_iters));
+    }
 
     if (tier == 1 && !g_receiver_iface.empty()) {
         args.push_back("--iface");
@@ -1285,6 +1290,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--clock-cal-port") && i+1<argc) g_clock_cal_port = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--clock-cal-script") && i+1<argc) g_clock_cal_script = argv[++i];
         else if (!strcmp(argv[i],"--light-bench")) g_light_bench = true;
+        else if (!strcmp(argv[i],"--bench-work") && i+1<argc) {
+            g_bench_work_iters = std::max(0, atoi(argv[++i]));
+        }
     }
 
     /* Parse tier list */

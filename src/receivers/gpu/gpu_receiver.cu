@@ -43,6 +43,7 @@
 #include <signal.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -165,6 +166,19 @@ __device__ static void compute_risk_mc(
     cvar_95 = mc_mean - 2.0627128443 * mc_std;
 }
 
+/* Deterministic opt-in benchmark load. Keep this mirrored with
+ * process_kernel.cuh so --bench-work has the same meaning for T1-T4. */
+__device__ static float synthetic_bench_work(float x, int iters)
+{
+    float acc = x;
+#pragma unroll 1
+    for (int i = 0; i < iters; ++i) {
+        acc = fmaf(acc, 1.000001f, 0.000001f * (float)(i + 1));
+        acc = fmaf(acc, 0.999999f, 0.0000003f);
+    }
+    return acc;
+}
+
 /* ── GPU result ring (GPU -> CPU readback) ────────────────────────────────── */
 struct ResultSlot {
     volatile uint64_t seq;
@@ -233,7 +247,8 @@ __global__ void gpu_recv_process_kernel(
     uint32_t                 ring_depth,
     uint8_t                  tier,
     int                      use_nic_t1,
-    int                      light_mode)
+    int                      light_mode,
+    int                      bench_work_iters)
 {
     const int tid = threadIdx.x;
 
@@ -423,6 +438,11 @@ __global__ void gpu_recv_process_kernel(
                                                   ^ (uint32_t)t2);
                         compute_risk_mc(mid, vol_dev, seed,
                                         var_95, cvar_95, mc_mean, mc_std);
+                    }
+                    if (bench_work_iters > 0) {
+                        float work = synthetic_bench_work((float)(mid + spread + rsi),
+                                                          bench_work_iters);
+                        mc_std += (double)work * 1e-12;
                     }
 
                     /* T3: kernel done */
@@ -660,6 +680,7 @@ struct DocaContext {
 
 static bool g_use_nic_t1 = false;
 static bool g_light_bench = false;
+static int  g_bench_work_iters = 0;
 
 static size_t get_page_size(void)
 {
@@ -1010,12 +1031,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"--fillsim")   && i+1<argc) fillsim_ip   = argv[++i];
         else if (!strcmp(argv[i],"--nic-t1"))                     g_use_nic_t1 = true;
         else if (!strcmp(argv[i],"--light-bench"))                g_light_bench = true;
+        else if (!strcmp(argv[i],"--bench-work") && i+1<argc) {
+            g_bench_work_iters = std::max(0, atoi(argv[++i]));
+        }
     }
 
     fprintf(stderr, "[T%d gpu_receiver] gpu=%d gpu_pcie=%s nic_pcie=%s\n",
             tier, cuda_device, gpu_pcie, nic_pcie);
     if (g_light_bench)
         fprintf(stderr, "[T4/T5] light benchmark mode enabled (Monte Carlo skipped)\n");
+    if (g_bench_work_iters > 0)
+        fprintf(stderr, "[T4/T5] synthetic benchmark compute load: %d iterations/tick\n",
+                g_bench_work_iters);
 
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
@@ -1142,7 +1169,8 @@ int main(int argc, char **argv)
         ring.depth,
         tier,
         g_use_nic_t1 ? 1 : 0,
-        g_light_bench ? 1 : 0);
+        g_light_bench ? 1 : 0,
+        g_bench_work_iters);
 
     /* Wait for SIGINT / SIGTERM — periodically query flow counters */
     int poll_sec = 0;
