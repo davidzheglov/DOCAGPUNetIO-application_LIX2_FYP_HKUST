@@ -5,13 +5,14 @@
  * For each run:
  *   1. Launch data_source (replay mode) at the target rate.
  *   2. Launch the tier-specific receiver binary.
- *   3. Discard BenchmarkResult packets during the warmup window (5 s).
- *   4. Collect BenchmarkResult packets for the measurement window (30 s).
+ *   3. Account for, but do not time, BenchmarkResult packets during warmup.
+ *   4. Collect BenchmarkResult packets for the measurement window.
  *   5. Kill both subprocesses.
  *   6. Compute per-tick latency metrics and write to CSV.
  *
  * Results CSV columns:
- *   run_id, tier, rate_hz, repetition, n_ticks, drop_rate,
+ *   run_id, tier, rate_hz, repetition, sent_ticks, processed_ticks,
+ *   n_ticks, drop_rate,
  *   e2e_p50, e2e_p95, e2e_p99, e2e_mean,
  *   ingest_p50, ingest_p95, ingest_p99, ingest_mean,
  *   compute_p50, compute_p95, compute_p99, compute_mean,
@@ -95,6 +96,71 @@ static void drain_stale_results(int result_fd, int signal_fd)
 
     fprintf(stderr,
             "[harness] warning: result sockets still had backlog after post-run drain; "
+            "continuing with bounded cleanup\n");
+}
+
+static void drain_run_accounting(int result_fd, int signal_fd,
+                                 std::unordered_set<uint64_t> &result_tick_ids,
+                                 std::unordered_set<uint64_t> &signal_tick_ids,
+                                 uint64_t &n_dropped,
+                                 uint64_t &n_signals_actionable,
+                                 Clock::time_point deadline)
+{
+    BenchmarkResult br{};
+    SignalResult sr{};
+
+    for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < deadline; ++i) {
+        ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
+        if (n != sizeof(BenchmarkResult)) break;
+        if (br.dropped) {
+            ++n_dropped;
+        } else {
+            result_tick_ids.insert(br.tick_id);
+        }
+    }
+
+    for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < deadline; ++i) {
+        ssize_t n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);
+        if (n != sizeof(SignalResult)) break;
+        signal_tick_ids.insert(sr.tick_id);
+        if (sr.signal != 0) ++n_signals_actionable;
+    }
+}
+
+static void drain_run_accounting_after_stop(int result_fd, int signal_fd,
+                                            std::unordered_set<uint64_t> &result_tick_ids,
+                                            std::unordered_set<uint64_t> &signal_tick_ids,
+                                            uint64_t &n_dropped,
+                                            uint64_t &n_signals_actionable)
+{
+    BenchmarkResult br{};
+    SignalResult sr{};
+
+    for (int round = 0; round < MAX_POST_RUN_DRAIN_ROUNDS; ++round) {
+        bool drained_any = false;
+        for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK; ++i) {
+            ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
+            if (n != sizeof(BenchmarkResult)) break;
+            drained_any = true;
+            if (br.dropped) {
+                ++n_dropped;
+            } else {
+                result_tick_ids.insert(br.tick_id);
+            }
+        }
+        for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK; ++i) {
+            ssize_t n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);
+            if (n != sizeof(SignalResult)) break;
+            drained_any = true;
+            signal_tick_ids.insert(sr.tick_id);
+            if (sr.signal != 0) ++n_signals_actionable;
+        }
+        if (!drained_any) return;
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "[harness] warning: result sockets still had backlog after post-run accounting drain; "
             "continuing with bounded cleanup\n");
 }
 
@@ -818,15 +884,13 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         system_ignore(rm_cmd);
     }
     usleep(300000);
+    drain_stale_results(result_fd, signal_fd);
 
-    /* Remote SSH bookkeeping can stall if the DPU ARM is busy. Do it before
-     * the timed receiver window so warmup/measurement remain wall-clock bound. */
+    /* Remote clock sampling can stall if the DPU ARM is busy. Do it before
+     * the timed receiver window so warmup/measurement remain wall-clock bound.
+     * Sender tick accounting is read only after the run: data_source resets
+     * tick_id for each run, so the final counter is the full-run denominator. */
     ClockSample cal_start = sample_clock_pair();
-    uint64_t sent_ticks_start = g_sender_ssh.empty()
-        ? read_counter_from_file(sender_stats_path)
-        : read_remote_counter_via_ssh(sender_stats_path);
-    uint64_t relay_ticks_start = read_relay_counter_via_ssh();
-    auto counter_baseline_time = Clock::now();
 
     /* Launch data_source — remote (lxcpu2 via SSH) or local (legacy) */
     pid_t ds_pid = -1;
@@ -860,24 +924,29 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         fprintf(stderr, "Failed to launch receiver for tier %d\n", tier);
     }
 
-    /* Drain both sockets during warmup */
+    std::unordered_set<uint64_t> full_run_result_tick_ids;
+    std::unordered_set<uint64_t> full_run_signal_tick_ids;
+    uint64_t n_dropped = 0;
+    uint64_t n_signals_actionable = 0;
+
+    /* Drain both sockets during warmup. Warmup results are excluded from
+     * latency percentiles, but included in full-run drop accounting. */
     auto t_start = Clock::now();
     {
-        BenchmarkResult br{};
-        SignalResult    sr{};
         auto warmup_end = t_start + Sec(warmup_sec);
         fprintf(stderr, "[harness] warming up for %d s...\n", warmup_sec);
         while (Clock::now() < warmup_end) {
-            bool drained_any = false;
-            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < warmup_end; ++i) {
-                if (recv(result_fd, &br, sizeof(br), MSG_DONTWAIT) != sizeof(br)) break;
-                drained_any = true;
+            size_t before = full_run_result_tick_ids.size() + full_run_signal_tick_ids.size();
+            uint64_t dropped_before = n_dropped;
+            uint64_t signals_before = n_signals_actionable;
+            drain_run_accounting(result_fd, signal_fd,
+                                  full_run_result_tick_ids, full_run_signal_tick_ids,
+                                  n_dropped, n_signals_actionable, warmup_end);
+            size_t after = full_run_result_tick_ids.size() + full_run_signal_tick_ids.size();
+            if (after == before && dropped_before == n_dropped &&
+                signals_before == n_signals_actionable) {
+                usleep(1000);
             }
-            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < warmup_end; ++i) {
-                if (recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT) != sizeof(sr)) break;
-                drained_any = true;
-            }
-            if (!drained_any) usleep(1000);
         }
     }
 
@@ -886,11 +955,11 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     std::vector<BenchmarkResult> raw_results;
     std::vector<double> e2e_ns, ingest_ns, compute_ns;
 
-    uint64_t n_dropped = 0;
     uint64_t n_inferred_missing_ticks = 0;
     uint64_t n_rejected_invalid_order = 0;
     uint64_t n_rejected_too_old = 0;
     std::vector<SignalResult> raw_signals;
+    uint64_t n_measurement_signals_actionable = 0;
     auto measure_start = Clock::now();
     auto measure_end = measure_start + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
@@ -914,6 +983,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 if (n != sizeof(BenchmarkResult)) break;
                 if (!br.dropped) {
                     raw_results.push_back(br);
+                    full_run_result_tick_ids.insert(br.tick_id);
                 }
                 if (br.dropped) { ++n_dropped; }
             }
@@ -924,6 +994,9 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 ssize_t n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);
                 if (n != sizeof(SignalResult)) break;
                 raw_signals.push_back(sr);
+                full_run_signal_tick_ids.insert(sr.tick_id);
+                if (sr.signal != 0) ++n_signals_actionable;
+                if (sr.signal != 0) ++n_measurement_signals_actionable;
             }
         }
     }
@@ -937,12 +1010,14 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
     kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
     usleep(100000);
+    drain_run_accounting_after_stop(result_fd, signal_fd,
+                                    full_run_result_tick_ids, full_run_signal_tick_ids,
+                                    n_dropped, n_signals_actionable);
     drain_stale_results(result_fd, signal_fd);
 
     uint64_t sent_ticks_end = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
-    uint64_t relay_ticks_end = read_relay_counter_via_ssh();
     ClockSample cal_end = sample_clock_pair();
     if (g_sender_ssh.empty()) {
         fprintf(stderr, "[harness] clock-cal: local sender (no offset needed)\n");
@@ -964,25 +1039,10 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                             "using raw sender timestamps\n");
         }
     }
-    uint64_t sent_ticks_window = (sent_ticks_end >= sent_ticks_start)
-        ? (sent_ticks_end - sent_ticks_start) : 0;
-    uint64_t relay_ticks_window = (relay_ticks_end >= relay_ticks_start)
-        ? (relay_ticks_end - relay_ticks_start) : 0;
-    (void)counter_baseline_time;
-    (void)sent_ticks_window;
-    (void)relay_ticks_window;
-
     e2e_ns.reserve(raw_results.size());
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
-    std::unordered_set<uint64_t> benchmark_tick_ids;
-    uint64_t min_observed_tick = UINT64_MAX;
-    uint64_t max_observed_tick = 0;
     for (const BenchmarkResult &raw_br : raw_results) {
-        benchmark_tick_ids.insert(raw_br.tick_id);
-        min_observed_tick = std::min<uint64_t>(min_observed_tick, raw_br.tick_id);
-        max_observed_tick = std::max<uint64_t>(max_observed_tick, raw_br.tick_id);
-
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
         if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
@@ -1000,29 +1060,32 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             : (double)(br.t3_ns - br.t2_ns));
     }
 
-    std::unordered_set<uint64_t> processed_tick_ids;
-    uint64_t n_signals_actionable = 0;
-    for (const SignalResult &sr : raw_signals) {
-        processed_tick_ids.insert(sr.tick_id);
-        if (sr.signal != 0) ++n_signals_actionable;
-    }
-
     size_t n_ticks = e2e_ns.size();
-    uint64_t processed_ticks = benchmark_tick_ids.size();
+    uint64_t processed_ticks = full_run_result_tick_ids.size();
 
     /* Drop-rate computation:
      *
-     * Final benchmark definition: the receiver-side measurement window is the
-     * source of truth. We collect BenchmarkResult packets for exactly
-     * duration_sec seconds, then compare completed results against the target
-     * offered load (rate_hz * duration_sec). Remote sender/relay counters are
-     * kept only as sanity checks because their sampling is SSH/file based and
-     * not aligned tightly enough for the primary metric. */
-    uint64_t sent_denominator = (uint64_t)std::llround((double)rate_hz * (double)duration_sec);
-    if (!benchmark_tick_ids.empty()) {
-        uint64_t observed_span = max_observed_tick - min_observed_tick + 1;
-        n_inferred_missing_ticks = observed_span > benchmark_tick_ids.size()
-            ? observed_span - benchmark_tick_ids.size() : 0;
+     * Final benchmark definition:
+     *   - Latency uses only the post-warmup measurement window.
+     *   - Drop accounting uses the full run, including warmup, because sender
+     *     tick_id resets at run start and receiver buffers are drained before
+     *     the next run starts.
+     *   - Throughput/signals below remain measurement-window rates. */
+    uint64_t sent_denominator = sent_ticks_end;
+    if (sent_denominator == 0) {
+        sent_denominator =
+            (uint64_t)std::llround((double)rate_hz * (double)(warmup_sec + duration_sec));
+        fprintf(stderr,
+                "[harness] warning: sender stats were unavailable; "
+                "falling back to target full-run send count=%llu\n",
+                (unsigned long long)sent_denominator);
+    }
+    if (!full_run_result_tick_ids.empty()) {
+        auto minmax = std::minmax_element(full_run_result_tick_ids.begin(),
+                                          full_run_result_tick_ids.end());
+        uint64_t observed_span = *minmax.second - *minmax.first + 1;
+        n_inferred_missing_ticks = observed_span > full_run_result_tick_ids.size()
+            ? observed_span - full_run_result_tick_ids.size() : 0;
     }
     double drop_rate = sent_denominator > 0
         ? (double)(sent_denominator > processed_ticks
@@ -1055,11 +1118,11 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.compute_p99  = percentile(compute_ns, 0.99);
     r.compute_mean = mean_of(compute_ns);
     r.throughput   = duration_sec > 0
-        ? (double)processed_ticks / (double)duration_sec : 0.0;
+        ? (double)n_ticks / (double)duration_sec : 0.0;
     r.signals_total_per_sec      = duration_sec > 0
-        ? (double)processed_tick_ids.size() / (double)duration_sec : 0.0;
+        ? (double)raw_signals.size() / (double)duration_sec : 0.0;
     r.signals_actionable_per_sec = duration_sec > 0
-        ? (double)n_signals_actionable / (double)duration_sec : 0.0;
+        ? (double)n_measurement_signals_actionable / (double)duration_sec : 0.0;
 
     /* Clock-sync uncertainty for this run — propagates into the CSV so plots
      * can draw the cross-host noise floor. Local sender (no SSH) gets 0/0. */
@@ -1089,7 +1152,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         "tput=%.0f/s sig_total=%.0f/s sig_act=%.0f/s\n",
         tier, rate_hz, n_ticks, drop_rate * 100.0,
         (unsigned long long)sent_denominator,
-        "target",
+        sent_ticks_end == 0 ? "target-fallback" : "sender-final",
         (unsigned long long)processed_ticks,
         (unsigned long long)n_dropped,
         (unsigned long long)n_inferred_missing_ticks,
