@@ -68,6 +68,7 @@ CLOCK_CAL_BIND="${CLOCK_CAL_BIND:-0.0.0.0}"
 CLOCK_CAL_PORT="${CLOCK_CAL_PORT:-6006}"
 CLOCK_CAL_SCRIPT="${CLOCK_CAL_SCRIPT:-\$HOME/$SENDER_REMOTE_DIR/scripts/clock_cal_server.py}"
 CLOCK_TUNNEL_PID=""
+SUDO_KEEPALIVE_PID=""
 
 LOCAL_SENDER=0   # if 1, run sender locally (T1-only loopback fallback)
 SENDER_PASSWORD=0
@@ -321,6 +322,15 @@ if [[ $NEEDS_LOCAL_SUDO -eq 1 ]]; then
         log_err "sudo authentication failed"
         exit 1
     fi
+    # Long full sweeps can outlive sudo's timestamp timeout. Keep the credential
+    # warm so receiver launches never block at a password prompt mid-run.
+    (
+        while true; do
+            sudo -n -v 2>/dev/null || exit 0
+            sleep 60
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
     log_ok "sudo credential ready"
 fi
 
@@ -369,6 +379,10 @@ fi
 HARNESS_PID=""
 cleanup() {
     log "Cleaning up..."
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]] && kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
     if [[ -n "$HARNESS_PID" ]] && kill -0 "$HARNESS_PID" 2>/dev/null; then
         kill "$HARNESS_PID" 2>/dev/null || true
         wait "$HARNESS_PID" 2>/dev/null || true

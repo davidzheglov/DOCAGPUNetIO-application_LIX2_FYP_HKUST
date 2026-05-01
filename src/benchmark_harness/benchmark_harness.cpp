@@ -720,6 +720,7 @@ static pid_t launch_receiver(int tier, const char *binary,
         bool need_sudo = (tier >= 2 && tier <= 5) && (geteuid() != 0);
         if (need_sudo) {
             argv.push_back("sudo");
+            argv.push_back("-n");  /* never prompt inside a timed benchmark run */
             argv.push_back("-E");
             argv.push_back("env");
             owned_args.push_back(make_env_assignment("PATH"));
