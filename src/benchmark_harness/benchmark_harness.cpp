@@ -1018,6 +1018,12 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             }
         }
     }
+    uint64_t sent_ticks_start = g_sender_ssh.empty()
+        ? read_counter_from_file(sender_stats_path)
+        : read_remote_counter_via_ssh(sender_stats_path);
+    fprintf(stderr,
+            "[harness] measurement sender tick lower bound: %llu\n",
+            (unsigned long long)sent_ticks_start);
 
     /* Collect raw results during measurement. Sender-side t1 is reconciled
      * into the local clock domain after the run using two clock samples. */
@@ -1130,6 +1136,15 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 "falling back to target full-run send count=%llu\n",
                 (unsigned long long)sent_denominator);
     }
+    uint64_t measurement_tick_floor = sent_ticks_start;
+    if (measurement_tick_floor >= sent_denominator) {
+        fprintf(stderr,
+                "[harness] warning: measurement tick lower bound (%llu) >= "
+                "sender final count (%llu); disabling lower-bound latency filter\n",
+                (unsigned long long)measurement_tick_floor,
+                (unsigned long long)sent_denominator);
+        measurement_tick_floor = 0;
+    }
 
     /* Soft-tolerance for the cross-host edge of the validity check:
      * t1 is sender-stamped + offset-corrected, t2 is receiver-stamped on the
@@ -1151,6 +1166,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
     for (const BenchmarkResult &raw_br : raw_results) {
+        if (raw_br.tick_id < measurement_tick_floor) continue;
         if (raw_br.tick_id >= sent_denominator) continue;
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
@@ -1195,6 +1211,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     size_t n_measurement_signals = 0;
     uint64_t n_measurement_signals_actionable = 0;
     for (const SignalResult &sr : raw_signals) {
+        if (sr.tick_id < measurement_tick_floor) continue;
         if (sr.tick_id >= sent_denominator) continue;
         ++n_measurement_signals;
         if (sr.signal != 0) ++n_measurement_signals_actionable;
