@@ -57,6 +57,11 @@ static const int DEFAULT_WARMUP   = 5;
 static const int DEFAULT_DURATION = 30;
 static const int DEFAULT_REPS     = 3;
 
+/* Keep the harness wall-clock windows honest under high-rate traffic.
+ * Without this cap, a socket that is continuously readable can trap the
+ * harness inside recv() draining loops long past the warmup/measurement end. */
+static const int MAX_SOCKET_DRAIN_PER_TICK = 8192;
+
 /* ── Percentile helper ───────────────────────────────────────────────────── */
 static double percentile(std::vector<double> &v, double p)
 {
@@ -818,9 +823,16 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         auto warmup_end = t_start + Sec(warmup_sec);
         fprintf(stderr, "[harness] warming up for %d s...\n", warmup_sec);
         while (Clock::now() < warmup_end) {
-            while (recv(result_fd, &br, sizeof(br), MSG_DONTWAIT) == sizeof(br)) {}
-            while (recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT) == sizeof(sr)) {}
-            usleep(1000);
+            bool drained_any = false;
+            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < warmup_end; ++i) {
+                if (recv(result_fd, &br, sizeof(br), MSG_DONTWAIT) != sizeof(br)) break;
+                drained_any = true;
+            }
+            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < warmup_end; ++i) {
+                if (recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT) != sizeof(sr)) break;
+                drained_any = true;
+            }
+            if (!drained_any) usleep(1000);
         }
     }
 
@@ -847,25 +859,29 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     pfds[1].fd = signal_fd; pfds[1].events = POLLIN;
 
     while (Clock::now() < measure_end) {
-        int pr = poll(pfds, 2, 50);  /* 50 ms tick */
+        auto now = Clock::now();
+        auto remaining_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(measure_end - now).count();
+        int poll_timeout_ms = (int)std::max<int64_t>(0, std::min<int64_t>(50, remaining_ms));
+        int pr = poll(pfds, 2, poll_timeout_ms);  /* 50 ms max tick */
         if (pr <= 0) continue;
 
         if (pfds[0].revents & POLLIN) {
             BenchmarkResult br{};
-            ssize_t n;
-            while ((n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT)) == sizeof(BenchmarkResult)) {
-                if (n == sizeof(BenchmarkResult)) {
-                    if (!br.dropped) {
-                        raw_results.push_back(br);
-                    }
-                    if (br.dropped) { ++n_dropped; }
+            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < measure_end; ++i) {
+                ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
+                if (n != sizeof(BenchmarkResult)) break;
+                if (!br.dropped) {
+                    raw_results.push_back(br);
                 }
+                if (br.dropped) { ++n_dropped; }
             }
         }
         if (pfds[1].revents & POLLIN) {
             SignalResult sr{};
-            ssize_t n;
-            while ((n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT)) == sizeof(SignalResult)) {
+            for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < measure_end; ++i) {
+                ssize_t n = recv(signal_fd, &sr, sizeof(sr), MSG_DONTWAIT);
+                if (n != sizeof(SignalResult)) break;
                 raw_signals.push_back(sr);
             }
         }
