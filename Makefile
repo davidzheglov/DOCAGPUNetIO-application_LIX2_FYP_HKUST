@@ -214,7 +214,7 @@ benchmark: all
 	@bash scripts/run_benchmark.sh $(BENCHMARK_ARGS)
 	@python3 scripts/plot_benchmark.py --latest
 
-benchmark-quick: core
+benchmark-quick: all
 	@bash scripts/run_benchmark.sh --quick $(BENCHMARK_ARGS)
 	@python3 scripts/plot_benchmark.py --latest
 
