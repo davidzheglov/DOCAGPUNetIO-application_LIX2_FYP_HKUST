@@ -892,6 +892,16 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         }
     }
 
+    /* Stop traffic as soon as the measurement deadline passes. All slower
+     * bookkeeping below must happen after the receiver is no longer running,
+     * otherwise the log makes the measurement window look longer than it is. */
+    kill_proc(rx_pid);
+    if (!g_sender_ssh.empty()) {
+        kill_remote_sender();   /* tells the remote machine to stop sending */
+    }
+    kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
+    usleep(100000);
+
     uint64_t sent_ticks_end = g_sender_ssh.empty()
         ? read_counter_from_file(sender_stats_path)
         : read_remote_counter_via_ssh(sender_stats_path);
@@ -966,14 +976,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
         processed_tick_ids.insert(sr.tick_id);
         if (sr.signal != 0) ++n_signals_actionable;
     }
-
-    /* Kill subprocesses */
-    kill_proc(rx_pid);
-    if (!g_sender_ssh.empty()) {
-        kill_remote_sender();   /* tells the remote machine to stop sending */
-    }
-    kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
-    usleep(100000);
 
     size_t n_ticks = e2e_ns.size();
     uint64_t processed_ticks = processed_tick_ids.size();
