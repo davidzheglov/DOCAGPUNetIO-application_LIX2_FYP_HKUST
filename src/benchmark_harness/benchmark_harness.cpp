@@ -104,7 +104,8 @@ static void drain_run_accounting(int result_fd, int signal_fd,
                                  std::unordered_set<uint64_t> &signal_tick_ids,
                                  uint64_t &n_dropped,
                                  uint64_t &n_signals_actionable,
-                                 Clock::time_point deadline)
+                                 Clock::time_point deadline,
+                                 uint8_t expected_tier)
 {
     BenchmarkResult br{};
     SignalResult sr{};
@@ -112,6 +113,7 @@ static void drain_run_accounting(int result_fd, int signal_fd,
     for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < deadline; ++i) {
         ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
         if (n != sizeof(BenchmarkResult)) break;
+        if (br.tier != expected_tier) continue;
         if (br.dropped) {
             ++n_dropped;
         } else {
@@ -131,7 +133,8 @@ static void drain_run_accounting_after_stop(int result_fd, int signal_fd,
                                             std::unordered_set<uint64_t> &result_tick_ids,
                                             std::unordered_set<uint64_t> &signal_tick_ids,
                                             uint64_t &n_dropped,
-                                            uint64_t &n_signals_actionable)
+                                            uint64_t &n_signals_actionable,
+                                            uint8_t expected_tier)
 {
     BenchmarkResult br{};
     SignalResult sr{};
@@ -142,6 +145,7 @@ static void drain_run_accounting_after_stop(int result_fd, int signal_fd,
             ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
             if (n != sizeof(BenchmarkResult)) break;
             drained_any = true;
+            if (br.tier != expected_tier) continue;
             if (br.dropped) {
                 ++n_dropped;
             } else {
@@ -169,7 +173,8 @@ static void drain_run_accounting_until_quiet(int result_fd, int signal_fd,
                                              std::unordered_set<uint64_t> &signal_tick_ids,
                                              uint64_t &n_dropped,
                                              uint64_t &n_signals_actionable,
-                                             int max_ms)
+                                             int max_ms,
+                                             uint8_t expected_tier)
 {
     auto deadline = Clock::now() + std::chrono::milliseconds(max_ms);
     int idle_rounds = 0;
@@ -181,7 +186,8 @@ static void drain_run_accounting_until_quiet(int result_fd, int signal_fd,
 
         drain_run_accounting(result_fd, signal_fd,
                               result_tick_ids, signal_tick_ids,
-                              n_dropped, n_signals_actionable, deadline);
+                              n_dropped, n_signals_actionable, deadline,
+                              expected_tier);
 
         size_t after = result_tick_ids.size() + signal_tick_ids.size();
         if (after == before && dropped_before == n_dropped &&
@@ -191,6 +197,50 @@ static void drain_run_accounting_until_quiet(int result_fd, int signal_fd,
         } else {
             idle_rounds = 0;
         }
+    }
+}
+
+static void kill_proc_while_draining(pid_t pid,
+                                     int result_fd, int signal_fd,
+                                     std::unordered_set<uint64_t> &result_tick_ids,
+                                     std::unordered_set<uint64_t> &signal_tick_ids,
+                                     uint64_t &n_dropped,
+                                     uint64_t &n_signals_actionable,
+                                     uint8_t expected_tier)
+{
+    if (pid <= 0) return;
+
+    kill(-pid, SIGTERM);
+    kill(pid, SIGTERM);
+
+    int status;
+    auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (Clock::now() < deadline) {
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc == pid || rc < 0) return;
+
+        auto drain_deadline = Clock::now() + std::chrono::milliseconds(5);
+        drain_run_accounting(result_fd, signal_fd,
+                              result_tick_ids, signal_tick_ids,
+                              n_dropped, n_signals_actionable,
+                              drain_deadline, expected_tier);
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "[harness] warning: pid %d did not exit while draining; sending SIGKILL\n",
+            pid);
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    while (true) {
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc == pid || rc < 0) return;
+        auto drain_deadline = Clock::now() + std::chrono::milliseconds(5);
+        drain_run_accounting(result_fd, signal_fd,
+                              result_tick_ids, signal_tick_ids,
+                              n_dropped, n_signals_actionable,
+                              drain_deadline, expected_tier);
+        usleep(1000);
     }
 }
 
@@ -952,7 +1002,8 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             uint64_t signals_before = n_signals_actionable;
             drain_run_accounting(result_fd, signal_fd,
                                   full_run_result_tick_ids, full_run_signal_tick_ids,
-                                  n_dropped, n_signals_actionable, warmup_end);
+                                  n_dropped, n_signals_actionable, warmup_end,
+                                  (uint8_t)tier);
             size_t after = full_run_result_tick_ids.size() + full_run_signal_tick_ids.size();
             if (after == before && dropped_before == n_dropped &&
                 signals_before == n_signals_actionable) {
@@ -970,7 +1021,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     uint64_t n_rejected_invalid_order = 0;
     uint64_t n_rejected_too_old = 0;
     std::vector<SignalResult> raw_signals;
-    uint64_t n_measurement_signals_actionable = 0;
     auto measure_start = Clock::now();
     auto measure_end = measure_start + Sec(duration_sec);
     fprintf(stderr, "[harness] measuring for %d s...\n", duration_sec);
@@ -992,6 +1042,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
             for (int i = 0; i < MAX_SOCKET_DRAIN_PER_TICK && Clock::now() < measure_end; ++i) {
                 ssize_t n = recv(result_fd, &br, sizeof(br), MSG_DONTWAIT);
                 if (n != sizeof(BenchmarkResult)) break;
+                if (br.tier != (uint8_t)tier) continue;
                 if (!br.dropped) {
                     raw_results.push_back(br);
                     full_run_result_tick_ids.insert(br.tick_id);
@@ -1007,7 +1058,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                 raw_signals.push_back(sr);
                 full_run_signal_tick_ids.insert(sr.tick_id);
                 if (sr.signal != 0) ++n_signals_actionable;
-                if (sr.signal != 0) ++n_measurement_signals_actionable;
             }
         }
     }
@@ -1026,14 +1076,17 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
 
     drain_run_accounting_until_quiet(result_fd, signal_fd,
                                      full_run_result_tick_ids, full_run_signal_tick_ids,
-                                     n_dropped, n_signals_actionable, 2000);
+                                     n_dropped, n_signals_actionable, 2000,
+                                     (uint8_t)tier);
 
-    kill_proc(rx_pid);
+    kill_proc_while_draining(rx_pid, result_fd, signal_fd,
+                             full_run_result_tick_ids, full_run_signal_tick_ids,
+                             n_dropped, n_signals_actionable, (uint8_t)tier);
     kill_proc(ds_pid);          /* reaps the local ssh client (or local data_source) */
     usleep(100000);
     drain_run_accounting_after_stop(result_fd, signal_fd,
                                     full_run_result_tick_ids, full_run_signal_tick_ids,
-                                    n_dropped, n_signals_actionable);
+                                    n_dropped, n_signals_actionable, (uint8_t)tier);
     drain_stale_results(result_fd, signal_fd);
 
     uint64_t sent_ticks_end = g_sender_ssh.empty()
@@ -1060,10 +1113,22 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
                             "using raw sender timestamps\n");
         }
     }
+
+    uint64_t sent_denominator = sent_ticks_end;
+    if (sent_denominator == 0) {
+        sent_denominator =
+            (uint64_t)std::llround((double)rate_hz * (double)(warmup_sec + duration_sec));
+        fprintf(stderr,
+                "[harness] warning: sender stats were unavailable; "
+                "falling back to target full-run send count=%llu\n",
+                (unsigned long long)sent_denominator);
+    }
+
     e2e_ns.reserve(raw_results.size());
     ingest_ns.reserve(raw_results.size());
     compute_ns.reserve(raw_results.size());
     for (const BenchmarkResult &raw_br : raw_results) {
+        if (raw_br.tick_id >= sent_denominator) continue;
         BenchmarkResult br = raw_br;
         br.t1_ns = sender_t1_to_local_ns(raw_br.t1_ns, cal_start, cal_end);
         if (!(br.t4_ns > br.t1_ns && br.t3_ns >= br.t2_ns && br.t2_ns >= br.t1_ns)) {
@@ -1082,7 +1147,6 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     }
 
     size_t n_ticks = e2e_ns.size();
-    uint64_t processed_ticks = full_run_result_tick_ids.size();
 
     /* Drop-rate computation:
      *
@@ -1092,22 +1156,19 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
      *     tick_id resets at run start and receiver buffers are drained before
      *     the next run starts.
      *   - Throughput/signals below remain measurement-window rates. */
-    uint64_t sent_denominator = sent_ticks_end;
-    if (sent_denominator == 0) {
-        sent_denominator =
-            (uint64_t)std::llround((double)rate_hz * (double)(warmup_sec + duration_sec));
-        fprintf(stderr,
-                "[harness] warning: sender stats were unavailable; "
-                "falling back to target full-run send count=%llu\n",
-                (unsigned long long)sent_denominator);
+    uint64_t processed_ticks = 0;
+    for (uint64_t tick_id : full_run_result_tick_ids) {
+        if (tick_id < sent_denominator) ++processed_ticks;
     }
-    if (!full_run_result_tick_ids.empty()) {
-        auto minmax = std::minmax_element(full_run_result_tick_ids.begin(),
-                                          full_run_result_tick_ids.end());
-        uint64_t observed_span = *minmax.second - *minmax.first + 1;
-        n_inferred_missing_ticks = observed_span > full_run_result_tick_ids.size()
-            ? observed_span - full_run_result_tick_ids.size() : 0;
+    size_t n_measurement_signals = 0;
+    uint64_t n_measurement_signals_actionable = 0;
+    for (const SignalResult &sr : raw_signals) {
+        if (sr.tick_id >= sent_denominator) continue;
+        ++n_measurement_signals;
+        if (sr.signal != 0) ++n_measurement_signals_actionable;
     }
+    n_inferred_missing_ticks = sent_denominator > processed_ticks
+        ? sent_denominator - processed_ticks : 0;
     double drop_rate = sent_denominator > 0
         ? (double)(sent_denominator > processed_ticks
               ? (sent_denominator - processed_ticks) : 0ULL) / (double)sent_denominator
@@ -1141,7 +1202,7 @@ static RunResult run_one(int run_id, int tier, long rate_hz, int repetition,
     r.throughput   = duration_sec > 0
         ? (double)n_ticks / (double)duration_sec : 0.0;
     r.signals_total_per_sec      = duration_sec > 0
-        ? (double)raw_signals.size() / (double)duration_sec : 0.0;
+        ? (double)n_measurement_signals / (double)duration_sec : 0.0;
     r.signals_actionable_per_sec = duration_sec > 0
         ? (double)n_measurement_signals_actionable / (double)duration_sec : 0.0;
 
