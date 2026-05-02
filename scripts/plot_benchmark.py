@@ -3,17 +3,19 @@
 plot_benchmark.py — produce FYP-presentation plots from a benchmark CSV.
 
 Reads the CSV emitted by bin/benchmark_harness (one row per tier/rate/rep)
-and writes 6 PNGs to results/plots_<timestamp>/:
+and writes PNGs to results/plots_<timestamp>/:
 
   01_compute_latency.png    — per-tier per-tick GPU compute p50/p99 vs rate
   02_drop_curve.png         — sender-vs-processed drop rate vs offered rate
   03_throughput.png         — achieved tick throughput vs offered rate
   04_signal_rate.png        — total + actionable signal rate vs offered rate
-  05_stage_breakdown.png    — stacked p50 ingress/compute/egress per tier @ 100k Hz
+  05_stage_components_50k.png
+  05_stage_components_100k.png
+                            — p50 stage components per tier at healthy/overload rates
   06_e2e_latency.png        — receiver-ingress-to-output p50/p99
 
-Current benchmark definition for T1-T4 uses a single receiver-side clock on
-lxcpu1:
+Current benchmark definition for T1-T4 uses sender-side T1 translated into the
+receiver clock domain:
   ingress = T2 - T1
   compute = T3 - T2
   e2e = T4 - T1
@@ -253,49 +255,60 @@ def plot_signal_rate(agg, outdir):
     save(fig, outdir, "04_signal_rate.png")
 
 
-def plot_stage_breakdown(agg, outdir, target_rate=100000):
-    """Stacked bar of where time goes per tier at a fixed rate."""
+def plot_stage_breakdown(agg, outdir, target_rate=50000, filename=None):
+    """Grouped p50 stage components at a fixed rate.
+
+    This intentionally avoids the old stacked-bar presentation. Percentiles are
+    not additive: p50(e2e) - p50(ingest) - p50(compute) is only an approximate
+    residual, not a true p50 egress stage. Grouped log-scale bars make the
+    microsecond compute component visible without letting saturated T1 queueing
+    flatten every other tier.
+    """
     rates_avail = sorted({r for (_, r) in agg.keys()})
     if target_rate not in rates_avail:
         target_rate = min(rates_avail, key=lambda r: abs(r - target_rate))
+    if filename is None:
+        filename = f"05_stage_components_{target_rate//1000}k.png"
 
     tiers = sorted({t for (t, _) in agg.keys()})
     ingest  = [agg[(t, target_rate)]["ingest_p50"]  for t in tiers]
     compute = [agg[(t, target_rate)]["compute_p50"] for t in tiers]
-    # egress = e2e - ingress - compute
     e2e_v   = [agg[(t, target_rate)]["e2e_p50"]     for t in tiers]
-    egress  = [max(0.0, e2e_v[i] - ingest[i] - compute[i]) for i in range(len(tiers))]
+    # Approximate residual only; medians are not additive.
+    egress  = [max(0.0, e2e_v[i] - ingest[i] - compute[i])
+               for i in range(len(tiers))]
 
-    fig, (ax, ax_compute) = plt.subplots(
-        1, 2, figsize=(12, 5), gridspec_kw={"width_ratios": [2.2, 1.0]})
+    fig, ax = plt.subplots(figsize=(10, 5.5))
     labels = [TIER_LABEL[t] for t in tiers]
     x = np.arange(len(tiers))
-    ax.bar(x, ingest,  label="Ingress (T2−T1)", color="#cccccc")
-    ax.bar(x, compute, bottom=ingest, label="Compute (T3−T2)",
-           color="#2a9d8f")
-    ax.bar(x, egress,  bottom=[i+c for i, c in zip(ingest, compute)],
-           label="Egress (T4−T3)", color="#264653")
+    width = 0.18
+
+    def positive(vals):
+        return [max(v, 1e-3) for v in vals]
+
+    ax.bar(x - 1.5 * width, positive(ingest),  width,
+           label="Ingress p50 (T2−T1)", color="#b8b8b8")
+    ax.bar(x - 0.5 * width, positive(compute), width,
+           label="Compute p50 (T3−T2)", color="#2a9d8f")
+    ax.bar(x + 0.5 * width, positive(egress),  width,
+           label="Residual approx. (e2e−ingest−compute)", color="#264653")
+    ax.scatter(x + 1.5 * width, positive(e2e_v), marker="D", s=42,
+               color="#111111", label="End-to-end p50 (T4−T1)", zorder=4)
+
     ax.set_xticks(x)
     ax.set_xticklabels([l.split(" ")[0] for l in labels], fontsize=9)
-    ax.set_title(f"p50 stage breakdown @ {target_rate:,} Hz "
-                 f"(receiver-side single clock)", fontsize=11, pad=10)
+    ax.set_yscale("log")
+    ax.set_title(f"p50 stage components @ {target_rate:,} Hz",
+                 fontsize=11, pad=10)
     ax.set_ylabel("Latency (µs)", fontsize=10)
-    ax.grid(True, axis="y", alpha=0.25)
-    ax.legend(fontsize=9, loc="upper right")
-
-    compute_for_plot = [max(v, 1e-3) for v in compute]
-    ax_compute.bar(x, compute_for_plot, color="#2a9d8f")
-    ax_compute.set_yscale("log")
-    ax_compute.set_xticks(x)
-    ax_compute.set_xticklabels([l.split(" ")[0] for l in labels], fontsize=9)
-    ax_compute.set_title("Compute only", fontsize=11, pad=10)
-    ax_compute.set_ylabel("p50 compute latency (µs)", fontsize=10)
-    ax_compute.grid(True, axis="y", which="both", alpha=0.25)
-    for xi, val in zip(x, compute):
-        shown = max(val, 1e-3)
-        ax_compute.text(xi, shown, f"{val:.2g} µs",
-                        ha="center", va="bottom", fontsize=8)
-    save(fig, outdir, "05_stage_breakdown.png")
+    ax.grid(True, axis="y", which="both", alpha=0.25)
+    ax.legend(fontsize=8, loc="upper left", framealpha=0.95)
+    ax.text(
+        0.01, 0.01,
+        "Residual is approximate because medians are not additive.",
+        transform=ax.transAxes, fontsize=8, color="#555555",
+        ha="left", va="bottom")
+    save(fig, outdir, filename)
 
 
 def _shade_noise_floor(ax, floor_us: float):
@@ -383,7 +396,10 @@ def main():
     plot_drop_curve(agg, outdir)
     plot_throughput(agg, outdir)
     plot_signal_rate(agg, outdir)
-    plot_stage_breakdown(agg, outdir)
+    plot_stage_breakdown(agg, outdir, target_rate=50000,
+                         filename="05_stage_components_50k.png")
+    plot_stage_breakdown(agg, outdir, target_rate=100000,
+                         filename="05b_stage_components_100k.png")
     plot_e2e_latency(agg, outdir, noise_floor_us=floor_us)
     print(f"\nDone. {len(rows)} runs across "
           f"{len({t for t,_ in agg})} tier(s) × {len({r for _,r in agg})} rate(s).")
