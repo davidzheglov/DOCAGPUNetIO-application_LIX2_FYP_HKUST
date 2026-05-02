@@ -443,13 +443,21 @@ int main(int argc, char **argv)
     fprintf(stderr, "[T3] waiting for packets (raw packet QP)...\n");
 
     auto flush_batch = [&](const char *reason) {
+        int flushed_n = batch_n;
         process_rdma_batch(gpu, d_slots, batch_slots, batch_n, tier,
                             harness_fd, harness_dest, signal_fd, signal_dest);
+        /* Repost RX slots only after the GPU has extracted the packet data.
+         * Reposting immediately at CQ harvest time lets the NIC overwrite a
+         * slot while this batch still references it, which corrupts tick order
+         * and shows up in the harness as rejected_invalid_order. */
+        for (int i = 0; i < flushed_n; ++i) {
+            post_recv_wrs(gpu, (int)batch_slots[i], 1);
+        }
         ++total_batches;
         uint64_t now_n = now_ns();
         if (total_batches <= 5 || now_n - last_report_ns >= 1000000000ULL) {
             fprintf(stderr, "[T3] batch %lu: %d ticks [%s] (total_rx=%lu)\n",
-                    total_batches, batch_n, reason, total_rx);
+                    total_batches, flushed_n, reason, total_rx);
             last_report_ns = now_n;
         }
         batch_n = 0;
@@ -474,7 +482,6 @@ int main(int argc, char **argv)
             if (batch_n == 0) batch_start_ns = now_ns();
             batch_slots[batch_n++] = (uint32_t)wcs[w].wr_id;
             total_rx++;
-            post_recv_wrs(gpu, (int)wcs[w].wr_id, 1);
 
             if (total_rx == 1)
                 fprintf(stderr, "[T3] first packet received (byte_len=%u)\n", wcs[w].byte_len);
