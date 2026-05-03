@@ -2,19 +2,11 @@
 """
 plot_stages.py — tier-wise stage latency comparison plots.
 
-Produces 6 figures (p50 and p99 for ingest / compute / egress) where each
-figure shows ALL tiers side-by-side at every offered rate, making it easy to
-compare the pipeline cost breakdown across T1→T4.
+Produces figures for ingest/compute/egress latencies (p50 and p99).
 
-  01_ingest_p50.png   — NIC→receiver handoff latency (p50), per tier × rate
-  02_ingest_p99.png   — same, p99
-  03_compute_p50.png  — GPU kernel latency (p50)
-  04_compute_p99.png  — same, p99
-  05_egress_p50.png   — e2e − ingest − compute (p50), remainder for output path
-  06_egress_p99.png   — same, p99
-
-Egress is defined as:  egress = e2e − ingest − compute
-(captures cudaMemcpy + result UDP send + any downstream latency)
+For compute latency:
+  - Combined line plot showing all tiers together
+  - Individual scatter/line plots for each tier separately
 
 Usage:
   python3 scripts/plot_stages.py results/benchmark_20260428_193500.csv
@@ -40,7 +32,7 @@ import matplotlib.ticker as mticker
 REPO_ROOT   = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
 
-# ── Visual identity (same palette as plot_benchmark.py) ───────────────────────
+# ── Visual identity ───────────────────────────────────────────────────────────
 TIER_LABEL = {
     1: "T1  CPU recvfrom\n(3 copies)",
     2: "T2  DPDK PMD\n(2 copies)",
@@ -53,7 +45,7 @@ TIER_COLOR = {
     3: "#2a9d8f",
     4: "#264653",
 }
-TIER_HATCH = {1: "", 2: "//", 3: "..", 4: "xx"}
+TIER_MARKER = {1: "o", 2: "s", 3: "^", 4: "D"}
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -75,7 +67,6 @@ def load(csv_path: Path):
                 "ingest_p99":  i99,
                 "compute_p50": c50,
                 "compute_p99": c99,
-                # egress = e2e − ingest − compute (floor at 0 to avoid neg noise)
                 "egress_p50":  max(0.0, e50 - i50 - c50),
                 "egress_p99":  max(0.0, e99 - i99 - c99),
                 "clock_rtt_us": float(r.get("clock_rtt_us", 0.0) or 0.0),
@@ -102,23 +93,132 @@ def aggregate(rows):
     return out
 
 
-# ── Plotting ──────────────────────────────────────────────────────────────────
+def get_raw_by_tier(rows, tier: int, metric: str):
+    """Get all raw data points for a specific tier and metric."""
+    points = [(r["rate"], r[metric]) for r in rows if r["tier"] == tier]
+    rates = sorted(set(p[0] for p in points))
+    vals_by_rate = {rate: [p[1] for p in points if p[0] == rate] for rate in rates}
+    return rates, vals_by_rate
+
+
+# ── Plotting helpers ──────────────────────────────────────────────────────────
 
 def _fmt_rate(v):
     return f"{int(v/1000)}k" if v < 1_000_000 else f"{v/1e6:g}M"
 
 
+def _plot_combined_compute(agg, tiers, rates, outdir: Path, filename: str):
+    """Combined line plot for compute latency showing all tiers."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for tier in tiers:
+        xs, ys, lo_err, hi_err = [], [], [], []
+        for rate in rates:
+            key = (tier, rate)
+            if key not in agg:
+                continue
+            med = agg[key]["compute_p50"]
+            lo  = agg[key]["compute_p50_min"]
+            hi  = agg[key]["compute_p50_max"]
+            xs.append(rate)
+            ys.append(med)
+            lo_err.append(med - lo)
+            hi_err.append(hi - med)
+
+        if not xs:
+            continue
+        color  = TIER_COLOR[tier]
+        label  = TIER_LABEL[tier].replace("\n", " ")
+        marker = TIER_MARKER.get(tier, "o")
+        
+        ax.plot(xs, ys, marker=marker, color=color, label=label,
+                linewidth=1.8, markersize=6, zorder=4)
+        ax.fill_between(xs,
+                        [y - e for y, e in zip(ys, lo_err)],
+                        [y + e for y, e in zip(ys, hi_err)],
+                        color=color, alpha=0.12, linewidth=0, zorder=3)
+
+    ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: _fmt_rate(v)))
+    ax.set_title("Compute Latency — p50\n(GPU kernel execution)", fontsize=13, pad=10)
+    ax.set_xlabel("Offered rate (ticks/s)", fontsize=10)
+    ax.set_ylabel("Latency (µs)", fontsize=10)
+    ax.grid(True, which="both", alpha=0.25)
+    ax.tick_params(labelsize=9)
+    ax.legend(fontsize=8, ncol=2, loc="best")
+
+    fig.tight_layout()
+    path = outdir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {path.relative_to(REPO_ROOT)}")
+
+
+def _plot_individual_compute(rows, tier: int, outdir: Path, filename: str):
+    """Individual scatter/line plot for compute latency of a single tier."""
+    rates, vals_by_rate = get_raw_by_tier(rows, tier, "compute_p50")
+    
+    if not rates:
+        print(f"  [WARN] No compute data for tier {tier}")
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Calculate medians and IQR for each rate
+    medians = []
+    lower_err = []
+    upper_err = []
+    all_y = []
+    
+    for rate in rates:
+        vals = vals_by_rate[rate]
+        med = np.median(vals)
+        q1, q3 = np.percentile(vals, [25, 75])
+        all_y.extend(vals)
+        
+        medians.append(med)
+        lower_err.append(med - q1)
+        upper_err.append(q3 - med)
+        
+        # Plot individual points as scatter
+        ax.scatter([rate] * len(vals), vals, alpha=0.3, s=30, 
+                  color=TIER_COLOR[tier], edgecolors='black', linewidth=0.5, zorder=2)
+    
+    # Plot median line with error bars
+    ax.errorbar(rates, medians, 
+                yerr=[lower_err, upper_err],
+                fmt='o-', color=TIER_COLOR[tier], linewidth=2, markersize=8,
+                capsize=5, capthick=1.5, elinewidth=1.5, zorder=3,
+                label=f"Median ± IQR")
+    
+    ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+        lambda v, _: _fmt_rate(v)))
+    
+    tier_name = TIER_LABEL[tier].replace("\n", " ")
+    ax.set_title(f"Compute Latency — p50\n{tier_name}", fontsize=13, pad=10)
+    ax.set_xlabel("Offered rate (ticks/s)", fontsize=10)
+    ax.set_ylabel("Latency (µs)", fontsize=10)
+    ax.grid(True, which="both", alpha=0.25)
+    ax.tick_params(labelsize=9)
+    ax.legend(fontsize=9, loc="best")
+    
+    fig.tight_layout()
+    path = outdir / filename
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {path.relative_to(REPO_ROOT)}")
+
+
 def _plot_metric(agg, metric_key: str, title: str, ylabel: str,
                  tiers, rates, outdir: Path, filename: str,
                  noise_floor_us: float = 0.0):
-    """
-    Grouped-bar chart: x-axis = offered rate, groups = tiers.
-    Each bar is the median across reps; error bars show min→max spread.
-    """
+    """Grouped-bar chart for non-compute metrics."""
     n_tiers = len(tiers)
     n_rates = len(rates)
     x = np.arange(n_rates)
-    width = 0.7 / n_tiers          # total bar cluster width = 0.7
+    width = 0.7 / n_tiers
     offsets = np.linspace(-(n_tiers - 1) / 2, (n_tiers - 1) / 2, n_tiers) * width
 
     fig, ax = plt.subplots(figsize=(max(8, n_rates * 1.6), 5))
@@ -137,24 +237,16 @@ def _plot_metric(agg, metric_key: str, title: str, ylabel: str,
             lo_err.append(med - lo)
             hi_err.append(hi - med)
 
-        color = TIER_COLOR[tier]
-        hatch = TIER_HATCH[tier]
-        label = TIER_LABEL[tier].replace("\n", " ")
-
         bars = ax.bar(
             x + offsets[i], vals, width,
-            label=label, color=color, hatch=hatch,
-            edgecolor="white", linewidth=0.6, zorder=3,
+            label=TIER_LABEL[tier].replace("\n", " "),
+            color=TIER_COLOR[tier], edgecolor="white", linewidth=0.6, zorder=3,
         )
-        # Error bars for run-to-run spread
-        ax.errorbar(
-            x + offsets[i], vals,
-            yerr=[lo_err, hi_err],
-            fmt="none", color="black", capsize=3, linewidth=1.0, zorder=4,
-        )
+        ax.errorbar(x + offsets[i], vals,
+                    yerr=[lo_err, hi_err],
+                    fmt="none", color="black", capsize=3, linewidth=1.0, zorder=4)
 
-    # Noise floor shading (cross-host clock limit for ingest/egress)
-    if noise_floor_us > 0 and ("ingest" in metric_key or "egress" in metric_key):
+    if noise_floor_us > 0:
         ax.axhline(noise_floor_us, color="crimson", linewidth=1.2,
                    linestyle="--", zorder=5,
                    label=f"clock noise floor ({noise_floor_us:.0f} µs)")
@@ -170,64 +262,6 @@ def _plot_metric(agg, metric_key: str, title: str, ylabel: str,
     ax.grid(axis="y", alpha=0.3, zorder=0)
     ax.tick_params(labelsize=9)
     ax.legend(fontsize=8, ncol=2, loc="upper left")
-
-    fig.tight_layout()
-    path = outdir / filename
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  → {path.relative_to(REPO_ROOT)}")
-
-
-def _plot_line_metric(agg, metric_key: str, title: str, ylabel: str,
-                      tiers, rates, outdir: Path, filename: str,
-                      noise_floor_us: float = 0.0):
-    """
-    Line plot variant: x-axis = offered rate (log), one line per tier.
-    Useful as a companion to the bar chart for presentations.
-    """
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    markers = {1: "o", 2: "s", 3: "^", 4: "D"}
-    for tier in tiers:
-        xs, ys, lo_err, hi_err = [], [], [], []
-        for rate in rates:
-            key = (tier, rate)
-            if key not in agg:
-                continue
-            med = agg[key][metric_key]
-            lo  = agg[key][metric_key + "_min"]
-            hi  = agg[key][metric_key + "_max"]
-            xs.append(rate)
-            ys.append(med)
-            lo_err.append(med - lo)
-            hi_err.append(hi - med)
-
-        if not xs:
-            continue
-        color  = TIER_COLOR[tier]
-        label  = TIER_LABEL[tier].replace("\n", " ")
-        marker = markers.get(tier, "o")
-        ax.plot(xs, ys, marker=marker, color=color, label=label,
-                linewidth=1.8, markersize=6, zorder=4)
-        ax.fill_between(xs,
-                        [y - e for y, e in zip(ys, lo_err)],
-                        [y + e for y, e in zip(ys, hi_err)],
-                        color=color, alpha=0.12, linewidth=0, zorder=3)
-
-    if noise_floor_us > 0 and ("ingest" in metric_key or "egress" in metric_key):
-        ax.axhline(noise_floor_us, color="crimson", linewidth=1.2,
-                   linestyle="--", zorder=5,
-                   label=f"clock noise floor ({noise_floor_us:.0f} µs)")
-
-    ax.set_xscale("log")
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(
-        lambda v, _: _fmt_rate(v)))
-    ax.set_title(title, fontsize=13, pad=10)
-    ax.set_xlabel("Offered rate (ticks/s)", fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=10)
-    ax.grid(True, which="both", alpha=0.25)
-    ax.tick_params(labelsize=9)
-    ax.legend(fontsize=8, ncol=2, loc="best")
 
     fig.tight_layout()
     path = outdir / filename
@@ -254,10 +288,6 @@ def main():
     ap.add_argument("--out", help="Output directory (default: results/stages_<timestamp>)")
     ap.add_argument("--tiers", default="1,2,3,4",
                     help="Comma-separated tier list to include (default: 1,2,3,4)")
-    ap.add_argument("--bar", action="store_true", default=True,
-                    help="Generate grouped-bar charts (default: on)")
-    ap.add_argument("--line", action="store_true", default=False,
-                    help="Also generate line chart versions")
     args = ap.parse_args()
 
     if args.latest:
@@ -282,7 +312,6 @@ def main():
     if not rows:
         sys.exit("CSV has no data rows.")
 
-    # Filter to requested tiers
     rows = [r for r in rows if r["tier"] in tiers]
     if not rows:
         sys.exit(f"No rows found for tiers {tiers}")
@@ -298,33 +327,36 @@ def main():
     print(f"Cross-host noise floor: {noise_floor:.1f} µs")
     print(f"Generating plots in {outdir.relative_to(REPO_ROOT)} …")
 
-    SPECS = [
-        # (metric_key, title, ylabel, filename_base)
+    # Ingest and egress (bar charts)
+    INGEST_EGRESS_SPECS = [
         ("ingest_p50",  "Ingest Latency — p50\n(NIC → receiver handoff)",
          "Latency (µs)", "01_ingest_p50"),
         ("ingest_p99",  "Ingest Latency — p99\n(NIC → receiver handoff)",
          "Latency (µs)", "02_ingest_p99"),
-        ("compute_p50", "Compute Latency — p50\n(GPU kernel execution)",
-         "Latency (µs)", "03_compute_p50"),
-        ("compute_p99", "Compute Latency — p99\n(GPU kernel execution)",
-         "Latency (µs)", "04_compute_p99"),
         ("egress_p50",  "Egress Latency — p50\n(e2e − ingest − compute)",
          "Latency (µs)", "05_egress_p50"),
         ("egress_p99",  "Egress Latency — p99\n(e2e − ingest − compute)",
          "Latency (µs)", "06_egress_p99"),
     ]
 
-    for metric_key, title, ylabel, name_base in SPECS:
+    for metric_key, title, ylabel, name_base in INGEST_EGRESS_SPECS:
         nf = noise_floor if ("ingest" in metric_key or "egress" in metric_key) else 0.0
         _plot_metric(agg, metric_key, title, ylabel,
                      avail_tiers, rates, outdir,
-                     name_base + "_bar.png", noise_floor_us=nf)
-        if args.line:
-            _plot_line_metric(agg, metric_key, title, ylabel,
-                              avail_tiers, rates, outdir,
-                              name_base + "_line.png", noise_floor_us=nf)
+                     name_base + ".png", noise_floor_us=nf)
 
-    print("Done.")
+    # Compute latency: combined line plot + individual plots
+    print("\nCompute latency plots:")
+    _plot_combined_compute(agg, avail_tiers, rates, outdir, "03_compute_p50_combined.png")
+    
+    # Also generate p99 combined if desired (optional)
+    # _plot_combined_compute_p99(agg, avail_tiers, rates, outdir, "04_compute_p99_combined.png")
+    
+    print("\nIndividual tier plots:")
+    for tier in avail_tiers:
+        _plot_individual_compute(rows, tier, outdir, f"03_compute_p50_tier{tier}.png")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
