@@ -224,9 +224,16 @@ benchmark-quick: all
 	@bash scripts/run_benchmark.sh --quick $(BENCHMARK_ARGS)
 	@python3 scripts/plot_benchmark.py --latest
 
+# Usage: make plots                    # uses latest results/benchmark.csv
+#        make plots FILE=bm.csv        # uses specified file
 plots:
-	@python3 scripts/plot_benchmark.py --latest
-	@python3 scripts/plot_stages.py --latest
+	@if [ -n "$(FILE)" ]; then \
+		python3 scripts/plot_benchmark.py $(FILE) && \
+		python3 scripts/plot_stages.py $(FILE); \
+	else \
+		python3 scripts/plot_benchmark.py --latest && \
+		python3 scripts/plot_stages.py --latest; \
+	fi
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
 dashboard:
