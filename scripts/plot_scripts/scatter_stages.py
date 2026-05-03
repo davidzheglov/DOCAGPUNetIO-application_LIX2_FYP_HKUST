@@ -10,6 +10,8 @@ Produces scatter plots showing raw data points for each tier separately:
 Output: results/scatter_plots/
   tier1_ingest_p50.png, tier1_ingest_p99.png, etc.
   tier2_ingest_p50.png, ...
+  combined_all_tiers_ingest_p50.png (T1-T4)
+  combined_t2_t4_ingest_p50.png (T2-T4)
 
 Usage:
   python3 scripts/scatter_stages.py results/benchmark_20260428_193500.csv
@@ -149,8 +151,8 @@ def plot_scatter_tier(data, tier: int, metric: str, title: str, ylabel: str, out
     print(f"  → {outfile.relative_to(REPO_ROOT)}")
 
 
-def plot_combined(data, tiers, metric: str, title: str, ylabel: str, outdir: Path):
-    """Create combined scatter/line plot for all tiers."""
+def plot_combined(data, tiers, metric: str, title: str, ylabel: str, outdir: Path, suffix: str = "combined"):
+    """Create combined scatter/line plot for specified tiers."""
     fig, ax = plt.subplots(figsize=(12, 7))
     
     for tier in tiers:
@@ -183,7 +185,15 @@ def plot_combined(data, tiers, metric: str, title: str, ylabel: str, outdir: Pat
     ax.set_xscale('log')
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: fmt_rate(v)))
     
-    ax.set_title(title, fontsize=13, pad=10)
+    # Add title suffix to indicate which tiers are included
+    if suffix == "combined_all_tiers":
+        title_suffix = "All Tiers (T1-T4)"
+    elif suffix == "combined_t2_t4":
+        title_suffix = "High-Performance Tiers (T2-T4)"
+    else:
+        title_suffix = "Combined"
+    
+    ax.set_title(f"{title}\n{title_suffix}", fontsize=13, pad=10)
     ax.set_xlabel("Offered rate (ticks/s)", fontsize=10)
     ax.set_ylabel(ylabel, fontsize=10)
     ax.grid(True, which='both', alpha=0.25, linestyle='--')
@@ -192,7 +202,7 @@ def plot_combined(data, tiers, metric: str, title: str, ylabel: str, outdir: Pat
     
     fig.tight_layout()
     safe_metric = metric.replace('_', '')
-    outfile = outdir / f"combined_{safe_metric}.png"
+    outfile = outdir / f"{suffix}_{safe_metric}.png"
     fig.savefig(outfile, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  → {outfile.relative_to(REPO_ROOT)}")
@@ -256,9 +266,17 @@ def main():
         for tier in avail_tiers:
             plot_scatter_tier(data, tier, metric, title, ylabel, outdir)
         
-        # Combined plot
+        # Combined plots (if not disabled)
         if not args.no_combined:
-            plot_combined(data, avail_tiers, metric, title, ylabel, outdir)
+            # Combined plot for all available tiers (T1-T4)
+            plot_combined(data, avail_tiers, metric, title, ylabel, outdir, 
+                         suffix="combined_all_tiers")
+            
+            # Combined plot for T2, T3, T4 only (exclude T1 if present)
+            t2_t4_tiers = [t for t in avail_tiers if t in [2, 3, 4]]
+            if t2_t4_tiers and len(t2_t4_tiers) >= 2:
+                plot_combined(data, t2_t4_tiers, metric, title, ylabel, outdir,
+                             suffix="combined_t2_t4")
 
     print("\nDone.")
 
