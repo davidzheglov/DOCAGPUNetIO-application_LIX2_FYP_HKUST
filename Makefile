@@ -228,11 +228,13 @@ benchmark-quick: all
 #        make plots FILE=bm.csv        # uses specified file
 plots:
 	@if [ -n "$(FILE)" ]; then \
-		python3 scripts/plot_benchmark.py $(FILE) && \
-		python3 scripts/plot_stages.py $(FILE); \
+		python3 scripts/plot_scripts/plot_benchmark.py $(FILE) && \
+		python3 scripts/plot_scripts/scatter_stages.py $(FILE) && \
+		python3 scripts/plot_scripts/plot_stages.py $(FILE); \
 	else \
-		python3 scripts/plot_benchmark.py --latest && \
-		python3 scripts/plot_stages.py --latest; \
+		python3 scripts/plot_scripts/plot_benchmark.py --latest && \
+		python3 scripts/plot_scripts/scatter_stages.py --latest && \
+		python3 scripts/plot_scripts/plot_stages.py --latest; \
 	fi
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
