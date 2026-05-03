@@ -226,6 +226,7 @@ benchmark-quick: all
 
 plots:
 	@python3 scripts/plot_benchmark.py --latest
+	@python3 scripts/plot_stages.py --latest
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
 dashboard:
