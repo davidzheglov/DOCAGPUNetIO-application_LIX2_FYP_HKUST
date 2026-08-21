@@ -14,7 +14,7 @@
 #
 #  Usage:
 #    ./scripts/run_benchmark.sh                                    # full sweep
-#    ./scripts/run_benchmark.sh --tiers 1,4 --quick                # smoke test
+#    ./scripts/run_benchmark.sh --quick                            # T1-T4 smoke test
 #    ./scripts/run_benchmark.sh --rates 100000,500000,1000000      # custom rates
 #    ./scripts/run_benchmark.sh --duration 60 --warmup 10
 #    ./scripts/run_benchmark.sh --sender-password                   # prompt once for lxcpu2 SSH password
@@ -310,7 +310,7 @@ ETA_M=$((ETA_S / 60))
 # ── Local sudo pre-flight for privileged tiers ──────────────────────────────
 NEEDS_LOCAL_SUDO=0
 for tier in ${TIERS//,/ }; do
-    if [[ "$tier" == "2" || "$tier" == "3" || "$tier" == "4" || "$tier" == "5" ]]; then
+    if [[ "$tier" == "2" || "$tier" == "3" || "$tier" == "4" ]]; then
         NEEDS_LOCAL_SUDO=1
         break
     fi
